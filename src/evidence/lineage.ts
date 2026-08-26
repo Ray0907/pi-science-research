@@ -361,12 +361,12 @@ function buildPreparedGraph(
     dependencyUnion.join(sourceIndex.get(edge.from)!, sourceIndex.get(edge.target)!);
   }
   const metadataOwner = new Map<string, number>();
-  for (const { record } of ordered) {
+  for (const { record } of latestBySource.values()) {
     const sourceId = record.sourceId;
     const tokens = [
       ...(resolvedStudy(record.lineage.studyId) === null ? [] : [`study:${record.lineage.studyId}`]),
-      ...record.lineage.cohortIds.map((id) => `cohort:${id}`),
-      ...record.lineage.datasetIds.map((id) => `dataset:${id}`),
+      ...record.lineage.cohortIds.filter((id) => id.length > 0).map((id) => `cohort:${id}`),
+      ...record.lineage.datasetIds.filter((id) => id.length > 0).map((id) => `dataset:${id}`),
     ];
     const index = sourceIndex.get(sourceId)!;
     for (const token of tokens) {
@@ -388,7 +388,7 @@ function buildPreparedGraph(
   const relationComponentKeyBySourceId = new Map<string, string>();
   sourceIds.forEach((sourceId, index) => {
     componentKeyBySourceId.set(sourceId, `retrieved-lineage:${smallestByRoot.get(dependencyUnion.find(index))!}`);
-    relationComponentKeyBySourceId.set(sourceId, `relation:${relationSmallestByRoot.get(relationUnion.find(index))!}`);
+    relationComponentKeyBySourceId.set(sourceId, relationSmallestByRoot.get(relationUnion.find(index))!);
   });
   const dependencyComponentCount = smallestByRoot.size;
 

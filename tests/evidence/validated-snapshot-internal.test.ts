@@ -155,6 +155,11 @@ describe("validated evidence snapshot internals", () => {
     const conflicting = source({ sourceId: "src-internal.000003", identifiers: { doi: "10.1234/other", pmid: null, pmcid: null }, canonicalUrl: shared });
     for (const values of [[a, middle, conflicting], [middle, conflicting, a], [conflicting, a, middle]])
       expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: values })))).toBe("evidence.ambiguous-source-identity");
+    const strongUrlA = source({ sourceId: "src-internal.strongurla", identifiers: { doi: "10.1234/strong-url", pmid: null, pmcid: null }, canonicalUrl: "https://doi.org/10.1234/strong-url" });
+    const strongUrlB = source({ sourceId: "src-internal.strongurlb", identifiers: { doi: "10.1234/strong-url", pmid: null, pmcid: null }, canonicalUrl: "https://example.org/shared-bridge" });
+    const strongUrlC = source({ sourceId: "src-internal.strongurlc", identifiers: { doi: null, pmid: null, pmcid: null }, canonicalUrl: "https://example.org/shared-bridge" });
+    for (const values of [[strongUrlA, strongUrlB, strongUrlC], [strongUrlC, strongUrlA, strongUrlB]])
+      expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: values })))).toBe("evidence.ambiguous-source-identity");
     const bridgeA = source({ sourceId: "src-internal.bridgea", identifiers: { doi: "10.1234/bridge-a", pmid: null, pmcid: null }, canonicalUrl: "https://doi.org/10.1234/bridge-a" });
     const bridgeB = source({ sourceId: "src-internal.bridgeb", identifiers: { doi: "10.1234/bridge-a", pmid: "123456", pmcid: null }, canonicalUrl: "https://doi.org/10.1234/bridge-a" });
     const bridgeC = source({ sourceId: "src-internal.bridgec", identifiers: { doi: null, pmid: "123456", pmcid: null }, canonicalUrl: "https://pubmed.ncbi.nlm.nih.gov/123456/" });
@@ -162,6 +167,22 @@ describe("validated evidence snapshot internals", () => {
       [bridgeA, bridgeB, bridgeC], [bridgeA, bridgeC, bridgeB], [bridgeB, bridgeA, bridgeC],
       [bridgeB, bridgeC, bridgeA], [bridgeC, bridgeA, bridgeB], [bridgeC, bridgeB, bridgeA],
     ]) expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: values })))).toBe("evidence.ambiguous-source-identity");
+    const many = Array.from({ length: 40 }, (_, index) => source({ sourceId: `src-internal.large${String(index).padStart(3, "0")}` }));
+    for (const values of [many, [...many].reverse()]) {
+      const visits = diagnostics();
+      expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: values }), undefined, visits))).toBe("evidence.duplicate-source-identity");
+      expect(visits.sourceIdentityVisits).toBe(many.length);
+    }
+  });
+  test("counts latest metadata plus retained relations for lineage component ceilings", () => {
+    const a1 = source({ sourceId: "src-internal.historya", identifiers: { doi: "10.1234/history-a", pmid: null, pmcid: null }, canonicalUrl: "https://doi.org/10.1234/history-a", lineage: { ...source().lineage, studyId: "study-a", cohortIds: ["cohort-old"] } });
+    const a2 = { ...a1, revision: 2, lineage: { ...a1.lineage, cohortIds: [] } };
+    const b1 = source({ sourceId: "src-internal.historyb", identifiers: { doi: "10.1234/history-b", pmid: null, pmcid: null }, canonicalUrl: "https://doi.org/10.1234/history-b", lineage: { ...source().lineage, studyId: "study-b", cohortIds: ["cohort-old"] } });
+    const b2 = { ...b1, revision: 2, lineage: { ...b1.lineage, cohortIds: [] } };
+    expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: [source(), a1, a2, b1, b2] }), { limits: { maxLineageComponents: 2 } }))).toBe("evidence.too-many-records");
+    const emptyA = source({ sourceId: "src-internal.emptya", identifiers: { doi: "10.1234/empty-a", pmid: null, pmcid: null }, canonicalUrl: "https://doi.org/10.1234/empty-a", lineage: { ...source().lineage, studyId: "study-empty-a", cohortIds: [""], datasetIds: [""] } });
+    const emptyB = source({ sourceId: "src-internal.emptyb", identifiers: { doi: "10.1234/empty-b", pmid: null, pmcid: null }, canonicalUrl: "https://doi.org/10.1234/empty-b", lineage: { ...source().lineage, studyId: "study-empty-b", cohortIds: [""], datasetIds: [""] } });
+    expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: [emptyA, emptyB] }), { limits: { maxLineageComponents: 1 } }))).toBe("evidence.too-many-records");
   });
   test("preflights references and lineage components before full indexes and graphs", () => {
     expect(buildBoundedValidatedEvidenceSnapshot(records(), { limits: { maxReferences: 3 } }).referenceCount).toBe(3);

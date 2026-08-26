@@ -219,7 +219,6 @@ export function evaluateEvidenceRule(
   enforceCurrentReferences(target, indexes);
 
   const qualifying: QualifiedEvidence[] = [];
-  const baseConflictRecorderAttempts = new Set<string>();
   const conflictClosure = buildConflictClosure(target, indexes, maxEvidence);
   const contradictions = conflictClosure.evidence;
   let otherwiseUnknown = false;
@@ -228,7 +227,6 @@ export function evaluateEvidenceRule(
     const record = indexes.getExactRecord({ kind: "evidence", id: evidenceId, revision: evidenceRevision }) as EvidenceRecord | undefined;
     if (!record) fail("evidence.unresolved-ref");
     if (record.claimRef.claimId !== target.claimId || record.claimRef.revision !== target.revision) continue;
-    if (["supporting", "contradicting"].includes(record.stance)) baseConflictRecorderAttempts.add(record.recordedByAttemptId);
     if (record.stance === "contradicting") continue;
     if (record.stance !== "supporting" || !["unverified", "verified"].includes(record.verificationStatus)) continue;
     const qualified = qualifyEvidence(record, indexes, target);
@@ -258,7 +256,7 @@ export function evaluateEvidenceRule(
   if (target.evidenceRule.fullTextRequired && retrieved.some(({ source }) => source?.accessLevel !== "full-text")) blockers.push("claim.full-text-required");
   if (otherwiseUnknown && resolvedLineageCount < effectiveMinimum) blockers.push("claim.unresolved-lineage");
   if ((contradictions.length > 0 || conflictClosure.claims.length > 0)
-    && !conflictsResolved(selectedVerifications, target, qualifying, contradictions, conflictClosure.claims, baseConflictRecorderAttempts)) blockers.push("claim.unresolved-conflict");
+    && !conflictsResolved(selectedVerifications, target, qualifying, contradictions)) blockers.push("claim.unresolved-conflict");
   const independentRequired = resolvedLineageCount < effectiveMinimum && target.evidenceRule.independentVerificationAllowed && independentVerificationCredit === 0;
   if (independentRequired) blockers.push("claim.independent-verification-required");
   if (effectiveIndependentCount < effectiveMinimum && !independentRequired) blockers.push("claim.insufficient-lineages");
@@ -323,7 +321,11 @@ function validCalculation(calculation: CalculationRecord, record: EvidenceRecord
 }
 interface RetrievedComponentContext { readonly relationKeys: ReadonlySet<string>; readonly metadataTokens: ReadonlySet<string> }
 function sourceMetadataTokens(source: SourceRecord): string[] {
-  return [`study:${source.lineage.studyId!}`, ...source.lineage.cohortIds.map((id) => `cohort:${id}`), ...source.lineage.datasetIds.map((id) => `dataset:${id}`)];
+  return [
+    `study:${source.lineage.studyId!}`,
+    ...source.lineage.cohortIds.filter((id) => id.length > 0).map((id) => `cohort:${id}`),
+    ...source.lineage.datasetIds.filter((id) => id.length > 0).map((id) => `dataset:${id}`),
+  ];
 }
 function relationComponentKey(source: SourceRecord, indexes: ReturnType<typeof getValidatedSnapshotIndexes>): string {
   try { return getLineageRelationComponentKeyInternal(indexes.lineageGraph, { sourceId: source.sourceId, revision: source.revision }); }
@@ -337,13 +339,14 @@ function assignEvaluationLocalComponents(
   const find = (value: number): number => { let root = value; while (parent[root] !== root) root = parent[root]!; while (parent[value] !== value) { const next = parent[value]!; parent[value] = root; value = next; } return root; };
   const join = (left: number, right: number): void => { const a = find(left); const b = find(right); if (a !== b) parent[b] = a; };
   const relationOwner = new Map<string, number>(); const metadataOwner = new Map<string, number>();
+  const relationMinimumByIndex: string[] = [];
   selected.forEach((item, index) => {
-    const source = item.source!; const relation = relationComponentKey(source, indexes);
+    const source = item.source!; const relation = relationComponentKey(source, indexes); relationMinimumByIndex[index] = relation;
     const relationPrior = relationOwner.get(relation); if (relationPrior === undefined) relationOwner.set(relation, index); else join(relationPrior, index);
     for (const token of sourceMetadataTokens(source)) { const prior = metadataOwner.get(token); if (prior === undefined) metadataOwner.set(token, index); else join(prior, index); }
   });
   const smallest = new Map<number, string>();
-  selected.forEach((item, index) => { const root = find(index); const id = item.source!.sourceId; const prior = smallest.get(root); if (prior === undefined || id < prior) smallest.set(root, id); });
+  selected.forEach((_item, index) => { const root = find(index); const id = relationMinimumByIndex[index]!; const prior = smallest.get(root); if (prior === undefined || id < prior) smallest.set(root, id); });
   selected.forEach((item, index) => { item.key = `retrieved-lineage:${smallest.get(find(index))!}`; });
   return Object.freeze({ relationKeys: new Set(relationOwner.keys()), metadataTokens: new Set(metadataOwner.keys()) });
 }
@@ -430,7 +433,7 @@ function independentCredit(
         const relation = relationComponentKey(qualified.source, indexes);
         const tokens = sourceMetadataTokens(qualified.source);
         if (retrievedContext.relationKeys.has(relation) || tokens.some((token) => retrievedContext.metadataTokens.has(token))) continue;
-        qualified.key = `retrieved-lineage:${qualified.source.sourceId}`;
+        qualified.key = `retrieved-lineage:${relation}`;
       }
       if (qualified.key && !baseKeys.has(qualified.key)) candidates.push({ verificationId: verification.verificationId, revision: verification.revision, key: qualified.key });
     }
@@ -439,19 +442,14 @@ function independentCredit(
   return candidates.length > 0 ? 1 : 0;
 }
 function conflictsResolved(
-  verifications: VerificationRecord[], target: ClaimRecord, supporting: QualifiedEvidence[],
-  contradictions: EvidenceRecord[], conflictingClaims: ClaimRecord[], baseRecorderAttempts: ReadonlySet<string>,
+  verifications: VerificationRecord[], target: ClaimRecord, supporting: QualifiedEvidence[], contradictions: EvidenceRecord[],
 ): boolean {
   if (target.status !== "supported") return false;
-  const used = [...supporting.map(({ evidence }) => evidence), ...contradictions];
-  const forbiddenAttempts = new Set([target.createdByAttemptId, ...baseRecorderAttempts, ...used.map((record) => record.recordedByAttemptId)]);
+  const forbiddenAttempts = new Set([target.createdByAttemptId, ...supporting.map(({ evidence }) => evidence.recordedByAttemptId)]);
   return verifications.some((verification) => verification.result === "accepted" && !forbiddenAttempts.has(verification.attemptId)
     && verification.corrections.some((correction) => correction.claimId === target.claimId && asciiTrim(correction.description).length > 0)
-    && conflictingClaims.every((claim) => claim.status === "rejected"
-      && verification.checkedClaims.some((ref) => ref.claimId === claim.claimId && ref.revision === claim.revision)
-      && verification.corrections.some((correction) => correction.claimId === claim.claimId && asciiTrim(correction.description).length > 0))
-    && used.every((record) => verification.checkedEvidence.some((ref) => ref.evidenceId === record.evidenceId && ref.revision === record.revision))
-    && contradictions.every((record) => record.verificationStatus === "rejected"));
+    && contradictions.every((record) => record.verificationStatus === "rejected"
+      && verification.checkedEvidence.some((ref) => ref.evidenceId === record.evidenceId && ref.revision === record.revision)));
 }
 function enforceCurrentReferences(target: ClaimRecord, indexes: ReturnType<typeof getValidatedSnapshotIndexes>): void {
   const latestClaim = indexes.getLatestRevision("claims", target.claimId);

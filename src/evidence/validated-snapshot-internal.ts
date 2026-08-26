@@ -448,13 +448,19 @@ function preflightLineageComponents(sources: readonly SourceRecord[], maximum: n
   const parent = ids.map((_, index) => index);
   const find = (value: number): number => { let root = value; while (parent[root] !== root) root = parent[root]!; while (parent[value] !== value) { const next = parent[value]!; parent[value] = root; value = next; } return root; };
   const join = (left: number, right: number): void => { const a = find(left); const b = find(right); if (a !== b) parent[b] = a; };
-  const metadataOwner = new Map<string, number>();
+  const latestById = new Map<string, SourceRecord>();
   for (const source of sources) {
     const index = indexById.get(source.sourceId)!;
     for (const target of source.lineage.relatedSourceIds) { const targetIndex = indexById.get(target); if (targetIndex !== undefined) join(index, targetIndex); }
+    const prior = latestById.get(source.sourceId); if (!prior || prior.revision < source.revision) latestById.set(source.sourceId, source);
+  }
+  const metadataOwner = new Map<string, number>();
+  for (const source of latestById.values()) {
+    const index = indexById.get(source.sourceId)!;
     const tokens = [
-      ...(source.lineage.studyId === null ? [] : [`study:${source.lineage.studyId}`]),
-      ...source.lineage.cohortIds.map((id) => `cohort:${id}`), ...source.lineage.datasetIds.map((id) => `dataset:${id}`),
+      ...(source.lineage.studyId === null || source.lineage.studyId.length === 0 ? [] : [`study:${source.lineage.studyId}`]),
+      ...source.lineage.cohortIds.filter((id) => id.length > 0).map((id) => `cohort:${id}`),
+      ...source.lineage.datasetIds.filter((id) => id.length > 0).map((id) => `dataset:${id}`),
     ];
     for (const token of tokens) { const owner = metadataOwner.get(token); if (owner === undefined) metadataOwner.set(token, index); else join(owner, index); }
   }
@@ -486,38 +492,34 @@ function auditSourceIdentities(sources: readonly SourceRecord[], diagnostics?: E
   const parent = sourceIds.map((_, index) => index);
   const find = (value: number): number => { let root = value; while (parent[root] !== root) root = parent[root]!; while (parent[value] !== value) { const next = parent[value]!; parent[value] = root; value = next; } return root; };
   const join = (left: number, right: number): void => { const a = find(left); const b = find(right); if (a !== b) parent[b] = a; };
-  const owner = new Map<string, number>();
-  const strongMembers = new Map<string, Set<string>>();
+  const owner = new Map<string, number>(); const keyMembers = new Map<string, Set<string>>();
   for (const source of sources) {
     bump(diagnostics, "sourceIdentityVisits");
-    const index = indexById.get(source.sourceId)!;
-    const keys = [`url:${source.canonicalUrl}`];
-    for (const field of ["doi", "pmid", "pmcid"] as const) if (source.identifiers[field] !== null) {
-      const key = `${field}:${source.identifiers[field]}`; keys.push(key);
-      const members = strongMembers.get(key) ?? new Set<string>(); members.add(source.sourceId); strongMembers.set(key, members);
+    const index = indexById.get(source.sourceId)!; const keys = [`url:${source.canonicalUrl}`];
+    for (const field of ["doi", "pmid", "pmcid"] as const) if (source.identifiers[field] !== null) keys.push(`${field}:${source.identifiers[field]}`);
+    for (const key of keys) {
+      const members = keyMembers.get(key) ?? new Set<string>(); members.add(source.sourceId); keyMembers.set(key, members);
+      const prior = owner.get(key); if (prior === undefined) owner.set(key, index); else join(prior, index);
     }
-    for (const key of keys) { const prior = owner.get(key); if (prior === undefined) owner.set(key, index); else join(prior, index); }
   }
-  const recordsByRoot = new Map<number, SourceRecord[]>();
   const idsByRoot = new Map<number, Set<string>>();
+  const identifiersByRoot = new Map<number, Record<"doi" | "pmid" | "pmcid", Set<string>>>();
   for (const source of sources) {
     const root = find(indexById.get(source.sourceId)!);
-    const records = recordsByRoot.get(root) ?? []; records.push(source); recordsByRoot.set(root, records);
     const ids = idsByRoot.get(root) ?? new Set<string>(); ids.add(source.sourceId); idsByRoot.set(root, ids);
+    const values = identifiersByRoot.get(root) ?? { doi: new Set<string>(), pmid: new Set<string>(), pmcid: new Set<string>() };
+    for (const field of ["doi", "pmid", "pmcid"] as const) if (source.identifiers[field] !== null) values[field].add(source.identifiers[field]);
+    identifiersByRoot.set(root, values);
   }
-  for (const [root, component] of recordsByRoot) if (idsByRoot.get(root)!.size > 1) {
-    for (const field of ["doi", "pmid", "pmcid"] as const) {
-      const values = new Set(component.flatMap((source) => source.identifiers[field] === null ? [] : [source.identifiers[field]]));
-      if (values.size > 1) fail("evidence.ambiguous-source-identity");
-    }
-    const componentIds = idsByRoot.get(root)!;
-    const groups = [...strongMembers.values()].filter((members) => members.size > 1 && [...members].some((id) => componentIds.has(id)));
-    const commonStrongKey = groups.some((members) => members.size === componentIds.size && [...componentIds].every((id) => members.has(id)));
-    if (!commonStrongKey) for (let left = 0; left < groups.length; left += 1) for (let right = left + 1; right < groups.length; right += 1) {
-      const a = groups[left]!; const b = groups[right]!;
-      const same = a.size === b.size && [...a].every((id) => b.has(id));
-      if (!same && [...a].some((id) => b.has(id))) fail("evidence.ambiguous-source-identity");
-    }
+  const rootsWithCommonKey = new Set<number>();
+  for (const members of keyMembers.values()) if (members.size > 1) {
+    const first = members.values().next().value as string; const root = find(indexById.get(first)!);
+    if (members.size === idsByRoot.get(root)!.size) rootsWithCommonKey.add(root);
+  }
+  for (const [root, ids] of idsByRoot) if (ids.size > 1) {
+    const values = identifiersByRoot.get(root)!;
+    if (values.doi.size > 1 || values.pmid.size > 1 || values.pmcid.size > 1 || !rootsWithCommonKey.has(root))
+      fail("evidence.ambiguous-source-identity");
     fail("evidence.duplicate-source-identity");
   }
 }

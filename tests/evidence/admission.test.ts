@@ -352,10 +352,12 @@ describe("evidence admission", () => {
     const supporting = evidence(undefined, { recordedByAttemptId: ATTEMPT_C });
     const contradiction = evidence("ev-0000000000000002", { stance: "contradicting", verificationStatus: "rejected", recordedByAttemptId: ATTEMPT_D });
     const target = claim(undefined, { evidenceRefs: [refForEvidence(supporting), refForEvidence(contradiction)] });
-    for (const attemptId of [ATTEMPT_A, ATTEMPT_C, ATTEMPT_D]) {
-      const colliding = verification(undefined, { attemptId, checkedEvidence: target.evidenceRefs, corrections: [{ claimId: target.claimId, description: "resolved" }] });
+    for (const attemptId of [ATTEMPT_A, ATTEMPT_C]) {
+      const colliding = verification(undefined, { attemptId, checkedEvidence: [refForEvidence(contradiction)], corrections: [{ claimId: target.claimId, description: "resolved" }] });
       expect(evaluate({ ...set(), claims: [target], evidence: [supporting, contradiction], verifications: [colliding] }).blockers).toContain("claim.unresolved-conflict");
     }
+    const contradictionRecorder = verification(undefined, { attemptId: ATTEMPT_D, checkedEvidence: [refForEvidence(contradiction)], corrections: [{ claimId: target.claimId, description: "resolved" }] });
+    expect(evaluate({ ...set(), claims: [target], evidence: [supporting, contradiction], verifications: [contradictionRecorder] }).blockers).not.toContain("claim.unresolved-conflict");
   });
   test("treats a conflicting claim supporting side as contradictory and requires both exact sides", () => {
     const targetEvidence = evidence(undefined, { recordedByAttemptId: ATTEMPT_C });
@@ -364,16 +366,20 @@ describe("evidence admission", () => {
       recordedByAttemptId: ATTEMPT_D, verificationStatus: "rejected",
     });
     const target = claim(undefined, { evidenceRefs: [refForEvidence(targetEvidence)], conflictClaimIds: ["claim-0000000000000002"] });
-    const other = claim("claim-0000000000000002", { status: "rejected", evidenceRefs: [refForEvidence(otherEvidence)], conflictClaimIds: [target.claimId], createdByAttemptId: ATTEMPT_D });
+    const other = claim("claim-0000000000000002", { status: "supported", evidenceRefs: [refForEvidence(otherEvidence)], conflictClaimIds: [target.claimId], createdByAttemptId: ATTEMPT_D });
     const unresolved = evaluate({ ...set(), claims: [target, other], evidence: [targetEvidence, otherEvidence] });
     expect(unresolved.contradictingEvidenceRefs).toEqual([refForEvidence(otherEvidence)]);
     expect(unresolved.blockers).toContain("claim.unresolved-conflict");
     const accepted = verification(undefined, {
-      checkedClaims: [refFor(target), refFor(other)], checkedEvidence: [refForEvidence(targetEvidence), refForEvidence(otherEvidence)],
-      corrections: [{ claimId: target.claimId, description: "supported" }, { claimId: other.claimId, description: "rejected" }],
+      checkedClaims: [refFor(target)], checkedEvidence: [refForEvidence(otherEvidence)],
+      corrections: [{ claimId: target.claimId, description: "supported" }],
     });
-    expect(evaluate({ ...set(), claims: [target, other], evidence: [targetEvidence, otherEvidence], verifications: [accepted] }).blockers).not.toContain("claim.unresolved-conflict");
-    expect(evaluate({ ...set(), claims: [target, other], evidence: [targetEvidence, otherEvidence], verifications: [{ ...accepted, checkedClaims: [refFor(target)] }] }).blockers).toContain("claim.unresolved-conflict");
+    const conflictSet = { ...set(), claims: [target, other], evidence: [targetEvidence, otherEvidence] };
+    expect(evaluate({ ...conflictSet, verifications: [accepted] }).blockers).not.toContain("claim.unresolved-conflict");
+    expect(evaluate({ ...conflictSet, verifications: [{ ...accepted, checkedEvidence: [] }] }).blockers).toContain("claim.unresolved-conflict");
+    expect(evaluate({ ...conflictSet, verifications: [{ ...accepted, corrections: [] }] }).blockers).toContain("claim.unresolved-conflict");
+    expect(evaluate({ ...conflictSet, claims: [{ ...target, status: "disputed" }, other], verifications: [accepted] }).blockers).toContain("claim.unresolved-conflict");
+    expect(evaluate({ ...conflictSet, evidence: [targetEvidence, { ...otherEvidence, verificationStatus: "verified" }], verifications: [accepted] }).blockers).toContain("claim.unresolved-conflict");
   });
   test("deduplicates exact target evidence references deterministically", () => {
     const first = evidence(); const second = evidence("ev-0000000000000002");
@@ -383,6 +389,16 @@ describe("evidence admission", () => {
       expect(result.supportingEvidenceRefs).toEqual([a, b]);
       expect(result.retrievedComponentCount).toBe(1);
     }
+  });
+  test("ignores empty cohort and dataset identifiers in exact dependency components", () => {
+    const sources = [
+      source("src-admission.empty1", { lineage: { studyId: "study-empty-1", cohortIds: [""], datasetIds: [""], relatedSourceIds: [], relationTypes: [] } }),
+      source("src-admission.empty2", { lineage: { studyId: "study-empty-2", cohortIds: [""], datasetIds: [""], relatedSourceIds: [], relationTypes: [] } }),
+      source("src-admission.empty3", { lineage: { studyId: "study-empty-3", cohortIds: [""], datasetIds: [""], relatedSourceIds: [], relationTypes: [] } }),
+    ];
+    const items = sources.map((item, index) => evidence(`ev-000000000000000${index + 1}`, { sourceRef: refForSource(item) }));
+    const target = claim(undefined, { evidenceRefs: items.map(refForEvidence) });
+    expect(evaluate({ ...set(), sources, claims: [target], evidence: items }).retrievedComponentCount).toBe(3);
   });
   test("counts metadata components from selected exact source revisions only", () => {
     const a1 = source("src-admission.exacta", { lineage: { studyId: "study-a", cohortIds: [], datasetIds: [], relatedSourceIds: [], relationTypes: [] } });
@@ -397,6 +413,13 @@ describe("evidence admission", () => {
     const records = { ...set(), sources: [a1, a2, b], claims: [c1, c2], evidence: [ea1, ea2, eb1, eb2] };
     expect(evaluate(records, refFor(c1)).retrievedComponentCount).toBe(2);
     expect(evaluate(records, refFor(c2)).retrievedComponentCount).toBe(1);
+
+    const sharedA1 = { ...a1, lineage: { ...a1.lineage, cohortIds: ["cohort-old"] } };
+    const sharedA2 = { ...a2, lineage: { ...a2.lineage, cohortIds: [] } };
+    const sharedB = { ...b, lineage: { ...b.lineage, cohortIds: ["cohort-old"] } };
+    const inverse = { ...records, sources: [sharedA1, sharedA2, sharedB] };
+    expect(evaluate(inverse, refFor(c1)).retrievedComponentCount).toBe(1);
+    expect(evaluate(inverse, refFor(c2)).retrievedComponentCount).toBe(2);
   });
   test("assigns deterministic lineage keys across study cohort dataset components and input permutations", () => {
     const s1 = source();

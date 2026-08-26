@@ -9,6 +9,7 @@ import {
   compareSourceIndependence,
   getLineageDependencyComponentCountInternal,
   getLineageDependencyComponentKey,
+  getLineageRelationComponentKeyInternal,
   type LineageErrorCode,
 } from "../../src/evidence/lineage.js";
 import {
@@ -392,6 +393,14 @@ describe("source lineage", () => {
     const accessor = { ...a, get lineage() { touched = true; return a.lineage; } };
     expect(code(() => buildLineageGraph([accessor]))).toBe("lineage.invalid-input");
     expect(touched).toBe(false);
+  });
+
+  test("returns complete stable relation-component minima for exact refs", () => {
+    const smaller = withLineage(source("src-component.aaa001"), { studyId: "study-smaller" });
+    const selected = edge(withLineage(source("src-component.zzz001"), { studyId: "study-selected" }), smaller, "version-of");
+    const graph = buildLineageGraph([selected, smaller]);
+    expect(getLineageRelationComponentKeyInternal(graph, { sourceId: selected.sourceId, revision: 1 })).toBe(smaller.sourceId);
+    expect(getLineageRelationComponentKeyInternal(graph, { sourceId: smaller.sourceId, revision: 1 })).toBe(smaller.sourceId);
   });
 
   test("exposes authentic deterministic exact-ref dependency component keys", () => {
