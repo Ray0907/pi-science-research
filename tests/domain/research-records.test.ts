@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import { canonicalJson } from "../../src/crypto/canonical-json.js";
 import { parseResearchRecord } from "../../src/domain/research-records.js";
 
 const AT = "2026-08-25T12:00:00.000Z";
@@ -52,6 +53,18 @@ describe("closed research record schemas", () => {
     expect(parseResearchRecord("evidence", { ...evidenceRecord(), quotes: [], extractedValues: [] }).success).toBe(false);
     expect(parseResearchRecord("evidence", { ...evidenceRecord(), evidenceType: "derived", sourceRef: null, quotes: [], calculationId: null, method: null }).success).toBe(false);
     expect(parseResearchRecord("evidence", { ...evidenceRecord(), evidenceType: "derived", sourceRef: null, quotes: [], calculationId: "calc-0000000000000001", method: null }).success).toBe(true);
+  });
+
+  test("preserves pre-increment V1 SourceRecord parser compatibility", () => {
+    const legacy = {
+      ...sourceRecord(),
+      identifiers: { doi: "DOI:10.1234/Legacy", pmid: "000123", pmcid: "pmc000456" },
+      canonicalUrl: "https://EXAMPLE.org:443/a/../paper",
+    };
+    const before = canonicalJson(legacy);
+    const parsed = parseResearchRecord("sources", legacy);
+    expect(parsed.success).toBe(true);
+    expect(parsed.success && canonicalJson(parsed.value)).toBe(before);
   });
 
   test("enforces confidence, exact refs and calculation status", () => {
