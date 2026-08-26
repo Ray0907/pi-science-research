@@ -79,6 +79,48 @@ describe("canonicalJson", () => {
     expect(getterCalls).toBe(0);
   });
 
+  it("rejects object proxies before any user trap executes", () => {
+    for (const operation of [
+      (value: object) => canonicalJson(value),
+      (value: object) => canonicalJsonBytes(value),
+      (value: object) => hashLedgerEvent(value),
+    ]) {
+      const hostile = createHostileProxy({ payload: { ok: true } });
+      expectFixedProxyFailure(() => operation(hostile.value));
+      expect(hostile.trapCalls).toEqual(zeroTrapCalls());
+      expect(hostile.target).toEqual({ payload: { ok: true } });
+    }
+  });
+
+  it("rejects array proxies before any user trap executes", () => {
+    for (const operation of [
+      (value: object) => canonicalJson(value),
+      (value: object) => canonicalJsonBytes(value),
+      (value: object) => hashLedgerEvent(value),
+    ]) {
+      const hostile = createHostileProxy([1, { ok: true }]);
+      expectFixedProxyFailure(() => operation(hostile.value));
+      expect(hostile.trapCalls).toEqual(zeroTrapCalls());
+      expect(hostile.target).toEqual([1, { ok: true }]);
+    }
+  });
+
+  it("accepts arrays and objects at root-relative depth 256", () => {
+    expect(() => canonicalJson(nestedArraysAtDepth(256))).not.toThrow();
+    expect(() => canonicalJson(nestedObjectsAtDepth(256))).not.toThrow();
+  });
+
+  it("rejects arrays and objects at root-relative depth 257 with a canonical error", () => {
+    expectCanonicalFailure(nestedArraysAtDepth(257));
+    expectCanonicalFailure(nestedObjectsAtDepth(257));
+    expectCanonicalBytesFailure(nestedArraysAtDepth(257));
+  });
+
+  it("rejects over-depth ledger events with a canonical error", () => {
+    // The event root is depth 0, so its payload starts at depth 1.
+    expectHashFailure({ payload: nestedObjectsAtDepth(256) });
+  });
+
   it("rejects sparse arrays and arrays with extra properties", () => {
     const sparse = new Array(2);
     sparse[1] = "value";
@@ -180,6 +222,104 @@ describe("SHA-256 helpers", () => {
     );
   });
 });
+
+const PROXY_SENTINEL = "sentinel-proxy-secret-7f83";
+
+type TrapName =
+  | "getPrototypeOf"
+  | "ownKeys"
+  | "getOwnPropertyDescriptor"
+  | "get";
+type TrapCalls = Record<TrapName, number>;
+
+function zeroTrapCalls(): TrapCalls {
+  return { getPrototypeOf: 0, ownKeys: 0, getOwnPropertyDescriptor: 0, get: 0 };
+}
+
+function createHostileProxy<T extends object>(target: T): {
+  value: T;
+  target: T;
+  trapCalls: TrapCalls;
+} {
+  const trapCalls = zeroTrapCalls();
+  const value = new Proxy(target, {
+    getPrototypeOf(innerTarget) {
+      trapCalls.getPrototypeOf += 1;
+      Reflect.defineProperty(innerTarget, "mutated-by-trap", { value: true });
+      throw new Error(PROXY_SENTINEL);
+    },
+    ownKeys(innerTarget) {
+      trapCalls.ownKeys += 1;
+      return [...Reflect.ownKeys(innerTarget), "fabricated-by-trap"];
+    },
+    getOwnPropertyDescriptor() {
+      trapCalls.getOwnPropertyDescriptor += 1;
+      return {
+        configurable: true,
+        enumerable: true,
+        value: new Proxy({}, {}),
+        writable: true,
+      };
+    },
+    get() {
+      trapCalls.get += 1;
+      return new Proxy({ fabricated: true }, {});
+    },
+  });
+  return { value, target, trapCalls };
+}
+
+function nestedArraysAtDepth(deepestContainerDepth: number): unknown {
+  let value: unknown = null;
+  for (let index = 0; index <= deepestContainerDepth; index += 1) {
+    value = [value];
+  }
+  return value;
+}
+
+function nestedObjectsAtDepth(deepestContainerDepth: number): unknown {
+  let value: unknown = null;
+  for (let index = 0; index <= deepestContainerDepth; index += 1) {
+    value = { child: value };
+  }
+  return value;
+}
+
+function expectFixedProxyFailure(operation: () => unknown): void {
+  let error: unknown;
+  try {
+    operation();
+  } catch (caught) {
+    error = caught;
+  }
+  expect(error).toBeInstanceOf(CanonicalJsonError);
+  expect((error as Error).message).toBe(
+    "Canonical JSON rejected input (proxy-value)",
+  );
+  expect((error as Error).message).not.toContain(PROXY_SENTINEL);
+}
+
+function expectCanonicalBytesFailure(value: unknown): void {
+  let error: unknown;
+  try {
+    canonicalJsonBytes(value);
+  } catch (caught) {
+    error = caught;
+  }
+  expect(error).toBeInstanceOf(CanonicalJsonError);
+  expect(error).not.toBeInstanceOf(RangeError);
+}
+
+function expectHashFailure(event: object): void {
+  let error: unknown;
+  try {
+    hashLedgerEvent(event);
+  } catch (caught) {
+    error = caught;
+  }
+  expect(error).toBeInstanceOf(CanonicalJsonError);
+  expect(error).not.toBeInstanceOf(RangeError);
+}
 
 function expectCanonicalFailure(value: unknown): void {
   let error: unknown;

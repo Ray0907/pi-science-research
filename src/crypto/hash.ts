@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { types as utilTypes } from "node:util";
 
 import { CanonicalJsonError, canonicalJsonBytes } from "./canonical-json.js";
 
@@ -8,6 +9,10 @@ export function sha256Hex(input: string | Uint8Array): string {
 
 /** Hashes an event without its root entrySha256 field, framed by one LF byte. */
 export function hashLedgerEvent(event: object): string {
+  if (utilTypes.isProxy(event)) {
+    throw new CanonicalJsonError("proxy-value");
+  }
+
   const prototype = Object.getPrototypeOf(event);
   if (prototype !== Object.prototype && prototype !== null) {
     throw new CanonicalJsonError("non-plain-object");

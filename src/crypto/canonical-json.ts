@@ -1,3 +1,8 @@
+import { types as utilTypes } from "node:util";
+
+/** Root containers are depth 0; nested containers may reach this depth. */
+export const MAX_CANONICAL_JSON_DEPTH = 256;
+
 export type CanonicalJsonErrorCode =
   | "unsupported-type"
   | "non-finite-number"
@@ -5,7 +10,9 @@ export type CanonicalJsonErrorCode =
   | "sparse-array"
   | "non-plain-object"
   | "unsupported-property"
-  | "cyclic-value";
+  | "cyclic-value"
+  | "proxy-value"
+  | "maximum-depth-exceeded";
 
 /**
  * Indicates that a value is outside the closed JSON data model accepted by the
@@ -27,14 +34,18 @@ export class CanonicalJsonError extends TypeError {
  * data objects; arbitrary JavaScript values are deliberately unsupported.
  */
 export function canonicalJson(value: unknown): string {
-  return serialize(value, new WeakSet<object>());
+  return serialize(value, new WeakSet<object>(), 0);
 }
 
 export function canonicalJsonBytes(value: unknown): Buffer {
   return Buffer.from(canonicalJson(value), "utf8");
 }
 
-function serialize(value: unknown, ancestors: WeakSet<object>): string {
+function serialize(
+  value: unknown,
+  ancestors: WeakSet<object>,
+  depth: number,
+): string {
   if (value === null) return "null";
 
   switch (typeof value) {
@@ -47,25 +58,35 @@ function serialize(value: unknown, ancestors: WeakSet<object>): string {
       assertWellFormedUnicode(value);
       return JSON.stringify(value);
     case "object":
-      return serializeObject(value, ancestors);
+      return serializeObject(value, ancestors, depth);
     default:
       return fail("unsupported-type");
   }
 }
 
-function serializeObject(value: object, ancestors: WeakSet<object>): string {
+function serializeObject(
+  value: object,
+  ancestors: WeakSet<object>,
+  depth: number,
+): string {
+  if (utilTypes.isProxy(value)) fail("proxy-value");
+  if (depth > MAX_CANONICAL_JSON_DEPTH) fail("maximum-depth-exceeded");
   if (ancestors.has(value)) fail("cyclic-value");
   ancestors.add(value);
   try {
     return Array.isArray(value)
-      ? serializeArray(value, ancestors)
-      : serializePlainObject(value, ancestors);
+      ? serializeArray(value, ancestors, depth)
+      : serializePlainObject(value, ancestors, depth);
   } finally {
     ancestors.delete(value);
   }
 }
 
-function serializeArray(value: unknown[], ancestors: WeakSet<object>): string {
+function serializeArray(
+  value: unknown[],
+  ancestors: WeakSet<object>,
+  depth: number,
+): string {
   if (Object.getPrototypeOf(value) !== Array.prototype) {
     fail("non-plain-object");
   }
@@ -86,7 +107,7 @@ function serializeArray(value: unknown[], ancestors: WeakSet<object>): string {
     const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
     if (!descriptor) fail("sparse-array");
     assertEnumerableDataProperty(descriptor);
-    parts.push(serialize(descriptor.value, ancestors));
+    parts.push(serialize(descriptor.value, ancestors, depth + 1));
   }
 
   return `[${parts.join(",")}]`;
@@ -95,6 +116,7 @@ function serializeArray(value: unknown[], ancestors: WeakSet<object>): string {
 function serializePlainObject(
   value: object,
   ancestors: WeakSet<object>,
+  depth: number,
 ): string {
   const prototype = Object.getPrototypeOf(value);
   if (prototype !== Object.prototype && prototype !== null) {
@@ -115,7 +137,9 @@ function serializePlainObject(
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     if (!descriptor) fail("unsupported-property");
     assertEnumerableDataProperty(descriptor);
-    parts.push(`${JSON.stringify(key)}:${serialize(descriptor.value, ancestors)}`);
+    parts.push(
+      `${JSON.stringify(key)}:${serialize(descriptor.value, ancestors, depth + 1)}`,
+    );
   }
 
   return `{${parts.join(",")}}`;
