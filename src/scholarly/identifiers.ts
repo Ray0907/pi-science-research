@@ -36,6 +36,13 @@ export interface ScholarlyScalarOptions { readonly maxCanonicalScalarBytes?: num
 export interface ProspectiveSourceIdentityOptions extends ScholarlyScalarOptions {
   readonly maxSourceRecordCanonicalBytes?: number;
 }
+/** @internal Package seam for reusing one bounded immutable source snapshot. */
+export interface PreparedProspectiveSourceIdentity {
+  readonly record: SourceRecord;
+  readonly canonicalJson: string;
+  readonly canonicalBytes: number;
+}
+
 export interface SourceUrlPolicyContext {
   readonly allowHttp?: boolean;
   readonly approvedHttpHosts?: readonly string[];
@@ -116,6 +123,15 @@ export function validateProspectiveSourceIdentityFields(
   policy?: SourceUrlPolicyContext,
   options?: ProspectiveSourceIdentityOptions,
 ): SourceRecord {
+  return prepareProspectiveSourceIdentityFields(source, policy, options).record;
+}
+
+/** @internal Validates and canonicalizes a prospective source exactly once. */
+export function prepareProspectiveSourceIdentityFields(
+  source: SourceRecord,
+  policy?: SourceUrlPolicyContext,
+  options?: ProspectiveSourceIdentityOptions,
+): PreparedProspectiveSourceIdentity {
   const normalizedOptions = closedOptions(options, ["maxCanonicalScalarBytes", "maxSourceRecordCanonicalBytes"]);
   const scalarBytes = positiveLimit(normalizedOptions.maxCanonicalScalarBytes, DEFAULT_SCALAR_BYTES, HARD_SCALAR_BYTES);
   const recordBytes = positiveLimit(normalizedOptions.maxSourceRecordCanonicalBytes, DEFAULT_SOURCE_BYTES, HARD_SOURCE_BYTES);
@@ -132,7 +148,8 @@ export function validateProspectiveSourceIdentityFields(
     if (error instanceof StructuralLimitError) fail("identifier.record-too-large");
     return fail("identifier.invalid-type");
   }
-  if (Buffer.byteLength(encoded, "utf8") > recordBytes) fail("identifier.record-too-large");
+  const canonicalBytes = Buffer.byteLength(encoded, "utf8");
+  if (canonicalBytes > recordBytes) fail("identifier.record-too-large");
   const snapshot = JSON.parse(encoded) as unknown;
   const parsed = parse(SourceRecordSchema, snapshot);
   if (!parsed.success) fail("identifier.invalid-type");
@@ -155,7 +172,7 @@ export function validateProspectiveSourceIdentityFields(
     const url = new URL(canonicalUrl);
     if (url.port !== "" || !normalizedPolicy.approvedHttpHosts.includes(url.hostname)) fail("url.http-host-not-approved");
   }
-  return deepFreeze(record);
+  return Object.freeze({ record: deepFreeze(record), canonicalJson: encoded, canonicalBytes });
 }
 
 function normalizeDoiWithLimit(input: unknown, limit: number): string {

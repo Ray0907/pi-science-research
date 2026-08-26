@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 import { canonicalJson } from "../../src/crypto/canonical-json.js";
 import type { RequestRecord } from "../../src/domain/events.js";
 import type { SourceRecord } from "../../src/domain/research-records.js";
+import { prepareProspectiveSourceIdentityFields } from "../../src/scholarly/identifiers.js";
 import {
   SourceIdentityError,
   buildRequestProvenanceIndex,
@@ -83,7 +84,10 @@ function options(overrides: SourceIdentityOptions = {}): SourceIdentityOptions {
 }
 
 function diagnostics(): RequestProvenanceDiagnostics {
-  return { sourceVisits: 0, requestVisits: 0, requestUrlVisits: 0, metadataStepVisits: 0, witnessInsertions: 0 };
+  return {
+    sourceVisits: 0, sourceCanonicalizations: 0, revisionVisits: 0, requestVisits: 0,
+    requestUrlVisits: 0, metadataStepVisits: 0, witnessInsertions: 0,
+  };
 }
 
 function errorCode(action: () => unknown): string | undefined {
@@ -211,6 +215,30 @@ describe("source identity and provenance", () => {
     expect(noOp.changedSourceRefs).toEqual([]);
   });
 
+  test("uses complete authoritative history for effective identity and ambiguity bridges", () => {
+    const stable = { doi: "10.1234/history", pmid: "7654321", pmcid: "PMC7654321" };
+    const historical = src("src-history.0000001", { identifiers: stable, revision: 1, canonicalUrl: "https://history.example/original" });
+    const nulled = { ...historical, revision: 2, identifiers: { doi: null, pmid: null, pmcid: null }, canonicalUrl: "https://history.example/latest" };
+    const update = { ...nulled, revision: 3 };
+    const duplicate = src("src-history.0000002", { identifiers: stable, canonicalUrl: "https://candidate.example/distinct" });
+    expect(mergeSourceRecords([nulled, historical], [update]).sources.at(-1)!.identifiers).toEqual(stable);
+    const merged = mergeSourceRecords([nulled, historical], [duplicate, update]);
+    expect(merged.aliases).toEqual({ [duplicate.sourceId]: historical.sourceId });
+    expect(merged.sources.at(-1)!.identifiers).toEqual(stable);
+    expect(merged.sources.at(-1)!.revision).toBe(3);
+
+    const left1 = src("src-historyleft.0001", { identifiers: { doi: stable.doi, pmid: null, pmcid: null } });
+    const left2 = { ...left1, revision: 2, identifiers: { doi: null, pmid: null, pmcid: null } };
+    const right1 = src("src-historyright.001", { identifiers: { doi: null, pmid: stable.pmid, pmcid: null } });
+    const right2 = { ...right1, revision: 2, identifiers: { doi: null, pmid: null, pmcid: null } };
+    const bridge = src("src-historybridge.01", {
+      identifiers: { doi: stable.doi, pmid: stable.pmid, pmcid: null }, canonicalUrl: "https://bridge.example/distinct",
+    });
+    const ambiguous = mergeSourceRecords([left2, right1, left1, right2], [bridge]);
+    expect(ambiguous.aliases).toEqual({});
+    expect(ambiguous.conflicts).toContainEqual(expect.objectContaining({ code: "source.ambiguous-identity", field: "identity" }));
+  });
+
   test("returns aliases and deeply frozen canonical arrays", () => {
     const a = src("src-frozen.00000001", { identifiers: { doi: DOI, pmid: null, pmcid: null } });
     const b = src("src-frozen.00000002", { identifiers: { doi: DOI, pmid: null, pmcid: null } });
@@ -226,9 +254,17 @@ describe("source identity and provenance", () => {
     const a = src("src-bound.000000001");
     const b = src("src-bound.000000002");
     expect(errorCode(() => mergeSourceRecords([], [a, b], { maxSources: 1 }))).toBe("source.too-many-records");
+    const emptySources = Array.from({ length: 200 }, (_, index) => src(`src-empty.${String(index).padStart(8, "0")}`));
+    const emptyRequests = emptySources.map((source, index) => req(`request-${String(index + 500).padStart(16, "0")}`, source.sourceId, {
+      requestedUrl: null, finalUrl: null, redirectUrls: [], resultSourceIds: [],
+    }));
+    expect(buildRequestProvenanceIndex(emptySources, emptyRequests, {
+      maxSources: 250, maxRequests: 250, maxProvenanceSteps: 1,
+    }).sourceCount).toBe(200);
     const crowded = { ...a, retrievalRequestIds: [REQUEST_A, REQUEST_B] };
-    expect(errorCode(() => validateProspectiveSourceSemantics(crowded, { maxSources: 1, maxRequests: 1, maxProvenanceSteps: 1 })))
-      .toBe("source.too-many-provenance-steps");
+    expect(errorCode(() => validateProspectiveSourceSemantics(crowded, {
+      maxSources: 250, maxRequests: 250, maxProvenanceSteps: 1,
+    }))).toBe("source.too-many-provenance-steps");
     expect(errorCode(() => buildRequestProvenanceIndex([a], [req(REQUEST_A, a.sourceId), req(REQUEST_B, a.sourceId)], { maxRequests: 1 })))
       .toBe("source.too-many-records");
   });
@@ -239,7 +275,10 @@ describe("source identity and provenance", () => {
     const requests = [req(REQUEST_A, a.sourceId, { finalUrl: "https://example.org/a" }), req(REQUEST_B, b.sourceId, { finalUrl: "https://example.org/b", redirectUrls: ["https://redirect.example.org/b"] })];
     const visits = diagnostics();
     const index = buildRequestProvenanceIndex([a, b], requests, undefined, visits);
-    expect(visits).toEqual({ sourceVisits: 2, requestVisits: 2, requestUrlVisits: 5, metadataStepVisits: 1, witnessInsertions: 3 });
+    expect(visits).toEqual({
+      sourceVisits: 2, sourceCanonicalizations: 2, revisionVisits: 2, requestVisits: 2,
+      requestUrlVisits: 5, metadataStepVisits: 1, witnessInsertions: 3,
+    });
     const before = { ...visits };
     expect(validateSourceCanonicalUrlProvenance(a, index)).toEqual({ kind: "transport-url", requestId: REQUEST_A, matchedField: "finalUrl" });
     expect(validateSourceCanonicalUrlProvenance(b, index)).toEqual({ kind: "transport-url", requestId: REQUEST_B, matchedField: "finalUrl" });
@@ -266,8 +305,8 @@ describe("source identity and provenance", () => {
     const manyVisits = diagnostics();
     const manyIndex = buildRequestProvenanceIndex(manySources, manyRequests, undefined, manyVisits);
     expect(manyVisits).toEqual({
-      sourceVisits: 200, requestVisits: 200, requestUrlVisits: 400,
-      metadataStepVisits: 200, witnessInsertions: 400,
+      sourceVisits: 200, sourceCanonicalizations: 200, revisionVisits: 200, requestVisits: 200,
+      requestUrlVisits: 400, metadataStepVisits: 200, witnessInsertions: 400,
     });
     const manyBefore = { ...manyVisits };
     expect(validateSourceCanonicalUrlProvenance(manySources[0]!, manyIndex)).toEqual({
@@ -277,6 +316,31 @@ describe("source identity and provenance", () => {
       kind: "transport-url", requestId: manyRequests.at(-1)!.requestId, matchedField: "finalUrl",
     });
     expect(manyVisits).toEqual(manyBefore);
+
+    const revisionBase = src("src-longhistory.0001", { identifiers: { doi: DOI, pmid: PMID, pmcid: "PMC123" } });
+    const revisions = Array.from({ length: 2_000 }, (_, index) => ({ ...revisionBase, revision: index + 1 }));
+    const revisionVisits = diagnostics();
+    const reverseIndex = buildRequestProvenanceIndex([...revisions].reverse(), [], {
+      maxSources: 2_500, maxProvenanceSteps: 1,
+    }, revisionVisits);
+    expect(revisionVisits).toEqual({
+      sourceVisits: 2_000, sourceCanonicalizations: 2_000, revisionVisits: 2_000, requestVisits: 0,
+      requestUrlVisits: 0, metadataStepVisits: 0, witnessInsertions: 0,
+    });
+    const forwardIndex = buildRequestProvenanceIndex(revisions, [], { maxSources: 2_500, maxProvenanceSteps: 1 });
+    const reverseSnapshot = validatedProvenanceRecordsForSnapshot(reverseIndex);
+    const forwardSnapshot = validatedProvenanceRecordsForSnapshot(forwardIndex);
+    expect(reverseSnapshot.sources.map(({ revision }) => revision)).toEqual(revisions.map(({ revision }) => revision));
+    expect(reverseSnapshot.sourceCanonicalJson).toEqual(forwardSnapshot.sourceCanonicalJson);
+  });
+
+  test("prepares one frozen Task 1 source snapshot with cached canonical bytes", () => {
+    const source = src("src-prepared.0000001", { identifiers: { doi: DOI, pmid: PMID, pmcid: "PMC123" } });
+    const prepared = prepareProspectiveSourceIdentityFields(source);
+    expect(prepared.canonicalJson).toBe(canonicalJson(source));
+    expect(prepared.canonicalBytes).toBe(Buffer.byteLength(prepared.canonicalJson, "utf8"));
+    expect(Object.isFrozen(prepared)).toBe(true);
+    expect(Object.isFrozen(prepared.record)).toBe(true);
   });
 
   test("attributes canonical URL to a linked result transport URL", () => {
@@ -485,8 +549,6 @@ describe("source identity and provenance", () => {
       { maxCanonicalScalarBytes: 1_001, maxRequestRecordCanonicalBytes: 1_000 },
       { maxSourceRecordCanonicalBytes: 2_001, maxAggregateCanonicalBytes: 2_000 },
       { maxRequestRecordCanonicalBytes: 2_001, maxAggregateCanonicalBytes: 2_000 },
-      { maxSources: 2, maxRequests: 1, maxProvenanceSteps: 1 },
-      { maxSources: 1, maxRequests: 2, maxProvenanceSteps: 1 },
       { maxSources: 0 }, { maxSources: 100_001 }, { maxRequests: 500_001 }, { maxProvenanceSteps: 1_000_001 },
       { maxCanonicalScalarBytes: 16_385 }, { maxSourceRecordCanonicalBytes: 1_048_577 },
       { maxRequestRecordCanonicalBytes: 1_048_577 }, { maxAggregateCanonicalBytes: 67_108_865 }, { unknown: 1 },
