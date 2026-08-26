@@ -1190,6 +1190,24 @@ describe("cross-module ledger invariants", () => {
     expectCorruption(late.values, "reducer.request-cancelled");
   });
 
+  test("preserves deterministic ledger insertion order for cache-eligible requests", () => {
+    const events = new Events(); events.base(); events.started();
+    const addSuccess = (requestId: typeof REQUEST_1 | typeof REQUEST_2, journalLocalSeq: number, logicalRequestId: string) => {
+      events.add("identity_reserved", { kind: "request", id: requestId, origin: "child-import" });
+      const intent = events.add("request_intent_recorded", { attemptId: ATTEMPT_1, journalLocalSeq,
+        journalEntrySha256: journalLocalSeq === 1 ? HASH : "c".repeat(64),
+        intent: requestIntent({ requestId, logicalRequestId }) });
+      events.add("request_result_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: journalLocalSeq + 1,
+        journalEntrySha256: journalLocalSeq === 1 ? HASH_B : "d".repeat(64),
+        intentLedgerSeq: intent.seq, request: { ...requestResult({ requestId, logicalRequestId }), status: "success", httpStatus: 200,
+          responseSha256: HASH, responseFile: { relativePath: `.state/request-payloads/${HASH}`, mediaType: "application/json", decodedBytes: 2, sha256: HASH },
+          encodedBytes: 2, decodedBytes: 2, errorClass: null } });
+    };
+    addSuccess(REQUEST_2, 1, "series-second-id-first");
+    addSuccess(REQUEST_1, 3, "series-first-id-second");
+    expect(reduceLedgerEvents(events.values).cacheEligibleRequestIds).toEqual([REQUEST_2, REQUEST_1]);
+  });
+
   test("authorizes a cross-child request retry through one canonical schedule/start", () => {
     const events = new Events(); events.base(); events.started();
     events.add("identity_reserved", { kind: "request", id: REQUEST_1, origin: "child-import" });

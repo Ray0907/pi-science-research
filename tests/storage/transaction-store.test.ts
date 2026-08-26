@@ -451,6 +451,18 @@ describe("canonical transaction store", () => {
     await expectCode(prepareTransaction(runRoot, input(), { maxReferences: 1 }), "transaction.too-many-records");
   });
 
+  test("enforces aggregate persisted record limits in verify, inspect, and reconcile without rewriting objects", async () => {
+    const runRoot = await root();
+    const ref = await committed(runRoot);
+    const manifestPath = join(runRoot, ref.relativePath);
+    const before = await readFile(manifestPath);
+    const limited = { maxRecords: 2, maxTotalRecords: 6, maxArrayLength: 10 };
+    await expectCode(verifyTransaction(runRoot, ref, limited), "transaction.too-many-records");
+    await expectCode(inspectCanonicalTransactionsReadOnly(runRoot, baseEvents(), limited), "transaction.too-many-records");
+    await expectCode(reconcileCanonicalTransactions(runRoot, baseEvents(), limited), "transaction.too-many-records");
+    expect(await readFile(manifestPath)).toEqual(before);
+  });
+
   test("rejects structurally hostile records before canonicalization", async () => {
     const runRoot = await root();
     for (const [record, options] of [
@@ -777,6 +789,32 @@ describe("canonical transaction store", () => {
       await expectCode(failure, "transaction.invalid-input");
       await expect(failure.catch((error: Error) => error.message)).resolves.not.toContain(`secret-${kind}`);
     }
+  });
+
+  test("does not comparison-sort canonical records while verifying persisted objects", async () => {
+    const runRoot = await root();
+    const ref = await committed(runRoot);
+    const diagnostics = { recordVisits: 0, comparisonSortCalls: 0 };
+    await expect(verifyTransaction(runRoot, ref, { recordReadDiagnostics: diagnostics })).resolves.toMatchObject({ manifestSha256: ref.sha256 });
+    expect(diagnostics).toEqual({ recordVisits: 7, comparisonSortCalls: 0 });
+  });
+
+  test("rejects out-of-order persisted records even when hashes and references are self-consistent", async () => {
+    const runRoot = await root();
+    const ref = await committed(runRoot);
+    const directory = join(runRoot, ref.relativePath, "..");
+    const sourcePath = join(directory, "sources.jsonl");
+    const reversed = (await readFile(sourcePath, "utf8")).trimEnd().split("\n").reverse().join("\n") + "\n";
+    await writeFile(sourcePath, reversed);
+    const manifestPath = join(directory, "manifest.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    const sourceFile = manifest.files.find((file: { kind: string }) => file.kind === "sources");
+    sourceFile.decodedBytes = Buffer.byteLength(reversed);
+    sourceFile.sha256 = sha256Hex(reversed);
+    manifest.sourceRefs.reverse();
+    const manifestBytes = `${canonicalJson(manifest)}\n`;
+    await writeFile(manifestPath, manifestBytes);
+    await expectCode(verifyTransaction(runRoot, { ...ref, sha256: sha256Hex(manifestBytes) }), "transaction.corrupt");
   });
 
   test("rejects symlink and hardlink substitution, tampered bytes, hashes, counts, and refs", async () => {

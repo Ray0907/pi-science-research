@@ -137,6 +137,7 @@ export interface TransactionStoreOptions {
   onReadOnlyCheck?: (phase: string, path: string) => void | Promise<void>;
   onHandleOpened?: (kind: "read-only-hierarchy" | "mutation-hierarchy" | "transaction-directory" | "transaction-file", path: string, handle: FileHandle) => void | Promise<void>;
   requestIndexDiagnostics?: RequestIndexDiagnostics;
+  recordReadDiagnostics?: { recordVisits: number; comparisonSortCalls: number };
 }
 
 export interface TransactionManifestRef {
@@ -654,10 +655,28 @@ function validateInputRoot(input: CanonicalTransactionInput): void {
 }
 
 function validateAndSortRecords(kind: CanonicalRecordKind, values: readonly JsonRecord[], attemptId: string, limits: Limits): JsonRecord[] {
+  const output = validateRecords(kind, values, attemptId, limits);
+  const metadata = KIND_ID[kind];
+  output.sort((left, right) => compareRecordOrder(metadata, left, right));
+  return output;
+}
+
+function validateOrderedRecords(kind: CanonicalRecordKind, values: readonly JsonRecord[], attemptId: string, limits: Limits,
+  diagnostics?: { recordVisits: number; comparisonSortCalls: number }): JsonRecord[] {
+  const output = validateRecords(kind, values, attemptId, limits);
+  const metadata = KIND_ID[kind];
+  if (diagnostics) diagnostics.recordVisits += output.length;
+  for (let index = 1; index < output.length; index++) {
+    if (compareRecordOrder(metadata, output[index - 1]!, output[index]!) >= 0) fail("transaction.corrupt");
+  }
+  return output;
+}
+
+function validateRecords(kind: CanonicalRecordKind, values: readonly JsonRecord[], attemptId: string, limits: Limits): JsonRecord[] {
   if (values.length > limits.maxRecords) fail("transaction.too-many-records");
   const metadata = KIND_ID[kind];
   const seen = new Set<string>();
-  const output = values.map((inputRecord) => {
+  return values.map((inputRecord) => {
     const record = inputRecord as JsonRecord;
     for (const field of ALL_ID_FIELDS) {
       if (field !== metadata.field && Object.prototype.hasOwnProperty.call(record, field)
@@ -683,12 +702,12 @@ function validateAndSortRecords(kind: CanonicalRecordKind, values: readonly Json
     if (lineBytes > limits.maxLineBytes) fail("transaction.file-too-large");
     return cloned;
   });
-  output.sort((left, right) => {
-    const leftId = left[metadata.field] as string;
-    const rightId = right[metadata.field] as string;
-    return compareCodeUnits(leftId, rightId) || Number(left.revision ?? 0) - Number(right.revision ?? 0);
-  });
-  return output;
+}
+
+function compareRecordOrder(metadata: (typeof KIND_ID)[CanonicalRecordKind], left: JsonRecord, right: JsonRecord): number {
+  const leftId = left[metadata.field] as string;
+  const rightId = right[metadata.field] as string;
+  return compareCodeUnits(leftId, rightId) || Number(left.revision ?? 0) - Number(right.revision ?? 0);
 }
 
 function compareCodeUnits(left: string, right: string): number {
@@ -990,7 +1009,13 @@ async function verifyDirectory(
     const manifest = parsed.value;
     if (manifest.transactionId !== transactionId || manifest.files.length !== KINDS.length
       || manifest.files.some((file, index) => file.kind !== KINDS[index] || file.relativePath !== `${file.kind}.jsonl`)) fail("transaction.corrupt");
+    let declaredRecordCount = 0;
+    for (const file of manifest.files) {
+      if (file.recordCount > limits.maxRecords || file.recordCount > limits.maxTotalRecords - declaredRecordCount) fail("transaction.too-many-records");
+      declaredRecordCount += file.recordCount;
+    }
     const records = Object.create(null) as Record<CanonicalRecordKind, JsonRecord[]>;
+    let actualRecordCount = 0;
     for (const [index, kind] of KINDS.entries()) {
       const file = manifest.files[index]!;
       const pinnedFile = await openAndReadPinnedFile(join(directory, file.relativePath), limits.maxFileBytes, limits, pinned, options);
@@ -1001,8 +1026,9 @@ async function verifyDirectory(
       if (bytes.byteLength !== file.decodedBytes || sha256Hex(bytes) !== file.sha256) fail("transaction.corrupt");
       const parsedRecords = parseJsonLines(bytes, limits);
       if (parsedRecords.length !== file.recordCount) fail("transaction.corrupt");
-      records[kind] = validateAndSortRecords(kind, parsedRecords, manifest.attemptId, limits);
-      if (!Buffer.from(records[kind].map((record) => `${canonicalJson(record)}\n`).join(""), "utf8").equals(bytes)) fail("transaction.corrupt");
+      if (parsedRecords.length > limits.maxTotalRecords - actualRecordCount) fail("transaction.too-many-records");
+      actualRecordCount += parsedRecords.length;
+      records[kind] = validateOrderedRecords(kind, parsedRecords, manifest.attemptId, limits, options.recordReadDiagnostics);
       await assertPinnedTransactionDirectory(container);
       await assertPinnedTransactionDirectory(pinned);
     }
@@ -1095,7 +1121,8 @@ function parseJsonLines(bytes: Buffer, limits: Limits): JsonRecord[] {
   try { text = fatalUtf8.decode(bytes); } catch { fail("transaction.corrupt"); }
   if (!text.endsWith("\n")) fail("transaction.corrupt");
   const lines = text.slice(0, -1).split("\n");
-  if (lines.length > limits.maxRecords || lines.some((line) => line.length === 0 || Buffer.byteLength(line) + 1 > limits.maxLineBytes)) fail("transaction.corrupt");
+  if (lines.length > limits.maxRecords) fail("transaction.too-many-records");
+  if (lines.some((line) => line.length === 0 || Buffer.byteLength(line) + 1 > limits.maxLineBytes)) fail("transaction.corrupt");
   return lines.map((line) => {
     let value: unknown;
     try { value = JSON.parse(line); } catch { fail("transaction.corrupt"); }

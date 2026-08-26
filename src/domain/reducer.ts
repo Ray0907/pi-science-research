@@ -726,7 +726,7 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
     currentEpoch,
     operations: Object.freeze(operationOutput),
     requests: Object.freeze(requestOutput),
-    cacheEligibleRequestIds: Object.freeze(cacheEligibleRequestIds.sort()),
+    cacheEligibleRequestIds: Object.freeze(cacheEligibleRequestIds),
     cancelledEpochs: Object.freeze(cancellationOutput),
   });
 }
