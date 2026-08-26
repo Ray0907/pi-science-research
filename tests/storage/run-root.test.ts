@@ -1,4 +1,5 @@
 import { constants } from "node:fs";
+import { spawn } from "node:child_process";
 import {
   link,
   lstat,
@@ -6,6 +7,7 @@ import {
   mkdtemp,
   open,
   readFile,
+  readdir,
   realpath,
   rename,
   rm,
@@ -54,6 +56,24 @@ function options(project: string, extra: Record<string, unknown> = {}) {
 
 function expectCode(code: string) {
   return expect.objectContaining({ code });
+}
+
+function spawnVitestChild(root: string, environment: Record<string, string>): Promise<void> {
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(process.execPath, [resolve("node_modules/vitest/vitest.mjs"), "run", "--root", root, "child.test.ts"], {
+      cwd: process.cwd(),
+      env: { ...process.env, ...environment },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let output = "";
+    child.stdout.on("data", (chunk) => { output += String(chunk); });
+    child.stderr.on("data", (chunk) => { output += String(chunk); });
+    child.once("error", reject);
+    child.once("exit", (code) => {
+      if (code === 0) resolvePromise();
+      else reject(new Error(`child vitest failed (${code}) ${output.slice(-2000)}`));
+    });
+  });
 }
 
 afterEach(async () => {
@@ -110,6 +130,68 @@ describe("createOwnedRunRoot", () => {
     await a.close();
     await b.close();
   });
+
+  test("cross-process creators never adopt another process marker", async () => {
+    const { base, project } = await fixture();
+    const harnessRoot = join(base, "child-harness");
+    await mkdir(harnessRoot);
+    const barrier = join(harnessRoot, "start");
+    const source = resolve("src/storage/run-root.ts");
+    const childTest = join(harnessRoot, "child.test.ts");
+    await writeFile(childTest, `
+import { test, expect } from "vitest";
+import { readFile, stat, writeFile } from "node:fs/promises";
+import { createOwnedRunRoot } from ${JSON.stringify(source)};
+
+test("cross-process create", async () => {
+  while (true) {
+    try { await stat(process.env.BARRIER!); break; } catch { await new Promise((resolve) => setTimeout(resolve, 10)); }
+  }
+  const root = await createOwnedRunRoot({
+    trustedProject: process.env.PROJECT!, repositoryRoot: process.env.PROJECT!, topic: "cross-process",
+    runId: process.env.RUN_ID! as \`run-\${string}\`, ownershipToken: process.env.TOKEN!,
+    now: () => new Date("2026-08-25T12:34:56.000Z"),
+  });
+  const marker = JSON.parse(await readFile(root.path + "/.pi-science-research-owner.json", "utf8"));
+  await writeFile(process.env.RESULT!, JSON.stringify({ path: root.path, marker }));
+  await root.close();
+  expect(marker.runId).toBe(process.env.RUN_ID);
+});
+`);
+
+    const children = [0, 1, 2].map((index) => {
+      const runId = `run-${String(index + 1).repeat(16)}`;
+      const token = String(index + 1).repeat(64);
+      const result = join(harnessRoot, `result-${index}.json`);
+      return {
+        runId,
+        token,
+        result,
+        completion: spawnVitestChild(harnessRoot, {
+          BARRIER: barrier, PROJECT: project, RUN_ID: runId, TOKEN: token, RESULT: result,
+        }),
+      };
+    });
+    await writeFile(barrier, "go");
+    const completions = await Promise.allSettled(children.map((child) => child.completion));
+    const failure = completions.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failure) throw failure.reason;
+
+    const records = await Promise.all(children.map(async (child) => ({
+      child,
+      value: JSON.parse(await readFile(child.result, "utf8")),
+    })));
+    const canonicalProject = await realpath(project);
+    expect(new Set(records.map(({ value }) => value.path))).toEqual(new Set([
+      join(canonicalProject, "research", "2026-08-25-cross-process"),
+      join(canonicalProject, "research", "2026-08-25-cross-process-2"),
+      join(canonicalProject, "research", "2026-08-25-cross-process-3"),
+    ]));
+    for (const { child, value } of records) {
+      expect(value.marker.runId).toBe(child.runId);
+      expect(value.marker.ownershipTokenSha256).toBe(sha256Hex(child.token));
+    }
+  }, 30_000);
 
   test("generates a cryptographic token through the injected source when omitted", async () => {
     const { project } = await fixture();
@@ -267,6 +349,153 @@ describe("createOwnedRunRoot", () => {
     );
   });
 
+  test("approval and allowlists never override global credential roots", async () => {
+    const { project } = await fixture();
+    const sshTarget = join(homedir(), ".ssh", "pi-science-research-forbidden");
+    let approvals = 0;
+    await expect(createOwnedRunRoot(options(project, {
+      requestedPath: sshTarget,
+      allowAbsoluteRequestedPath: true,
+      approvedOutsideRoots: [homedir()],
+      approveOutside: async () => { approvals += 1; return true; },
+    }))).rejects.toEqual(expectCode("run-root.unsafe-root"));
+    expect(approvals).toBe(0);
+
+    await expect(createOwnedRunRoot(options(project, {
+      requestedPath: join(homedir(), ".ssh-confusion", "run"),
+      allowAbsoluteRequestedPath: true,
+      approveOutside: async () => { approvals += 1; return false; },
+    }))).rejects.toEqual(expectCode("run-root.outside-denied"));
+    expect(approvals).toBe(1);
+  });
+
+  test("XDG config roots are globally forbidden", async () => {
+    const { base, project } = await fixture();
+    const xdg = join(base, "xdg-config");
+    await mkdir(xdg);
+    const previous = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = xdg;
+    try {
+      await expect(createOwnedRunRoot(options(project, {
+        requestedPath: join(xdg, "research-run"),
+        allowAbsoluteRequestedPath: true,
+        approvedOutsideRoots: [base],
+      }))).rejects.toEqual(expectCode("run-root.unsafe-root"));
+    } finally {
+      if (previous === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = previous;
+    }
+  });
+
+  test("never adopts a replacement research parent temp directory", async () => {
+    const { base, project } = await fixture();
+    let injected = false;
+    await expect(createOwnedRunRoot(options(project, {
+      topic: "research-parent-swap",
+      onCheck: async (phase: string) => {
+        if (phase !== "after-research-temp-mkdir" || injected) return;
+        injected = true;
+        const canonicalProject = await realpath(project);
+        const temp = (await readdir(canonicalProject)).find((entry) => entry.startsWith(".tmp-run-root-"));
+        if (!temp) throw new Error("temp absent");
+        const original = join(canonicalProject, temp);
+        await rename(original, join(base, "moved-research-temp"));
+        await mkdir(original);
+      },
+    }))).rejects.toEqual(expectCode("run-root.replaced"));
+    expect(injected).toBe(true);
+    await expect(lstat(join(await realpath(project), "research"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test.each([
+    "after-leaf-temp-mkdir-before-pin",
+    "after-leaf-temp-pin-before-open",
+    "after-marker-create-before-write",
+    "after-marker-write-before-fsync",
+    "after-marker-fsync-before-rename",
+    "after-leaf-rename-before-final-open",
+    "after-final-open-before-return",
+  ])("never adopts a replacement directory injected at %s", async (phase) => {
+    const { base, project } = await fixture();
+    let injected = false;
+    await expect(createOwnedRunRoot(options(project, {
+      topic: `swap-${phase}`,
+      onCheck: async (seen: string) => {
+        if (seen !== phase || injected) return;
+        injected = true;
+        const research = join(await realpath(project), "research");
+        const entries = await readdir(research);
+        const selected = phase === "after-leaf-rename-before-final-open" || phase === "after-final-open-before-return"
+          ? entries.find((entry) => entry.includes(`swap-${phase}`) && !entry.startsWith(".tmp-"))
+          : entries.find((entry) => entry.startsWith(".tmp-run-root-"));
+        if (!selected) throw new Error("injection target absent");
+        const original = join(research, selected);
+        const moved = join(base, `moved-${phase}`);
+        await rename(original, moved);
+        await mkdir(original);
+      },
+    }))).rejects.toBeInstanceOf(RunRootError);
+    expect(injected).toBe(true);
+    const research = join(await realpath(project), "research");
+    for (const entry of await readdir(research)) {
+      if (!entry.includes(`swap-${phase}`) || entry.startsWith(".tmp-")) continue;
+      await expect(readFile(join(research, entry, ".pi-science-research-owner.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    }
+  });
+
+  test.each([
+    { kind: "hook", boundary: "after-research-temp-mkdir" },
+    { kind: "durability", boundary: "research-temp-directory-synced" },
+    { kind: "rename", boundary: "research" },
+    { kind: "durability", boundary: "research-parent-synced" },
+    { kind: "hook", boundary: "after-leaf-temp-mkdir-before-pin" },
+    { kind: "durability", boundary: "leaf-temp-directory-synced" },
+    { kind: "hook", boundary: "before-marker-create" },
+    { kind: "hook", boundary: "after-marker-create-before-write" },
+    { kind: "hook", boundary: "after-marker-write-before-fsync" },
+    { kind: "durability", boundary: "marker-synced" },
+    { kind: "durability", boundary: "leaf-marker-directory-synced" },
+    { kind: "rename", boundary: "leaf" },
+    { kind: "durability", boundary: "leaf-parent-synced" },
+  ])("recovers safely after $kind failure at $boundary", async ({ kind, boundary }) => {
+    const { project } = await fixture();
+    let renameCount = 0;
+    await expect(createOwnedRunRoot(options(project, {
+      topic: "durability",
+      onCheck: async (phase: string) => {
+        if (kind === "hook" && phase === boundary) throw new Error("injected");
+      },
+      durability: async (handle: { sync(): Promise<void> }, step: string) => {
+        if (kind === "durability" && step === boundary) throw new Error("injected");
+        await handle.sync();
+      },
+      rename: async (from: string, to: string) => {
+        renameCount += 1;
+        const isResearch = basename(to) === "research";
+        if (kind === "rename" && ((boundary === "research" && isResearch) || (boundary === "leaf" && !isResearch))) {
+          throw new Error("injected");
+        }
+        await rename(from, to);
+      },
+    }))).rejects.toBeInstanceOf(RunRootError);
+    if (kind === "rename") expect(renameCount).toBeGreaterThan(0);
+
+    const recovered = await createOwnedRunRoot(options(project, { topic: "durability", ownershipToken: OTHER_TOKEN }));
+    const marker = JSON.parse(await readFile(join(recovered.path, ".pi-science-research-owner.json"), "utf8"));
+    expect(marker.runId).toBe(RUN_ID);
+    expect(marker.ownershipTokenSha256).toBe(sha256Hex(OTHER_TOKEN));
+    const research = join(await realpath(project), "research");
+    for (const entry of await readdir(research)) {
+      if (entry.startsWith(".tmp-run-root-")) continue;
+      const info = await lstat(join(research, entry));
+      if (!info.isDirectory()) continue;
+      const visibleMarker = JSON.parse(await readFile(join(research, entry, ".pi-science-research-owner.json"), "utf8"));
+      expect(visibleMarker.runId).toBe(RUN_ID);
+      expect([sha256Hex(TOKEN), sha256Hex(OTHER_TOKEN)]).toContain(visibleMarker.ownershipTokenSha256);
+    }
+    await recovered.close();
+  });
+
   test("fails closed when the project root is swapped during checks", async () => {
     const { base, project } = await fixture();
     const moved = join(base, "project-old");
@@ -287,6 +516,21 @@ describe("createOwnedRunRoot", () => {
     expect((await lstat(project)).isSymbolicLink()).toBe(true);
   });
 
+  test("failure paths close every descriptor exposed to durability hooks", async () => {
+    const { project } = await fixture();
+    const handles: Array<{ stat(): Promise<unknown> }> = [];
+    await expect(createOwnedRunRoot(options(project, {
+      topic: "descriptor-cleanup",
+      durability: async (handle: { stat(): Promise<unknown>; sync(): Promise<void> }, step: string) => {
+        handles.push(handle);
+        if (step === "marker-synced") throw new Error("injected");
+        await handle.sync();
+      },
+    }))).rejects.toBeInstanceOf(RunRootError);
+    expect(handles.length).toBeGreaterThan(0);
+    for (const handle of handles) await expect(handle.stat()).rejects.toBeDefined();
+  });
+
   test("propagates durability failure and does not return a partially owned root", async () => {
     const { project } = await fixture();
     await expect(createOwnedRunRoot(options(project, {
@@ -296,7 +540,7 @@ describe("createOwnedRunRoot", () => {
     }))).rejects.toEqual(expectCode("run-root.io-failed"));
 
     const recovered = await createOwnedRunRoot(options(project));
-    expect(recovered.path.endsWith("2026-08-25-crispr-rna-review-2")).toBe(true);
+    expect(recovered.path.endsWith("2026-08-25-crispr-rna-review")).toBe(true);
     await recovered.close();
   });
 });
@@ -383,6 +627,8 @@ describe("assertContainedWrite", () => {
     const authorization = await assertContainedWrite(owned, target);
 
     expect(authorization.relativePath).toBe(".state/events.jsonl");
+    expect(Number.isInteger(authorization.rootFd)).toBe(true);
+    expect(authorization.rootFd).toBeGreaterThanOrEqual(0);
     expect(Number.isInteger(authorization.parentFd)).toBe(true);
     expect(authorization.parentFd).toBeGreaterThanOrEqual(0);
     expect(authorization.openFlags & constants.O_EXCL).not.toBe(0);
@@ -391,13 +637,8 @@ describe("assertContainedWrite", () => {
     await authorization.close();
     await mkdir(join(owned.path, ".state"));
     const refreshed = await assertContainedWrite(owned, target);
-    if (process.platform === "linux") {
-      const created = await refreshed.openExclusive();
-      await created.close();
-    } else {
-      await expect(refreshed.openExclusive()).rejects.toEqual(expectCode("run-root.io-failed"));
-      await expect(lstat(target)).rejects.toMatchObject({ code: "ENOENT" });
-    }
+    await expect(refreshed.openExclusive()).rejects.toEqual(expectCode("run-root.io-failed"));
+    await expect(lstat(target)).rejects.toMatchObject({ code: "ENOENT" });
     await refreshed.close();
     await owned.close();
   });
@@ -465,15 +706,18 @@ describe("assertContainedWrite", () => {
     await mkdir(parent);
     await mkdir(outside);
     const authorization = await assertContainedWrite(owned, join(parent, "file"));
+    let hookRan = false;
 
     await expect(authorization.openExclusive(0o600, {
       onCheck: async (phase: string) => {
-        if (phase === "before-open") {
+        if (phase === "after-final-check-before-open") {
+          hookRan = true;
           await rename(parent, moved);
           await symlink(outside, parent);
         }
       },
     })).rejects.toBeInstanceOf(RunRootError);
+    expect(hookRan).toBe(true);
     await expect(lstat(join(outside, "file"))).rejects.toMatchObject({ code: "ENOENT" });
     await authorization.close();
     await owned.close();
