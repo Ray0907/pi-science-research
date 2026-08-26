@@ -336,7 +336,9 @@ describe("pure ledger recovery reduction", () => {
     events.add("retry_started", { scheduleId: RETRY_1, logicalOperationId: LOGICAL, attemptId: ATTEMPT_2, attemptOrdinal: 2, scheduledFromSeq: scheduledSeq });
     const reparsed = JSON.parse(JSON.stringify(events.values)) as FoundationLedgerEvent[];
 
-    const decision = recoveryDecisionFor(reduceLedgerEvents(reparsed), LOGICAL);
+    const reduced = reduceLedgerEvents(reparsed);
+    const decision = recoveryDecisionFor(reduced, LOGICAL);
+    expect(recoveryDecisionFor(reduced, LOGICAL)).toBe(decision);
     expect(decision).toEqual({
       kind: "resume-started-retry",
       attemptId: ATTEMPT_2,

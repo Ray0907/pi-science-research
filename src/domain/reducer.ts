@@ -40,6 +40,7 @@ export interface ReducedOperationState {
   readonly activeScheduleIds: readonly string[];
   readonly consumedScheduleIds: readonly string[];
   readonly startedRetries: readonly ReducedStartedRetryState[];
+  readonly recoveryDecision: RecoveryDecision;
 }
 
 export interface ReducedRequestState {
@@ -684,13 +685,20 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
         schedule,
       })];
     });
+    const frozenAttempts = Object.freeze(attemptOutput);
+    const frozenSchedules = Object.freeze(scheduleOutput);
+    const frozenActiveScheduleIds = Object.freeze(activeScheduleIds);
+    const frozenConsumedScheduleIds = Object.freeze(consumed);
+    const frozenStartedRetries = Object.freeze(startedRetries);
     operationOutput[logicalOperationId] = Object.freeze({
       logicalOperationId,
-      attempts: Object.freeze(attemptOutput),
-      schedules: Object.freeze(scheduleOutput),
-      activeScheduleIds: Object.freeze(activeScheduleIds),
-      consumedScheduleIds: Object.freeze(consumed),
-      startedRetries: Object.freeze(startedRetries),
+      attempts: frozenAttempts,
+      schedules: frozenSchedules,
+      activeScheduleIds: frozenActiveScheduleIds,
+      consumedScheduleIds: frozenConsumedScheduleIds,
+      startedRetries: frozenStartedRetries,
+      recoveryDecision: decideRecovery(frozenAttempts, frozenSchedules, frozenActiveScheduleIds,
+        frozenConsumedScheduleIds, frozenStartedRetries, cancelledEpochs),
     });
   }
   const requestOutput = Object.create(null) as Record<string, ReducedRequestState>;
@@ -723,14 +731,25 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
   });
 }
 
+const NOT_FOUND_DECISION: RecoveryDecision = Object.freeze({ kind: "not-found" });
+
 export function recoveryDecisionFor(state: ReducedLedgerState, logicalOperationId: string): RecoveryDecision {
-  const operation = state.operations[logicalOperationId];
-  if (!operation) return Object.freeze({ kind: "not-found" });
-  if (operation.attempts.some((attempt) => attempt.phase === "committed")) return Object.freeze({ kind: "skip-committed" });
-  const latest = operation.attempts.at(-1);
-  if (!latest) return Object.freeze({ kind: "not-found" });
-  const activeSchedules = new Set(operation.activeScheduleIds);
-  const startedRetry = operation.startedRetries.at(-1);
+  return state.operations[logicalOperationId]?.recoveryDecision ?? NOT_FOUND_DECISION;
+}
+
+function decideRecovery(
+  attempts: readonly ReducedAttemptState[],
+  schedules: readonly RetrySchedule[],
+  activeScheduleIds: readonly string[],
+  consumedScheduleIds: readonly string[],
+  startedRetries: readonly ReducedStartedRetryState[],
+  cancelledEpochs: ReadonlyMap<number, number>,
+): RecoveryDecision {
+  if (attempts.some((attempt) => attempt.phase === "committed")) return Object.freeze({ kind: "skip-committed" });
+  const latest = attempts.at(-1);
+  if (!latest) return NOT_FOUND_DECISION;
+  const activeSchedules = new Set(activeScheduleIds);
+  const startedRetry = startedRetries.at(-1);
   if (startedRetry) {
     return Object.freeze({
       kind: "resume-started-retry",
@@ -739,8 +758,8 @@ export function recoveryDecisionFor(state: ReducedLedgerState, logicalOperationI
       schedule: startedRetry.schedule,
     });
   }
-  const consumed = new Set(operation.consumedScheduleIds);
-  const pending = operation.schedules.find((schedule) => activeSchedules.has(schedule.scheduleId)
+  const consumed = new Set(consumedScheduleIds);
+  const pending = schedules.find((schedule) => activeSchedules.has(schedule.scheduleId)
     && !consumed.has(schedule.scheduleId)
     && schedule.failedAttemptId === latest.attemptId
     && schedule.nextAttemptOrdinal === latest.ordinal + 1);
@@ -748,7 +767,7 @@ export function recoveryDecisionFor(state: ReducedLedgerState, logicalOperationI
   if (latest.failureState === "terminal-failed" || latest.failureState === "cancelled") {
     return Object.freeze({ kind: "no-action", reason: "terminal" });
   }
-  const cancelSeq = state.cancelledEpochs[String(latest.executionEpoch)];
+  const cancelSeq = cancelledEpochs.get(latest.executionEpoch);
   if ((latest.phase === "result" || latest.phase === "records")
     && latest.transactionId
     && latest.resultSeq !== null

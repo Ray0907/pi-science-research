@@ -556,6 +556,30 @@ describe("canonical transaction store", () => {
     await expectCode(prepareTransaction(runRoot, input({ claims: [{ ...claim(), statement: "changed" }] })), "transaction.id-conflict");
   });
 
+  test("uses only snapshot-prior accepted references for standalone pending objects", async () => {
+    const referenced = { ...source("src-sequence.ref", 1, "reference"), retrievalRequestIds: [], metadataProvenance: [],
+      lineage: { studyId: null, cohortIds: [], datasetIds: [], relatedSourceIds: [], relationTypes: [] } };
+    const dependent = { ...source("src-sequence.dependent", 1, "dependent"), retrievalRequestIds: [], metadataProvenance: [],
+      lineage: { studyId: null, cohortIds: [], datasetIds: [], relatedSourceIds: ["src-sequence.ref"], relationTypes: [] } };
+    const laterRoot = await root();
+    await committed(laterRoot, input({ transactionId: "tx-0000000000000002", attemptId: "attempt-0000000000000002", sourceResultSeq: 8,
+      sources: [referenced], claims: [], evidence: [], verifications: [], requests: [], calculations: [] }));
+    await expectCode(prepareTransaction(laterRoot, input({ sourceResultSeq: 7, sources: [dependent], claims: [], evidence: [], verifications: [],
+      requests: [], calculations: [] })), "transaction.invalid-reference");
+
+    const priorRoot = await root();
+    await committed(priorRoot, input({ sources: [referenced], claims: [], evidence: [], verifications: [], requests: [], calculations: [] }));
+    await expect(prepareTransaction(priorRoot, input({ transactionId: "tx-0000000000000002", attemptId: "attempt-0000000000000002",
+      sourceResultSeq: 8, sources: [dependent], claims: [], evidence: [], verifications: [], requests: [], calculations: [] }))).resolves.toBeDefined();
+  });
+
+  test("rejects duplicate source result sequence across committed directories", async () => {
+    const runRoot = await root();
+    await committed(runRoot, input({ sources: [], claims: [], evidence: [], verifications: [], requests: [], calculations: [] }));
+    await expectCode(prepareTransaction(runRoot, input({ transactionId: "tx-0000000000000002", attemptId: "attempt-0000000000000002",
+      sourceResultSeq: 7, sources: [], claims: [], evidence: [], verifications: [], requests: [], calculations: [] })), "transaction.invalid-reference");
+  });
+
   test("resolves exact refs across transactions and enforces revision progression", async () => {
     const runRoot = await root();
     await committed(runRoot);
@@ -1169,10 +1193,20 @@ describe("read-only transaction race resistance", () => {
       events.push(event("attempt_committed", { attemptId, transactionId, taskId: TASK, sourceResultSeq: result.seq }));
     }
     const frozen = JSON.stringify(events);
-    const diagnostics = { eventVisits: 0, requestRecordsValidated: 0, catalogRecordVisits: 0, catalogReferenceVisits: 0, catalogRevisionScans: 0 };
+    const diagnostics = { eventVisits: 0, requestRecordsValidated: 0, catalogRecordVisits: 0, catalogReferenceVisits: 0, catalogRevisionScans: 0,
+      snapshotEventVisits: 0, objectVerifications: 0, catalogAdditions: 0, decisionLookups: 0 };
     await expect(inspectCanonicalTransactionsReadOnly(runRoot, events, { requestIndexDiagnostics: diagnostics })).resolves.toMatchObject({ committedCount: count });
-    expect(diagnostics).toEqual({ eventVisits: events.length, requestRecordsValidated: 0, catalogRecordVisits: count, catalogReferenceVisits: count - 1, catalogRevisionScans: 0 });
+    expect(diagnostics).toEqual({ eventVisits: events.length, requestRecordsValidated: 0, catalogRecordVisits: count,
+      catalogReferenceVisits: count - 1, catalogRevisionScans: 0, snapshotEventVisits: events.length * 2,
+      objectVerifications: count, catalogAdditions: count, decisionLookups: 0 });
     expect(JSON.stringify(events)).toBe(frozen);
+
+    const reconcileDiagnostics = { eventVisits: 0, requestRecordsValidated: 0, catalogRecordVisits: 0, catalogReferenceVisits: 0,
+      catalogRevisionScans: 0, snapshotEventVisits: 0, objectVerifications: 0, catalogAdditions: 0, decisionLookups: 0 };
+    await expect(reconcileCanonicalTransactions(runRoot, events, { requestIndexDiagnostics: reconcileDiagnostics })).resolves.toEqual([]);
+    expect(reconcileDiagnostics).toEqual({ eventVisits: events.length, requestRecordsValidated: 0, catalogRecordVisits: count,
+      catalogReferenceVisits: count - 1, catalogRevisionScans: 0, snapshotEventVisits: events.length * 2,
+      objectVerifications: count, catalogAdditions: count, decisionLookups: 0 });
   });
 
   test.each(["transaction-directory", "transaction-file"])("closes a newly opened %s handle when its first validation throws", async (targetKind) => {

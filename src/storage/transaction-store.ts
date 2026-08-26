@@ -102,6 +102,10 @@ export interface RequestIndexDiagnostics {
   catalogRecordVisits?: number;
   catalogReferenceVisits?: number;
   catalogRevisionScans?: number;
+  snapshotEventVisits?: number;
+  objectVerifications?: number;
+  catalogAdditions?: number;
+  decisionLookups?: number;
 }
 
 export interface TransactionStoreOptions {
@@ -203,6 +207,7 @@ export async function prepareTransaction(
   const root = await initializeRoot(runRoot, options);
   return withMutationLock(root, options, async () => {
     const catalog = await loadReferenceCatalog(root, limits, snapshot.transactionId, options.requestIndexDiagnostics);
+    if (catalog.sourceResultSeqs.has(snapshot.sourceResultSeq) || snapshot.sourceResultSeq <= catalog.maxSourceResultSeq) fail("transaction.invalid-reference");
     const built = buildTransaction(snapshot, limits, catalog, options.requestIndexDiagnostics);
     const committedPath = transactionDirectory(root, "committed", built.manifest.transactionId);
     if (await pathExists(committedPath)) {
@@ -271,6 +276,7 @@ export async function commitTransaction(
       throw error;
     });
     const catalog = await loadReferenceCatalog(root, limits, transactionId, options.requestIndexDiagnostics);
+    if (catalog.sourceResultSeqs.has(staged.manifest.sourceResultSeq) || staged.manifest.sourceResultSeq <= catalog.maxSourceResultSeq) fail("transaction.invalid-reference");
     validateCatalogAndReferences(staged.records, catalog, limits, options.requestIndexDiagnostics);
     const stagePath = transactionDirectory(root, ".staging", transactionId);
     await protocolStep("before-rename", options);
@@ -350,79 +356,21 @@ export async function inspectCanonicalTransactionsReadOnly(
   let failure: unknown;
   try {
     await assertPinnedHierarchy(guard, "read-only-before", options);
-    const results = new Map<string, Extract<FoundationLedgerEvent, { type: "result_recorded" }>>();
-    const recordCommits = new Map<string, Extract<FoundationLedgerEvent, { type: "records_committed" }>>();
-    const attemptCommits = new Set<string>();
-    for (const event of events) {
-      if (event.type === "result_recorded") results.set(event.payload.transactionId, event);
-      if (event.type === "records_committed") recordCommits.set(event.payload.transactionId, event);
-      if (event.type === "attempt_committed") attemptCommits.add(event.payload.transactionId);
-    }
-    const verifiedByTransaction = new Map<string, VerifiedTransaction>();
-    const acceptedVerified: VerifiedTransaction[] = [];
-    const catalog = emptyCatalog();
-    for (const event of events) {
-      if (event.type === "records_committed") {
-        const result = results.get(event.payload.transactionId);
-        const attempt = result ? ledger.attempts.get(result.payload.attemptId) : undefined;
-        if (!result || !attempt) fail("transaction.corrupt");
-        const verified = await verifyCommittedEvent(root, event, limits, options);
-        assertResultManifestLink(result, verified.manifest, ledger.runId, attempt);
-        assertCanonicalRequestRecords(verified.records.requests, requestIndex, options.requestIndexDiagnostics);
-        verifiedByTransaction.set(event.payload.transactionId, verified);
-      }
-      if (event.type === "attempt_committed") {
-        const verified = verifiedByTransaction.get(event.payload.transactionId);
-        if (!verified) fail("transaction.corrupt");
-        acceptedVerified.push(verified);
-      }
-    }
-    acceptedVerified.sort((left, right) => left.manifest.sourceResultSeq - right.manifest.sourceResultSeq);
-    for (const verified of acceptedVerified) {
-      validateCatalogAndReferences(verified.records, catalog, limits, options.requestIndexDiagnostics);
-    }
-    let pendingCount = 0;
-    let unmaterializedResultCount = 0;
-    for (const [transactionId, result] of results) {
-      if (recordCommits.has(transactionId)) {
-        if (!attemptCommits.has(transactionId)) {
-          const attempt = ledger.attempts.get(result.payload.attemptId);
-          if (!attempt) fail("transaction.corrupt");
-          const decision = recoveryDecisionFor(reduced, attempt.logicalOperationId);
-          if (decision.kind === "finish-transaction" && decision.transactionId === transactionId) pendingCount++;
-        }
-        continue;
-      }
-      const attempt = ledger.attempts.get(result.payload.attemptId);
-      if (!attempt) fail("transaction.corrupt");
-      const directory = transactionDirectory(root, "committed", transactionId as TransactionId);
-      const materialized = await pathExists(directory);
-      if (materialized) {
-        const verified = await verifyDirectory(root, "committed", transactionId as TransactionId, limits, options);
-        assertResultManifestLink(result, verified.manifest, ledger.runId, attempt);
-        const decision = recoveryDecisionFor(reduced, attempt.logicalOperationId);
-        if (decision.kind === "finish-transaction" && decision.transactionId === transactionId) {
-          validateCatalogAndReferences(verified.records, catalog, limits, options.requestIndexDiagnostics, false);
-          assertCanonicalRequestRecords(verified.records.requests, requestIndex, options.requestIndexDiagnostics);
-          pendingCount++;
-        }
-      } else {
-        unmaterializedResultCount++;
-      }
-    }
+    const replay = await replayCanonicalSnapshot(root, events, reduced, ledger, requestIndex, limits, options, false);
     const committedDirectory = join(root, ".state/transactions/committed");
     if (await pathExists(committedDirectory)) {
       await assertOwnedDirectory(committedDirectory);
       const entries = await readdir(committedDirectory, { withFileTypes: true }).catch(() => fail("transaction.io-failed"));
       for (const entry of entries) {
         if (!entry.isDirectory() || entry.isSymbolicLink() || !ID_PATTERNS.transaction.test(entry.name)) fail("transaction.suspicious-entry");
-        if (!results.has(entry.name)) fail("transaction.corrupt");
+        if (!replay.results.has(entry.name)) fail("transaction.corrupt");
       }
-    } else if (recordCommits.size > 0) {
+    } else if (replay.recordCommits.size > 0) {
       fail("transaction.missing-object");
     }
     await assertPinnedHierarchy(guard, "read-only-after", options);
-    result = Object.freeze({ committedCount: attemptCommits.size, pendingCount, unmaterializedResultCount });
+    result = Object.freeze({ committedCount: replay.attemptCommits.size, pendingCount: replay.pendingCount,
+      unmaterializedResultCount: replay.unmaterializedResultCount });
   } catch (error) {
     failure = error;
   }
@@ -441,59 +389,112 @@ export async function reconcileCanonicalTransactions(
   const requestIndex = buildCanonicalRequestIndex(events, options.requestIndexDiagnostics);
   const root = await initializeRoot(runRoot, options);
   return withMutationLock(root, options, async () => {
-    const results = new Map<string, Extract<FoundationLedgerEvent, { type: "result_recorded" }>>();
-    const commits = new Map<string, Extract<FoundationLedgerEvent, { type: "records_committed" }>>();
-    for (const event of events) {
-      if (event.type === "result_recorded") results.set(event.payload.transactionId, event);
-      if (event.type === "records_committed") commits.set(event.payload.transactionId, event);
-    }
-    const ledgerCatalog = emptyCatalog();
-    const accepted = new Set(events.filter((event) => event.type === "attempt_committed").map((event) => event.payload.transactionId));
-    const committedObjects: VerifiedTransaction[] = [];
-    for (const event of events) {
-      if (event.type !== "records_committed") continue;
-      const verified = await verifyCommittedEvent(root, event, limitsFrom(options), options);
-      assertCanonicalRequestRecords(verified.records.requests, requestIndex, options.requestIndexDiagnostics);
-      if (accepted.has(event.payload.transactionId)) committedObjects.push(verified);
-    }
-    committedObjects.sort((left, right) => left.manifest.sourceResultSeq - right.manifest.sourceResultSeq);
-    for (const verified of committedObjects) {
-      validateCatalogAndReferences(verified.records, ledgerCatalog, limitsFrom(options), options.requestIndexDiagnostics);
-    }
-    const decisions: TransactionReconciliationDecision[] = [];
-    for (const [transactionId, result] of results) {
-      const commit = commits.get(transactionId);
-      const attempt = ledger.attempts.get(result.payload.attemptId);
-      if (!attempt) fail("transaction.corrupt");
-      if (commit) {
-        const verified = await verifyCommittedEvent(root, commit, limitsFrom(options), options);
-        assertResultManifestLink(result, verified.manifest, ledger.runId, attempt);
-      } else {
-        const directory = transactionDirectory(root, "committed", transactionId as TransactionId);
-        if (await pathExists(directory)) {
-          const verified = await verifyDirectory(root, "committed", transactionId as TransactionId, limitsFrom(options), options);
-          assertResultManifestLink(result, verified.manifest, ledger.runId, attempt);
-          const decision = recoveryDecisionFor(reduced, attempt.logicalOperationId);
-          if (decision.kind === "finish-transaction" && decision.transactionId === transactionId) {
-            validateCatalogAndReferences(verified.records, ledgerCatalog, limitsFrom(options), options.requestIndexDiagnostics, false);
-            assertCanonicalRequestRecords(verified.records.requests, requestIndex, options.requestIndexDiagnostics);
-            decisions.push(Object.freeze({ kind: "finish-transaction", transactionId: transactionId as TransactionId }));
-          }
-        }
-      }
-    }
-    for (const commit of commits.values()) {
-      if (!results.has(commit.payload.transactionId)) fail("transaction.corrupt");
-      await verifyCommittedEvent(root, commit, limitsFrom(options), options);
-    }
+    const replay = await replayCanonicalSnapshot(root, events, reduced, ledger, requestIndex, limitsFrom(options), options, true);
     const committedEntries = await readdir(join(root, ".state/transactions/committed"), { withFileTypes: true })
       .catch(() => fail("transaction.io-failed"));
     for (const entry of committedEntries) {
       if (!entry.isDirectory() || !ID_PATTERNS.transaction.test(entry.name)) fail("transaction.suspicious-entry");
-      if (!results.has(entry.name)) fail("transaction.corrupt");
+      if (!replay.results.has(entry.name)) fail("transaction.corrupt");
     }
-    return decisions;
+    return replay.decisions;
   });
+}
+
+interface SnapshotReplayResult {
+  results: Map<string, Extract<FoundationLedgerEvent, { type: "result_recorded" }>>;
+  recordCommits: Map<string, Extract<FoundationLedgerEvent, { type: "records_committed" }>>;
+  attemptCommits: Set<string>;
+  pendingCount: number;
+  unmaterializedResultCount: number;
+  decisions: TransactionReconciliationDecision[];
+}
+
+async function replayCanonicalSnapshot(
+  root: string,
+  events: readonly FoundationLedgerEvent[],
+  reduced: ReturnType<typeof reduceLedgerEvents>,
+  ledger: ReturnType<typeof canonicalLedgerLinks>,
+  requestIndex: CanonicalRequestIndex,
+  limits: Limits,
+  options: TransactionStoreOptions,
+  emitDecisions: boolean,
+): Promise<SnapshotReplayResult> {
+  const diagnostics = options.requestIndexDiagnostics;
+  const results = new Map<string, Extract<FoundationLedgerEvent, { type: "result_recorded" }>>();
+  const recordCommits = new Map<string, Extract<FoundationLedgerEvent, { type: "records_committed" }>>();
+  const attemptCommits = new Set<string>();
+  for (const event of events) {
+    if (diagnostics) diagnostics.snapshotEventVisits = (diagnostics.snapshotEventVisits ?? 0) + 1;
+    if (event.type === "result_recorded") {
+      if (results.has(event.payload.transactionId)) fail("transaction.corrupt");
+      results.set(event.payload.transactionId, event);
+    } else if (event.type === "records_committed") {
+      if (recordCommits.has(event.payload.transactionId)) fail("transaction.corrupt");
+      recordCommits.set(event.payload.transactionId, event);
+    } else if (event.type === "attempt_committed") {
+      if (attemptCommits.has(event.payload.transactionId)) fail("transaction.corrupt");
+      attemptCommits.add(event.payload.transactionId);
+    }
+  }
+  const seenResults = new Map<string, Extract<FoundationLedgerEvent, { type: "result_recorded" }>>();
+  const verified = new Map<string, VerifiedTransaction>();
+  const catalog = emptyCatalog();
+  const decisions: TransactionReconciliationDecision[] = [];
+  let pendingCount = 0;
+  let unmaterializedResultCount = 0;
+  const noteDecision = (attempt: AttemptRecord) => {
+    if (diagnostics) diagnostics.decisionLookups = (diagnostics.decisionLookups ?? 0) + 1;
+    return recoveryDecisionFor(reduced, attempt.logicalOperationId);
+  };
+  const verifyObject = async (transactionId: string, event?: Extract<FoundationLedgerEvent, { type: "records_committed" }>) => {
+    const cached = verified.get(transactionId);
+    if (cached) return cached;
+    if (diagnostics) diagnostics.objectVerifications = (diagnostics.objectVerifications ?? 0) + 1;
+    const object = event
+      ? await verifyCommittedEvent(root, event, limits, options)
+      : await verifyDirectory(root, "committed", transactionId as TransactionId, limits, options);
+    verified.set(transactionId, object);
+    return object;
+  };
+  for (const event of events) {
+    if (diagnostics) diagnostics.snapshotEventVisits = (diagnostics.snapshotEventVisits ?? 0) + 1;
+    if (event.type === "result_recorded") {
+      seenResults.set(event.payload.transactionId, event);
+      if (recordCommits.has(event.payload.transactionId)) continue;
+      const attempt = ledger.attempts.get(event.payload.attemptId);
+      if (!attempt) fail("transaction.corrupt");
+      const directory = transactionDirectory(root, "committed", event.payload.transactionId);
+      if (!await pathExists(directory)) { unmaterializedResultCount += 1; continue; }
+      const object = await verifyObject(event.payload.transactionId);
+      assertResultManifestLink(event, object.manifest, ledger.runId, attempt);
+      const decision = noteDecision(attempt);
+      if (decision.kind === "finish-transaction" && decision.transactionId === event.payload.transactionId) {
+        validateCatalogAndReferences(object.records, catalog, limits, diagnostics, false);
+        assertCanonicalRequestRecords(object.records.requests, requestIndex, diagnostics);
+        pendingCount += 1;
+        if (emitDecisions) decisions.push(Object.freeze({ kind: "finish-transaction", transactionId: event.payload.transactionId }));
+      }
+    } else if (event.type === "records_committed") {
+      const result = seenResults.get(event.payload.transactionId);
+      if (!result) fail("transaction.corrupt");
+      const attempt = ledger.attempts.get(result.payload.attemptId);
+      if (!attempt) fail("transaction.corrupt");
+      const object = await verifyObject(event.payload.transactionId, event);
+      assertResultManifestLink(result, object.manifest, ledger.runId, attempt);
+      assertCanonicalRequestRecords(object.records.requests, requestIndex, diagnostics);
+      if (!attemptCommits.has(event.payload.transactionId)) {
+        validateCatalogAndReferences(object.records, catalog, limits, diagnostics, false);
+        const decision = noteDecision(attempt);
+        if (decision.kind === "finish-transaction" && decision.transactionId === event.payload.transactionId) pendingCount += 1;
+      }
+    } else if (event.type === "attempt_committed") {
+      const object = verified.get(event.payload.transactionId);
+      const result = seenResults.get(event.payload.transactionId);
+      if (!object || !result || event.payload.attemptId !== result.payload.attemptId) fail("transaction.corrupt");
+      validateCatalogAndReferences(object.records, catalog, limits, diagnostics);
+    }
+  }
+  return { results, recordCommits, attemptCommits, pendingCount, unmaterializedResultCount, decisions };
 }
 
 export async function reconstructCanonicalRecords(
@@ -715,6 +716,8 @@ interface ReferenceCatalog {
   readonly highestRevision: Record<CanonicalRecordKind, Map<string, number>>;
   readonly requestById: Map<string, JsonRecord>;
   readonly requestSeriesOrdinal: Map<string, string>;
+  readonly sourceResultSeqs: Set<number>;
+  maxSourceResultSeq: number;
 }
 
 function emptyCatalog(): ReferenceCatalog {
@@ -723,6 +726,8 @@ function emptyCatalog(): ReferenceCatalog {
     highestRevision: Object.fromEntries(KINDS.map((kind) => [kind, new Map()])) as ReferenceCatalog["highestRevision"],
     requestById: new Map(),
     requestSeriesOrdinal: new Map(),
+    sourceResultSeqs: new Set(),
+    maxSourceResultSeq: -1,
   };
 }
 
@@ -739,9 +744,14 @@ async function loadReferenceCatalog(
     if (!entry.isDirectory() || !ID_PATTERNS.transaction.test(entry.name)) fail("transaction.suspicious-entry");
     if (entry.name !== excludeTransactionId) transactions.push(await verifyDirectory(root, "committed", entry.name, limits));
   }
-  transactions.sort((left, right) => left.manifest.sourceResultSeq - right.manifest.sourceResultSeq);
+  radixOrderTransactions(transactions);
   const catalog = emptyCatalog();
-  for (const transaction of transactions) validateCatalogAndReferences(transaction.records, catalog, limits, diagnostics);
+  for (const transaction of transactions) {
+    if (catalog.sourceResultSeqs.has(transaction.manifest.sourceResultSeq)) fail("transaction.invalid-reference");
+    catalog.sourceResultSeqs.add(transaction.manifest.sourceResultSeq);
+    catalog.maxSourceResultSeq = transaction.manifest.sourceResultSeq;
+    validateCatalogAndReferences(transaction.records, catalog, limits, diagnostics);
+  }
   return catalog;
 }
 
@@ -829,7 +839,32 @@ function validateCatalogAndReferences(
     for (const item of verification.corrections as { claimId: string }[]) stable("claims", item.claimId);
     for (const id of verification.independentEvidenceIds as string[]) stable("evidence", id);
   }
-  if (apply) applyCatalogAdditions(catalog, staged);
+  if (apply) {
+    if (diagnostics) diagnostics.catalogAdditions = (diagnostics.catalogAdditions ?? 0)
+      + KINDS.reduce((count, kind) => count + records[kind].length, 0);
+    applyCatalogAdditions(catalog, staged);
+  }
+}
+
+function radixOrderTransactions(transactions: VerifiedTransaction[]): void {
+  const seen = new Set<number>();
+  for (const transaction of transactions) {
+    const seq = transaction.manifest.sourceResultSeq;
+    if (!Number.isSafeInteger(seq) || seq < 0 || seen.has(seq)) fail("transaction.invalid-reference");
+    seen.add(seq);
+  }
+  let source = transactions.slice();
+  let target: VerifiedTransaction[] = [];
+  const radix = 256;
+  const divisor = Array.from({ length: 7 }, (_, index) => radix ** index);
+  for (const place of divisor) {
+    const buckets = Array.from({ length: radix }, () => [] as VerifiedTransaction[]);
+    for (const transaction of source) buckets[Math.floor(transaction.manifest.sourceResultSeq / place) % radix]!.push(transaction);
+    target = [];
+    for (const bucket of buckets) target.push(...bucket);
+    source = target;
+  }
+  transactions.splice(0, transactions.length, ...source);
 }
 
 function applyCatalogAdditions(catalog: ReferenceCatalog, staged: ReferenceCatalog): void {
