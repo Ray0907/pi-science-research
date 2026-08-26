@@ -3,12 +3,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 
+import type { FoundationEventPayload, FoundationEventType, FoundationLedgerEvent } from "../../src/domain/events.js";
 import type { AttemptRecord, RunSnapshot, TaskRecord } from "../../src/domain/records.js";
 import { recoveryDecisionFor, reduceLedgerEvents } from "../../src/domain/reducer.js";
 import { openEventLedger, type EventLedger } from "../../src/storage/event-ledger.js";
 import {
   RetryStoreError,
   assertRetryContinuation,
+  cancelRetryEpoch,
   createRetryController,
   recoverRetryState,
   scheduleRetry,
@@ -64,8 +66,8 @@ function attemptRecord(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
 
 function policy(overrides: Partial<RetryPolicy> = {}): RetryPolicy {
   return {
-    maxAttempts: 3, baseDelayMs: 1_000, maxDelayMs: 30_000, activeTimeRemainingMs: 60_000,
-    finalizationReserveMs: 10_000, retryAfterMs: null, reasonClass: "transient", scheduleId: () => RETRY_1,
+    maxAttempts: 3, baseDelayMs: 1_000, maxDelayMs: 30_000,
+    retryAfterMs: null, reasonClass: "transient", scheduleId: () => RETRY_1,
     attemptId: () => ATTEMPT_2, ...overrides,
   };
 }
@@ -97,6 +99,16 @@ async function seedFailed(ledger: EventLedger, attempt = attemptRecord(), failur
 async function expectRetryError(action: Promise<unknown>, code: string): Promise<void> {
   await expect(action).rejects.toMatchObject({ name: "RetryStoreError", code });
   await expect(action).rejects.not.toThrow(/capability|secret/i);
+}
+
+class EventBuilder {
+  readonly values: FoundationLedgerEvent[] = [];
+  add<T extends FoundationEventType>(type: T, payload: FoundationEventPayload<T>): FoundationLedgerEvent {
+    const seq = this.values.length + 1;
+    const event = { schemaVersion: 1, seq, occurredAt: AT.toISOString(), eventId: `large-${seq}`, type, payload, prevSha256: HASH, entrySha256: HASH } as FoundationLedgerEvent;
+    this.values.push(event);
+    return event;
+  }
 }
 
 describe("durable retry scheduling", () => {
@@ -164,17 +176,32 @@ describe("durable retry scheduling", () => {
     await ledger.close();
   });
 
-  test("caps at deadline and active budget without consuming finalization reserve", async () => {
+  test("derives active budget from canonical checkpoints and preserves the finalization reserve", async () => {
     const ledger = await newLedger();
     await seedFailed(ledger);
-    const capped = await scheduleRetry(ledger, attemptRecord(), policy({ baseDelayMs: 30_000, activeTimeRemainingMs: 12_000, finalizationReserveMs: 10_000 }), AT, () => 1);
+    await ledger.append("active_time_checkpoint", {
+      ownerTokenSha256: HASH, intervalStartedAt: AT.toISOString(), intervalEndedAt: "2026-08-25T12:49:58.000Z",
+      addedMs: 2_998_000, totalMs: 2_998_000,
+    });
+    const capped = await scheduleRetry(ledger, attemptRecord(), policy({ baseDelayMs: 30_000 }), AT, () => 1);
     expect(capped).toMatchObject({ kind: "scheduled", schedule: { delayMs: 2_000 } });
     await ledger.close();
+  });
 
-    const ledger2 = await newLedger();
-    await seedFailed(ledger2);
-    expect(await scheduleRetry(ledger2, attemptRecord(), policy({ activeTimeRemainingMs: 10_000, finalizationReserveMs: 10_000 }), AT, () => 0)).toEqual({ kind: "blocked", code: "retry-budget-exhausted" });
-    await ledger2.close();
+  test("uses the latest canonical budget amendment after reopen and rejects exhausted budget", async () => {
+    const { ledger, path } = await newLedgerWithPath();
+    await seedFailed(ledger);
+    await ledger.append("active_time_checkpoint", {
+      ownerTokenSha256: HASH, intervalStartedAt: AT.toISOString(), intervalEndedAt: "2026-08-25T12:08:00.000Z", addedMs: 480_000, totalMs: 480_000,
+    });
+    const oldBudget = { ...runSnapshot().budget, activeTimeUsedMs: 480_000 };
+    const newBudget = { ...oldBudget, activeTimeLimitMs: 600_000, finalizationReserveMs: 120_000 };
+    await ledger.append("budget_amended", { oldBudget, newBudget, operatorSource: "tui", reason: "smaller budget" });
+    await ledger.close();
+    const reopened = await openEventLedger(path);
+    expect(await scheduleRetry(reopened, attemptRecord(), policy(), AT, () => 0)).toEqual({ kind: "blocked", code: "retry-budget-exhausted" });
+    expect((await reopened.readAll()).some((event) => event.type === "retry_scheduled")).toBe(false);
+    await reopened.close();
   });
 
   test("starts only when due, reserves the new attempt, and recovers the same crash-prefix descriptor", async () => {
@@ -189,6 +216,45 @@ describe("durable retry scheduling", () => {
     expect(recoveryDecisionFor(reduceLedgerEvents(events), LOGICAL)).toMatchObject({ kind: "resume-started-retry", attemptId: ATTEMPT_2, attemptOrdinal: 2 });
     expect(await startScheduledRetry(ledger, RETRY_1, new Date("2026-08-25T12:00:02.000Z"), policy())).toMatchObject({ kind: "already-started", descriptor: { attemptId: ATTEMPT_2 } });
     await ledger.close();
+  });
+
+  test("start re-evaluates canonical budget and deadline before appending any start", async () => {
+    const ledger = await newLedger();
+    await seedFailed(ledger);
+    await scheduleRetry(ledger, attemptRecord(), policy(), AT, () => 1);
+    await ledger.append("active_time_checkpoint", {
+      ownerTokenSha256: HASH, intervalStartedAt: AT.toISOString(), intervalEndedAt: "2026-08-25T12:50:00.000Z",
+      addedMs: 3_000_000, totalMs: 3_000_000,
+    });
+    const before = (await ledger.readAll()).length;
+    expect(await startScheduledRetry(ledger, RETRY_1, new Date("2026-08-25T12:00:01.000Z"), policy())).toEqual({ kind: "blocked", code: "retry-budget-exhausted" });
+    expect((await ledger.readAll()).length).toBe(before);
+    await ledger.close();
+
+    const deadlineLedger = await newLedger();
+    await seedFailed(deadlineLedger);
+    await scheduleRetry(deadlineLedger, attemptRecord(), policy(), AT, () => 0);
+    expect(await startScheduledRetry(deadlineLedger, RETRY_1, new Date("2026-08-25T13:00:00.000Z"), policy())).toEqual({ kind: "blocked", code: "retry-deadline-exhausted" });
+    await deadlineLedger.close();
+  });
+
+  test("start uses a checkpointed and amended canonical budget after reopen", async () => {
+    const { ledger, path } = await newLedgerWithPath();
+    await seedFailed(ledger);
+    await scheduleRetry(ledger, attemptRecord(), policy(), AT, () => 0);
+    await ledger.append("active_time_checkpoint", {
+      ownerTokenSha256: HASH, intervalStartedAt: AT.toISOString(), intervalEndedAt: "2026-08-25T12:08:00.000Z", addedMs: 480_000, totalMs: 480_000,
+    });
+    const oldBudget = { ...runSnapshot().budget, activeTimeUsedMs: 480_000 };
+    await ledger.append("budget_amended", {
+      oldBudget, newBudget: { ...oldBudget, activeTimeLimitMs: 600_000, finalizationReserveMs: 120_000 }, operatorSource: "json", reason: "canonical amendment",
+    });
+    await ledger.close();
+    const reopened = await openEventLedger(path);
+    const before = (await reopened.readAll()).length;
+    expect(await startScheduledRetry(reopened, RETRY_1, AT, policy())).toEqual({ kind: "blocked", code: "retry-budget-exhausted" });
+    expect((await reopened.readAll()).length).toBe(before);
+    await reopened.close();
   });
 
   test("reconstructs immutable pending, started and cancelled schedule states in O(events) input semantics", async () => {
@@ -217,7 +283,31 @@ describe("durable retry scheduling", () => {
     await ledger.close();
   });
 
-  test("a start ordered before cancellation commits exactly once before the cancellation boundary", async () => {
+  test("cancellation permanently quarantines crash-after-start work across resume", async () => {
+    const ledger = await newLedger();
+    await seedFailed(ledger);
+    await scheduleRetry(ledger, attemptRecord(), policy(), AT, () => 0);
+    await startScheduledRetry(ledger, RETRY_1, AT, policy());
+    const cancel = await cancelRetryEpoch(ledger, 0, "user-pause");
+    expect(recoverRetryState(await ledger.readAll()).schedules[RETRY_1]).toMatchObject({ status: "cancelled", startedAttemptId: ATTEMPT_2 });
+    expect(await startScheduledRetry(ledger, RETRY_1, AT, policy())).toEqual({ kind: "cancelled", executionEpoch: 0 });
+    await ledger.append("resume_epoch_started", { priorEpoch: 0, executionEpoch: 1, priorCancelSeq: cancel.seq, checkpointStage: "researching", ownerTokenSha256: HASH });
+    expect(recoverRetryState(await ledger.readAll()).schedules[RETRY_1]).toMatchObject({ status: "cancelled", executionEpoch: 0 });
+    expect(await startScheduledRetry(ledger, RETRY_1, AT, policy())).toEqual({ kind: "cancelled", executionEpoch: 0 });
+    await ledger.close();
+  });
+
+  test("schedule after predecessor epoch cancellation appends nothing", async () => {
+    const ledger = await newLedger();
+    await seedFailed(ledger);
+    await cancelRetryEpoch(ledger, 0, "user-pause");
+    const before = (await ledger.readAll()).length;
+    expect(await scheduleRetry(ledger, attemptRecord(), policy(), AT, () => 0)).toEqual({ kind: "cancelled", executionEpoch: 0 });
+    expect((await ledger.readAll()).length).toBe(before);
+    await ledger.close();
+  });
+
+  test("a start ordered before cancellation commits once and is then quarantined", async () => {
     const ledger = await newLedger();
     await seedFailed(ledger);
     await scheduleRetry(ledger, attemptRecord(), policy(), AT, () => 0);
@@ -227,6 +317,43 @@ describe("durable retry scheduling", () => {
     await expect(startFirst).resolves.toMatchObject({ kind: "started", descriptor: { attemptId: ATTEMPT_2 } });
     await expect(cancelSecond).resolves.toMatchObject({ type: "cancel_requested" });
     expect((await ledger.readAll()).slice(-3).map((event) => event.type)).toEqual(["identity_reserved", "retry_started", "cancel_requested"]);
+    expect(recoverRetryState(await ledger.readAll()).schedules[RETRY_1]?.status).toBe("cancelled");
+    await ledger.close();
+  });
+
+  test("separate controllers and direct scheduling share one non-poisoning ledger boundary", async () => {
+    const ledger = await newLedger();
+    await seedFailed(ledger);
+    const first = createRetryController(ledger);
+    const second = createRetryController(ledger);
+    const ids = ["retry-0000000000000101", "retry-0000000000000102", "retry-0000000000000103"];
+    const calls = [
+      first.schedule(attemptRecord(), policy({ scheduleId: () => ids[0]! }), AT, () => 0),
+      second.schedule(attemptRecord(), policy({ scheduleId: () => ids[1]! }), AT, () => 0),
+      scheduleRetry(ledger, attemptRecord(), policy({ scheduleId: () => ids[2]! }), AT, () => 0),
+    ];
+    const results = await Promise.all(calls);
+    expect(results.map((result) => result.kind).sort()).toEqual(["already-scheduled", "already-scheduled", "scheduled"]);
+    expect((await ledger.readAll()).filter((event) => event.type === "retry_scheduled")).toHaveLength(1);
+    await expect(first.schedule(attemptRecord(), policy({ retryAfterMs: -1 }), AT, () => 0)).rejects.toMatchObject({ code: "retry.policy" });
+    await expect(second.schedule(attemptRecord(), policy(), AT, () => 0)).resolves.toMatchObject({ kind: "already-scheduled" });
+    await ledger.close();
+  });
+
+  test("separate controllers and direct starts commit exactly one physical start", async () => {
+    const ledger = await newLedger();
+    await seedFailed(ledger);
+    await scheduleRetry(ledger, attemptRecord(), policy(), AT, () => 0);
+    const first = createRetryController(ledger);
+    const second = createRetryController(ledger);
+    const attempts = ["attempt-0000000000000101", "attempt-0000000000000102", "attempt-0000000000000103"];
+    const results = await Promise.all([
+      first.start(RETRY_1, AT, policy({ attemptId: () => attempts[0]! })),
+      second.start(RETRY_1, AT, policy({ attemptId: () => attempts[1]! })),
+      startScheduledRetry(ledger, RETRY_1, AT, policy({ attemptId: () => attempts[2]! })),
+    ]);
+    expect(results.map((result) => result.kind).sort()).toEqual(["already-started", "already-started", "started"]);
+    expect((await ledger.readAll()).filter((event) => event.type === "retry_started")).toHaveLength(1);
     await ledger.close();
   });
 
@@ -237,6 +364,35 @@ describe("durable retry scheduling", () => {
     const replacement = createRetryController(ledger);
     await expect(replacement.start(RETRY_1, AT, policy())).resolves.toMatchObject({ kind: "started", descriptor: { scheduleId: RETRY_1, providerModel: "provider/model", toolAllowlist: ["scholarly_search"] } });
     await ledger.close();
+  });
+
+  test("large many-epoch recovery visits each event and derives each schedule once", () => {
+    const events = new EventBuilder();
+    events.add("run_created", { run: runSnapshot() });
+    events.add("task_upserted", { task: taskRecord() });
+    const epochs = 12;
+    const perEpoch = 20;
+    for (let epoch = 0; epoch < epochs; epoch += 1) {
+      for (let item = 0; item < perEpoch; item += 1) {
+        const suffix = String(epoch * perEpoch + item + 1).padStart(16, "0");
+        const attemptId = `attempt-${suffix}`;
+        const scheduleId = `retry-${suffix}`;
+        const attempt = attemptRecord({ attemptId, executionEpoch: epoch, logicalOperationId: `large-operation-${suffix}` });
+        events.add("identity_reserved", { kind: "attempt", id: attemptId, origin: "parent-generated" });
+        events.add("dispatch_intent", { attempt });
+        events.add("dispatch_started", { attemptId, pid: null, requestCorrelation: null });
+        events.add("attempt_failed", { attemptId, state: "retryable-failed", errorClass: "transient", message: "safe" });
+        events.add("identity_reserved", { kind: "retry-schedule", id: scheduleId, origin: "parent-generated" });
+        events.add("retry_scheduled", { scheduleId, logicalOperationId: attempt.logicalOperationId, failedAttemptId: attemptId, nextAttemptOrdinal: 2, notBeforeAt: AT.toISOString(), delayMs: 0, reasonClass: "transient" });
+      }
+      const cancel = events.add("cancel_requested", { executionEpoch: epoch, reason: "user-pause" });
+      if (epoch + 1 < epochs) events.add("resume_epoch_started", { priorEpoch: epoch, executionEpoch: epoch + 1, priorCancelSeq: cancel.seq, checkpointStage: "researching", ownerTokenSha256: HASH });
+    }
+    const diagnostics = { eventsVisited: 0, schedulesDerived: 0 };
+    const state = recoverRetryState(events.values, diagnostics);
+    expect(diagnostics).toEqual({ eventsVisited: events.values.length, schedulesDerived: epochs * perEpoch });
+    expect(Object.values(state.schedules)).toHaveLength(epochs * perEpoch);
+    expect(Object.values(state.schedules).every((schedule) => schedule.status === "cancelled")).toBe(true);
   });
 
   test.each([

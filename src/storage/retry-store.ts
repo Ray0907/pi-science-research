@@ -1,7 +1,7 @@
 import { canonicalJson } from "../crypto/canonical-json.js";
 import type { FoundationEventOfType, FoundationLedgerEvent } from "../domain/events.js";
 import type { AttemptId, RetryScheduleId } from "../domain/ids.js";
-import type { AttemptRecord, RetrySchedule } from "../domain/records.js";
+import type { AttemptRecord, RetrySchedule, RunSnapshot } from "../domain/records.js";
 import { reduceLedgerEvents } from "../domain/reducer.js";
 import type { EventLedger } from "./event-ledger.js";
 
@@ -9,8 +9,6 @@ export interface RetryPolicy {
   maxAttempts: number;
   baseDelayMs: number;
   maxDelayMs: number;
-  activeTimeRemainingMs: number;
-  finalizationReserveMs: number;
   retryAfterMs: number | null;
   reasonClass: string;
   scheduleId: () => string;
@@ -20,8 +18,9 @@ export interface RetryPolicy {
 export type ScheduleRetryResult =
   | Readonly<{ kind: "scheduled"; schedule: RetrySchedule; sourceSeq: number }>
   | Readonly<{ kind: "already-scheduled"; schedule: RetrySchedule; sourceSeq: number }>
+  | Readonly<{ kind: "cancelled"; executionEpoch: number }>
   | Readonly<{ kind: "blocked"; code: "retry-attempts-exhausted"; attemptsUsed: number; maxAttempts: number }>
-  | Readonly<{ kind: "blocked"; code: "retry-budget-exhausted" }>;
+  | Readonly<{ kind: "blocked"; code: "retry-budget-exhausted" | "retry-deadline-exhausted" }>;
 
 export interface FrozenRetryDescriptor {
   readonly scheduleId: RetryScheduleId;
@@ -46,6 +45,7 @@ export interface FrozenRetryDescriptor {
 export type StartRetryResult =
   | Readonly<{ kind: "not-ready"; notBeforeAt: string }>
   | Readonly<{ kind: "cancelled"; executionEpoch: number }>
+  | Readonly<{ kind: "blocked"; code: "retry-budget-exhausted" | "retry-deadline-exhausted" }>
   | Readonly<{ kind: "started"; descriptor: FrozenRetryDescriptor }>
   | Readonly<{ kind: "already-started"; descriptor: FrozenRetryDescriptor }>;
 
@@ -64,6 +64,11 @@ export interface RecoveredSchedule {
 
 export interface RecoveredRetryState {
   readonly schedules: Readonly<Record<string, RecoveredSchedule>>;
+}
+
+export interface RetryRecoveryDiagnostics {
+  eventsVisited: number;
+  schedulesDerived: number;
 }
 
 export type RetryStoreErrorCode =
@@ -86,7 +91,20 @@ export class RetryStoreError extends Error {
   }
 }
 
-export async function scheduleRetry(
+interface RetryBoundary { queue: Promise<void> }
+const retryBoundaries = new WeakMap<EventLedger, RetryBoundary>();
+
+export function scheduleRetry(
+  ledger: EventLedger,
+  failedAttempt: AttemptRecord,
+  policy: RetryPolicy,
+  now: Date,
+  rng: () => number,
+): Promise<ScheduleRetryResult> {
+  return withRetryBoundary(ledger, () => scheduleRetryUnlocked(ledger, failedAttempt, policy, now, rng));
+}
+
+async function scheduleRetryUnlocked(
   ledger: EventLedger,
   failedAttempt: AttemptRecord,
   policy: RetryPolicy,
@@ -96,16 +114,15 @@ export async function scheduleRetry(
   validatePolicy(policy);
   const nowMs = validateDate(now);
   const events = await ledger.readAll();
-  // Fail closed on every semantic corruption before deriving counters.
   reduceLedgerEvents(events);
   const canonical = canonicalAttempt(events, failedAttempt.attemptId);
   if (!canonical) throw new RetryStoreError("retry.predecessor");
   if (canonical.replayPolicy !== "safe-read") throw new RetryStoreError("retry.nonreplayable");
-  if (!sameAttemptSnapshot(canonical, failedAttempt) || failedAttempt.state !== "intent-recorded") {
-    throw new RetryStoreError("retry.predecessor");
-  }
-  const failure = latestFailure(events, canonical.attemptId);
-  if (failure !== "retryable-failed") throw new RetryStoreError("retry.predecessor");
+  if (!sameAttemptSnapshot(canonical, failedAttempt) || failedAttempt.state !== "intent-recorded") throw new RetryStoreError("retry.predecessor");
+  if (latestFailure(events, canonical.attemptId) !== "retryable-failed") throw new RetryStoreError("retry.predecessor");
+
+  const cancelledEpochs = collectCancelledEpochs(events);
+  if (cancelledEpochs.has(canonical.executionEpoch)) return Object.freeze({ kind: "cancelled", executionEpoch: canonical.executionEpoch });
 
   const operationAttempts = events.flatMap((event) => event.type === "dispatch_intent"
     && event.payload.attempt.logicalOperationId === canonical.logicalOperationId ? [event.payload.attempt] : []);
@@ -116,18 +133,18 @@ export async function scheduleRetry(
   const nextAttemptOrdinal = canonical.attemptOrdinal + 1;
   if (nextAttemptOrdinal !== attemptsUsed + 1) throw new RetryStoreError("retry.corruption");
 
+  const budget = canonicalBudget(events);
+  const deadlineRemainingMs = new Date(canonical.deadlineAt).getTime() - nowMs;
+  if (!(deadlineRemainingMs > 0)) return Object.freeze({ kind: "blocked", code: "retry-deadline-exhausted" });
+  const activeBudgetMs = budget.activeTimeLimitMs - budget.activeTimeUsedMs - budget.finalizationReserveMs;
+  if (!(activeBudgetMs > 0)) return Object.freeze({ kind: "blocked", code: "retry-budget-exhausted" });
+  const availableMs = Math.min(policy.maxDelayMs, activeBudgetMs, deadlineRemainingMs);
+
   const prior = events.find((event): event is FoundationEventOfType<"retry_scheduled"> => event.type === "retry_scheduled"
     && event.payload.logicalOperationId === canonical.logicalOperationId
     && event.payload.failedAttemptId === canonical.attemptId
     && event.payload.nextAttemptOrdinal === nextAttemptOrdinal);
-  if (prior) {
-    return Object.freeze({ kind: "already-scheduled", schedule: scheduleFrom(prior), sourceSeq: prior.seq });
-  }
-
-  const activeBudgetMs = policy.activeTimeRemainingMs - policy.finalizationReserveMs;
-  const deadlineBudgetMs = new Date(canonical.deadlineAt).getTime() - nowMs;
-  const availableMs = Math.min(policy.maxDelayMs, activeBudgetMs, deadlineBudgetMs);
-  if (!(availableMs > 0)) return Object.freeze({ kind: "blocked", code: "retry-budget-exhausted" });
+  if (prior) return Object.freeze({ kind: "already-scheduled", schedule: scheduleFrom(prior), sourceSeq: prior.seq });
 
   const exponent = Math.max(0, nextAttemptOrdinal - 2);
   const jitterBound = boundedExponential(policy.baseDelayMs, exponent, policy.maxDelayMs);
@@ -151,7 +168,16 @@ export async function scheduleRetry(
   return Object.freeze({ kind: "scheduled", schedule: scheduleFrom(event), sourceSeq: event.seq });
 }
 
-export async function startScheduledRetry(
+export function startScheduledRetry(
+  ledger: EventLedger,
+  scheduleId: string,
+  now: Date,
+  policy: Pick<RetryPolicy, "attemptId">,
+): Promise<StartRetryResult> {
+  return withRetryBoundary(ledger, () => startScheduledRetryUnlocked(ledger, scheduleId, now, policy));
+}
+
+async function startScheduledRetryUnlocked(
   ledger: EventLedger,
   scheduleId: string,
   now: Date,
@@ -163,16 +189,17 @@ export async function startScheduledRetry(
   const recovered = recoverRetryState(events).schedules[scheduleId];
   if (!recovered) throw new RetryStoreError("retry.schedule-not-found");
   if (recovered.status === "cancelled") return Object.freeze({ kind: "cancelled", executionEpoch: recovered.executionEpoch });
-  const scheduleEvent = events[recovered.sourceSeq - 1];
-  if (!scheduleEvent || scheduleEvent.type !== "retry_scheduled") throw new RetryStoreError("retry.corruption");
   const predecessor = canonicalAttempt(events, recovered.failedAttemptId);
   if (!predecessor) throw new RetryStoreError("retry.corruption");
-  if (recovered.status === "started") {
-    return Object.freeze({ kind: "already-started", descriptor: descriptorFor(recovered, predecessor) });
+  if (recovered.status === "started") return Object.freeze({ kind: "already-started", descriptor: descriptorFor(recovered, predecessor) });
+
+  const budget = canonicalBudget(events);
+  if (!(new Date(predecessor.deadlineAt).getTime() - nowMs > 0)) return Object.freeze({ kind: "blocked", code: "retry-deadline-exhausted" });
+  if (!(budget.activeTimeLimitMs - budget.activeTimeUsedMs - budget.finalizationReserveMs > 0)) {
+    return Object.freeze({ kind: "blocked", code: "retry-budget-exhausted" });
   }
-  if (nowMs < new Date(recovered.notBeforeAt).getTime()) {
-    return Object.freeze({ kind: "not-ready", notBeforeAt: recovered.notBeforeAt });
-  }
+  if (nowMs < new Date(recovered.notBeforeAt).getTime()) return Object.freeze({ kind: "not-ready", notBeforeAt: recovered.notBeforeAt });
+
   const attemptId = policy.attemptId();
   if (!/^attempt-[a-z0-9]{16,64}$/.test(attemptId)) throw new RetryStoreError("retry.identity");
   await ledger.reserveIdentity("attempt", attemptId, "parent-generated");
@@ -186,16 +213,20 @@ export async function startScheduledRetry(
   return Object.freeze({ kind: "started", descriptor: descriptorFor({ ...recovered, status: "started", startedAttemptId: attemptId as AttemptId }, predecessor) });
 }
 
-export function recoverRetryState(events: readonly FoundationLedgerEvent[]): RecoveredRetryState {
+export function recoverRetryState(
+  events: readonly FoundationLedgerEvent[],
+  diagnostics?: RetryRecoveryDiagnostics,
+): RecoveredRetryState {
   reduceLedgerEvents(events);
-  const schedules = new Map<string, RecoveredSchedule>();
+  const schedules = new Map<string, Omit<RecoveredSchedule, "status">>();
+  const cancelledEpochs = new Set<number>();
   let epoch = 0;
   for (const event of events) {
+    if (diagnostics) diagnostics.eventsVisited += 1;
     if (event.type === "resume_epoch_started") epoch = event.payload.executionEpoch;
     else if (event.type === "retry_scheduled") {
-      schedules.set(event.payload.scheduleId, Object.freeze({
+      schedules.set(event.payload.scheduleId, {
         scheduleId: event.payload.scheduleId as RetryScheduleId,
-        status: "pending",
         sourceSeq: event.seq,
         executionEpoch: epoch,
         logicalOperationId: event.payload.logicalOperationId,
@@ -204,21 +235,21 @@ export function recoverRetryState(events: readonly FoundationLedgerEvent[]): Rec
         notBeforeAt: event.payload.notBeforeAt,
         delayMs: event.payload.delayMs,
         startedAttemptId: null,
-      }));
+      });
     } else if (event.type === "retry_started") {
       const schedule = schedules.get(event.payload.scheduleId);
       if (!schedule || schedule.sourceSeq !== event.payload.scheduledFromSeq) throw new RetryStoreError("retry.corruption");
-      schedules.set(event.payload.scheduleId, Object.freeze({ ...schedule, status: "started", startedAttemptId: event.payload.attemptId as AttemptId }));
-    } else if (event.type === "cancel_requested") {
-      for (const [id, schedule] of schedules) {
-        if (schedule.executionEpoch === event.payload.executionEpoch && schedule.status === "pending") {
-          schedules.set(id, Object.freeze({ ...schedule, status: "cancelled" }));
-        }
-      }
-    }
+      schedules.set(event.payload.scheduleId, { ...schedule, startedAttemptId: event.payload.attemptId as AttemptId });
+    } else if (event.type === "cancel_requested") cancelledEpochs.add(event.payload.executionEpoch);
   }
   const output = Object.create(null) as Record<string, RecoveredSchedule>;
-  for (const [id, schedule] of schedules) output[id] = schedule;
+  for (const [id, schedule] of schedules) {
+    if (diagnostics) diagnostics.schedulesDerived += 1;
+    output[id] = Object.freeze({
+      ...schedule,
+      status: cancelledEpochs.has(schedule.executionEpoch) ? "cancelled" : schedule.startedAttemptId === null ? "pending" : "started",
+    });
+  }
   return Object.freeze({ schedules: Object.freeze(output) });
 }
 
@@ -229,18 +260,30 @@ export interface RetryController {
 }
 
 export function createRetryController(ledger: EventLedger): RetryController {
-  let queue: Promise<void> = Promise.resolve();
-  const run = <T>(operation: () => Promise<T>): Promise<T> => {
-    const result = queue.then(operation);
-    queue = result.then(() => undefined, () => undefined);
-    return result;
-  };
   const controller: RetryController = {
-    schedule: (attempt, policy, now, rng) => run(() => scheduleRetry(ledger, attempt, policy, now, rng)),
-    start: (id, now, policy) => run(() => startScheduledRetry(ledger, id, now, policy)),
-    cancel: (executionEpoch, reason) => run(() => ledger.append("cancel_requested", { executionEpoch, reason })),
+    schedule: (attempt, policy, now, rng) => scheduleRetry(ledger, attempt, policy, now, rng),
+    start: (id, now, policy) => startScheduledRetry(ledger, id, now, policy),
+    cancel: (executionEpoch, reason) => cancelRetryEpoch(ledger, executionEpoch, reason),
   };
   return Object.freeze(controller);
+}
+
+/**
+ * Package orchestration routes cancellation through this helper so it shares
+ * the per-ledger retry boundary. Raw EventLedger cancellation appends are not
+ * part of that atomic controller contract.
+ */
+export function cancelRetryEpoch(
+  ledger: EventLedger,
+  executionEpoch: number,
+  reason: FoundationEventOfType<"cancel_requested">["payload"]["reason"],
+): Promise<FoundationEventOfType<"cancel_requested">> {
+  return withRetryBoundary(ledger, async () => {
+    const events = await ledger.readAll();
+    reduceLedgerEvents(events);
+    if (collectCancelledEpochs(events).has(executionEpoch)) throw new RetryStoreError("retry.corruption");
+    return ledger.append("cancel_requested", { executionEpoch, reason });
+  });
 }
 
 const retryImmutableFields: readonly (keyof AttemptRecord)[] = [
@@ -263,6 +306,17 @@ export function startNewLogicalOperation(previous: AttemptRecord, candidate: Att
   return candidate;
 }
 
+function withRetryBoundary<T>(ledger: EventLedger, operation: () => Promise<T>): Promise<T> {
+  let boundary = retryBoundaries.get(ledger);
+  if (!boundary) {
+    boundary = { queue: Promise.resolve() };
+    retryBoundaries.set(ledger, boundary);
+  }
+  const result = boundary.queue.then(operation);
+  boundary.queue = result.then(() => undefined, () => undefined);
+  return result;
+}
+
 function canonicalAttempt(events: readonly FoundationLedgerEvent[], attemptId: string): AttemptRecord | undefined {
   for (const event of events) if (event.type === "dispatch_intent" && event.payload.attempt.attemptId === attemptId) return event.payload.attempt;
   return undefined;
@@ -272,6 +326,43 @@ function latestFailure(events: readonly FoundationLedgerEvent[], attemptId: stri
   let state: FoundationEventOfType<"attempt_failed">["payload"]["state"] | null = null;
   for (const event of events) if (event.type === "attempt_failed" && event.payload.attemptId === attemptId) state = event.payload.state;
   return state;
+}
+
+function collectCancelledEpochs(events: readonly FoundationLedgerEvent[]): Set<number> {
+  const epochs = new Set<number>();
+  for (const event of events) if (event.type === "cancel_requested") epochs.add(event.payload.executionEpoch);
+  return epochs;
+}
+
+function canonicalBudget(events: readonly FoundationLedgerEvent[]): RunSnapshot["budget"] {
+  let budget: RunSnapshot["budget"] | undefined;
+  for (const event of events) {
+    if (event.type === "run_created") {
+      if (budget) throw new RetryStoreError("retry.corruption");
+      budget = structuredClone(event.payload.run.budget);
+    } else if (event.type === "active_time_checkpoint") {
+      if (!budget || event.payload.totalMs < budget.activeTimeUsedMs
+        || event.payload.totalMs - budget.activeTimeUsedMs !== event.payload.addedMs) throw new RetryStoreError("retry.corruption");
+      budget.activeTimeUsedMs = event.payload.totalMs;
+    } else if (event.type === "budget_amended") {
+      if (!budget || canonicalJson(event.payload.oldBudget) !== canonicalJson(budget)
+        || event.payload.newBudget.activeTimeUsedMs !== budget.activeTimeUsedMs
+        || !validBudget(event.payload.newBudget)) throw new RetryStoreError("retry.corruption");
+      budget = structuredClone(event.payload.newBudget);
+    }
+  }
+  if (!budget || !validBudget(budget)) throw new RetryStoreError("retry.corruption");
+  return budget;
+}
+
+function validBudget(budget: RunSnapshot["budget"]): boolean {
+  const values = [budget.activeTimeLimitMs, budget.activeTimeUsedMs, budget.finalizationReserveMs];
+  const reserve = Math.min(600_000, Math.max(60_000, 0.2 * budget.activeTimeLimitMs), 0.5 * budget.activeTimeLimitMs);
+  return values.every((value) => Number.isFinite(value) && value >= 0)
+    && budget.finalizationReserveMs === reserve
+    && budget.activeTimeUsedMs <= budget.activeTimeLimitMs
+    && budget.admittedSources <= budget.maxSources
+    && budget.waveOrdinal <= budget.maxWaves;
 }
 
 function scheduleFrom(event: FoundationEventOfType<"retry_scheduled">): RetrySchedule {
@@ -302,12 +393,11 @@ function descriptorFor(schedule: RecoveredSchedule, predecessor: AttemptRecord):
 }
 
 function validatePolicy(policy: RetryPolicy): void {
-  const integers = [policy.maxAttempts, policy.baseDelayMs, policy.maxDelayMs, policy.activeTimeRemainingMs, policy.finalizationReserveMs];
+  const integers = [policy.maxAttempts, policy.baseDelayMs, policy.maxDelayMs];
   const retryAfterValid = policy.retryAfterMs === null || (Number.isFinite(policy.retryAfterMs) && policy.retryAfterMs >= 0);
   if (!integers.every((value) => Number.isSafeInteger(value) && value >= 0)
     || policy.maxAttempts < 1 || policy.baseDelayMs < 1 || policy.maxDelayMs < 1
-    || policy.finalizationReserveMs > policy.activeTimeRemainingMs || !retryAfterValid
-    || typeof policy.reasonClass !== "string") throw new RetryStoreError("retry.policy");
+    || !retryAfterValid || typeof policy.reasonClass !== "string") throw new RetryStoreError("retry.policy");
 }
 
 function validateDate(now: Date): number {
@@ -335,11 +425,7 @@ function safeTimestamp(milliseconds: number): string {
 }
 
 function sameAttemptSnapshot(left: AttemptRecord, right: AttemptRecord): boolean {
-  try {
-    return canonicalJson(left) === canonicalJson(right);
-  } catch {
-    return false;
-  }
+  try { return canonicalJson(left) === canonicalJson(right); } catch { return false; }
 }
 
 function equalField(left: AttemptRecord[keyof AttemptRecord], right: AttemptRecord[keyof AttemptRecord]): boolean {
