@@ -65,9 +65,12 @@ describe("scholarly identifiers", () => {
   test("rejects malformed DOI resolver URLs and ambiguous punctuation", () => {
     for (const value of [
       "https://doi.org/10.1234", "https://doi.org/10.1234/a?x=1", "https://doi.org/10.1234/a#x", "https://doi.org/10.1234/a/../b",
+      "https://doi.org/10.1234/a\\..\\b", "https://doi.org/10.1234/a%5C..%5Cb", "https://doi.org/10.1234/a%5c",
       "https://user@doi.org/10.1234/a", "https://doi.org/10.1234%2Fa", "https://doi.org/10.1234/%ZZ",
-      "10.1234/a%ZZ", "10.1234/a?query", "10.1234/a#fragment", "10.1234/a\n", "10.1234/a b",
+      "10.1234/a\\b", "10.1234/a%5Cb", "10.1234/a%ZZ", "10.1234/a?query", "10.1234/a#fragment", "10.1234/a\n", "10.1234/a b",
     ]) expect(code(() => normalizeDoi(value))).toBe("identifier.invalid-doi");
+    expect(normalizeDoi("10.1234/a%2Eb")).toBe("10.1234/a.b");
+    expect(normalizeDoi("10.1234/a%255Cb")).toBe("10.1234/a%5cb");
     expect(normalizeDoi("10.1234/a.")).toBe("10.1234/a.");
   });
 
@@ -153,6 +156,29 @@ describe("scholarly identifiers", () => {
     expect(code(() => validateProspectiveSourceIdentityFields(input, { ...policy, accessPolicySha256: "bad" }))).toBe("url.http-context-invalid");
     expect(code(() => validateProspectiveSourceIdentityFields(input, { ...policy, approvedHttpHosts: ["x".repeat(254)] })))
       .toBe("identifier.invalid-options");
+
+    const twoHosts = ["example.org", "mirror.example.org"];
+    expect(validateProspectiveSourceIdentityFields(input, { ...policy, approvedHttpHosts: twoHosts, maxApprovedHttpHosts: 2 }).canonicalUrl)
+      .toBe("http://example.org/a");
+    expect(code(() => validateProspectiveSourceIdentityFields(input, {
+      ...policy, approvedHttpHosts: [...twoHosts, "third.example.org"], maxApprovedHttpHosts: 2,
+    }))).toBe("identifier.invalid-options");
+
+    const hardMaxHosts = Array.from({ length: 256 }, (_, index) => `h${index}.example.org`);
+    const hardMaxSource = source({ identifiers: { doi: null, pmid: null, pmcid: null }, canonicalUrl: "http://h255.example.org/a" });
+    expect(validateProspectiveSourceIdentityFields(hardMaxSource, {
+      allowHttp: true, approvedHttpHosts: hardMaxHosts, accessPolicySha256: HASH, maxApprovedHttpHosts: 256,
+    }).canonicalUrl).toBe("http://h255.example.org/a");
+    expect(code(() => validateProspectiveSourceIdentityFields(hardMaxSource, {
+      allowHttp: true,
+      approvedHttpHosts: [...hardMaxHosts, "overflow.example.org"],
+      accessPolicySha256: HASH,
+      maxApprovedHttpHosts: 256,
+    }))).toBe("identifier.invalid-options");
+    for (const maxApprovedHttpHosts of [0, 257, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(code(() => validateProspectiveSourceIdentityFields(input, { ...policy, maxApprovedHttpHosts })))
+        .toBe("identifier.invalid-options");
+    }
   });
 
   test("derives only allowlisted DOI PMID and PMCID resolver URLs", () => {
@@ -173,8 +199,9 @@ describe("scholarly identifiers", () => {
   });
 
   test("rejects canonical scalar bytes before identifier and URL parsing", () => {
-    const doi = "10.1234/exact";
+    const doi = "10.1234/exact\"quote";
     const exactDoiBytes = Buffer.byteLength(canonicalJson(doi));
+    expect(exactDoiBytes).toBeGreaterThan(Buffer.byteLength(doi));
     expect(normalizeDoi(doi, { maxCanonicalScalarBytes: exactDoiBytes })).toBe(doi);
     expect(code(() => normalizeDoi(doi, { maxCanonicalScalarBytes: exactDoiBytes - 1 }))).toBe("identifier.too-long");
     const multibyteUrl = "https://example.org/é";
@@ -192,8 +219,14 @@ describe("scholarly identifiers", () => {
   });
 
   test("rejects an oversized prospective source record before nested identity reads", () => {
-    const exact = source({ title: "nested".repeat(1_000), authors: [{ family: "Family".repeat(100), given: "Given", literal: null, orcid: null }] });
-    const exactBytes = Buffer.byteLength(canonicalJson(exact));
+    const exact = source({
+      title: "quoted \"title\" with \\ backslash and newline\nplus tab\t",
+      authors: [{ family: "Family\\Name", given: "Given\nName", literal: "literal \"author\"", orcid: null }],
+    });
+    const exactCanonical = canonicalJson(exact);
+    const exactBytes = Buffer.byteLength(exactCanonical);
+    expect(exactCanonical).toContain("\\\\ backslash");
+    expect(exactCanonical).toContain("newline\\nplus tab\\t");
     expect(validateProspectiveSourceIdentityFields(exact, undefined, { maxSourceRecordCanonicalBytes: exactBytes })).toEqual(exact);
     expect(code(() => validateProspectiveSourceIdentityFields(exact, undefined, { maxSourceRecordCanonicalBytes: exactBytes - 1 })))
       .toBe("identifier.record-too-large");

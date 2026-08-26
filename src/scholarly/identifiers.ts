@@ -160,7 +160,7 @@ export function validateProspectiveSourceIdentityFields(
 
 function normalizeDoiWithLimit(input: unknown, limit: number): string {
   const value = boundedScalar(input, limit, "identifier.too-long");
-  if (CONTROL_OR_BIDI.test(value)) fail("identifier.invalid-doi");
+  if (CONTROL_OR_BIDI.test(value) || value.includes("\\")) fail("identifier.invalid-doi");
   const trimmed = trimAsciiSpaces(value);
   let candidate: string;
   if (/^https?:\/\//i.test(trimmed)) candidate = doiFromResolver(trimmed);
@@ -170,7 +170,7 @@ function normalizeDoiWithLimit(input: unknown, limit: number): string {
     try { candidate = decodeURIComponent(candidate); }
     catch { return fail("identifier.invalid-doi"); }
   }
-  if (CONTROL_OR_BIDI.test(candidate) || /[^\x21-\x7e]/u.test(candidate)) fail("identifier.invalid-doi");
+  if (CONTROL_OR_BIDI.test(candidate) || candidate.includes("\\") || /[^\x21-\x7e]/u.test(candidate)) fail("identifier.invalid-doi");
   const match = /^(10\.[0-9]{4,9})\/(.+)$/u.exec(candidate);
   if (!match || Buffer.byteLength(candidate, "utf8") > 512) fail("identifier.invalid-doi");
   return `${match[1]!.toLowerCase()}/${match[2]!.toLowerCase()}`;
@@ -232,7 +232,7 @@ function hasValidRawHostPort(authority: string): boolean {
 }
 
 function doiFromResolver(value: string): string {
-  if (CONTROL_OR_BIDI.test(value) || MALFORMED_PERCENT.test(value) || value.includes("?") || value.includes("#")
+  if (CONTROL_OR_BIDI.test(value) || value.includes("\\") || MALFORMED_PERCENT.test(value) || value.includes("?") || value.includes("#")
     || !/^https:\/\/(?:doi\.org|dx\.doi\.org)\//u.test(value)) fail("identifier.invalid-doi");
   const rawPath = /^https:\/\/[^/?#]+(\/[^?#]*)/u.exec(value)?.[1];
   if (!rawPath || rawPath.split("/").some((part) => /^(?:\.|%2e){1,2}$/iu.test(part))) fail("identifier.invalid-doi");
