@@ -54,58 +54,39 @@ const MALFORMED_PERCENT = /%(?![0-9a-fA-F]{2})/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
 
 export function normalizeDoi(input: unknown, options?: ScholarlyScalarOptions): string {
-  const limit = scalarLimit(options);
-  const value = boundedScalar(input, limit, "identifier.too-long");
-  if (CONTROL_OR_BIDI.test(value)) fail("identifier.invalid-doi");
-  const trimmed = trimAsciiSpaces(value);
-  let candidate: string;
-  if (/^https?:\/\//i.test(trimmed)) candidate = doiFromResolver(trimmed);
-  else {
-    candidate = trimmed.replace(/^doi:/i, "");
-    if (MALFORMED_PERCENT.test(candidate) || candidate.includes("?") || candidate.includes("#")) fail("identifier.invalid-doi");
-    try { candidate = decodeURIComponent(candidate); }
-    catch { return fail("identifier.invalid-doi"); }
-  }
-  if (CONTROL_OR_BIDI.test(candidate) || /[^\x21-\x7e]/u.test(candidate)) fail("identifier.invalid-doi");
-  const match = /^(10\.[0-9]{4,9})\/(.+)$/u.exec(candidate);
-  if (!match || Buffer.byteLength(candidate, "utf8") > 512) fail("identifier.invalid-doi");
-  return `${match[1]!.toLowerCase()}/${match[2]!.toLowerCase()}`;
+  return normalizeDoiWithLimit(input, scalarLimit(options));
 }
 
 export function canonicalDoiUrl(doi: unknown, options?: ScholarlyScalarOptions): string {
-  const normalized = normalizeDoi(doi, options);
+  const limit = scalarLimit(options);
+  const normalized = normalizeDoiWithLimit(doi, limit);
   const slash = normalized.indexOf("/");
-  const prefix = normalized.slice(0, slash);
-  const suffix = normalized.slice(slash + 1);
-  return checkedConcat("https://doi.org/", `${encodeURIComponent(prefix)}/${encodeURIComponent(suffix)}`, scalarLimit(options));
+  const encodedPrefixBytes = percentEncodedComponentBytes(normalized, 0, slash);
+  const encodedSuffixBytes = percentEncodedComponentBytes(normalized, slash + 1, normalized.length);
+  assertResolverOutputBound(limit, Buffer.byteLength("https://doi.org/", "utf8"), encodedPrefixBytes, 1, encodedSuffixBytes);
+  return `https://doi.org/${encodeURIComponent(normalized.slice(0, slash))}/${encodeURIComponent(normalized.slice(slash + 1))}`;
 }
 
 export function normalizePmid(input: unknown, options?: ScholarlyScalarOptions): string {
-  const value = boundedScalar(input, scalarLimit(options), "identifier.too-long");
-  if (CONTROL_OR_BIDI.test(value)) fail("identifier.invalid-pmid");
-  const match = /^(?:pmid:)?([0-9]{1,12})$/iu.exec(trimAsciiSpaces(value));
-  if (!match) fail("identifier.invalid-pmid");
-  const normalized = match[1]!.replace(/^0+/u, "");
-  if (normalized.length === 0) fail("identifier.invalid-pmid");
-  return normalized;
+  return normalizePmidWithLimit(input, scalarLimit(options));
 }
 
 export function canonicalPmidUrl(pmid: unknown, options?: ScholarlyScalarOptions): string {
-  return checkedConcat("https://pubmed.ncbi.nlm.nih.gov/", `${normalizePmid(pmid, options)}/`, scalarLimit(options));
+  const limit = scalarLimit(options);
+  const normalized = normalizePmidWithLimit(pmid, limit);
+  assertResolverOutputBound(limit, Buffer.byteLength("https://pubmed.ncbi.nlm.nih.gov/", "utf8"), normalized.length, 1);
+  return `https://pubmed.ncbi.nlm.nih.gov/${normalized}/`;
 }
 
 export function normalizePmcid(input: unknown, options?: ScholarlyScalarOptions): string {
-  const value = boundedScalar(input, scalarLimit(options), "identifier.too-long");
-  if (CONTROL_OR_BIDI.test(value)) fail("identifier.invalid-pmcid");
-  const match = /^(?:pmcid:)?pmc([0-9]{1,12})$/iu.exec(trimAsciiSpaces(value));
-  if (!match) fail("identifier.invalid-pmcid");
-  const digits = match[1]!.replace(/^0+/u, "");
-  if (digits.length === 0) fail("identifier.invalid-pmcid");
-  return `PMC${digits}`;
+  return normalizePmcidWithLimit(input, scalarLimit(options));
 }
 
 export function canonicalPmcidUrl(pmcid: unknown, options?: ScholarlyScalarOptions): string {
-  return checkedConcat("https://pmc.ncbi.nlm.nih.gov/articles/", `${normalizePmcid(pmcid, options)}/`, scalarLimit(options));
+  const limit = scalarLimit(options);
+  const normalized = normalizePmcidWithLimit(pmcid, limit);
+  assertResolverOutputBound(limit, Buffer.byteLength("https://pmc.ncbi.nlm.nih.gov/articles/", "utf8"), normalized.length, 1);
+  return `https://pmc.ncbi.nlm.nih.gov/articles/${normalized}/`;
 }
 
 export function normalizeCanonicalUrl(
@@ -118,15 +99,14 @@ export function normalizeCanonicalUrl(
   const value = boundedScalar(input, limit, "url.too-long");
   if (CONTROL_OR_BIDI.test(value) || MALFORMED_PERCENT.test(value)) fail("url.invalid");
   const trimmed = trimAsciiSpaces(value);
-  if (/\s/u.test(trimmed)) fail("url.invalid");
-  const authority = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/iu.exec(trimmed)?.[1];
-  if (authority && /[^\x00-\x7f]/u.test(authority)) fail("url.invalid");
+  const raw = preflightAbsoluteUrl(trimmed);
+  if (raw.scheme !== "https" && !(raw.scheme === "http" && normalizedOptions.allowHttp === true)) fail("url.unsupported-scheme");
   let url: URL;
   try { url = new URL(trimmed); }
   catch { return fail("url.invalid"); }
-  if (url.protocol !== "https:" && !(url.protocol === "http:" && normalizedOptions.allowHttp === true)) fail("url.unsupported-scheme");
+  if (url.protocol !== `${raw.scheme}:`) fail("url.invalid");
   if (url.username !== "" || url.password !== "") fail("url.credentials-forbidden");
-  if (url.hash !== "") fail("url.fragment-forbidden");
+  if (url.hash !== "" || raw.hasFragmentDelimiter) fail("url.fragment-forbidden");
   if (url.hostname.length === 0 || /[^\x00-\x7f]/u.test(url.hostname)) fail("url.invalid");
   return url.href;
 }
@@ -178,8 +158,81 @@ export function validateProspectiveSourceIdentityFields(
   return deepFreeze(record);
 }
 
+function normalizeDoiWithLimit(input: unknown, limit: number): string {
+  const value = boundedScalar(input, limit, "identifier.too-long");
+  if (CONTROL_OR_BIDI.test(value)) fail("identifier.invalid-doi");
+  const trimmed = trimAsciiSpaces(value);
+  let candidate: string;
+  if (/^https?:\/\//i.test(trimmed)) candidate = doiFromResolver(trimmed);
+  else {
+    candidate = trimmed.replace(/^doi:/i, "");
+    if (MALFORMED_PERCENT.test(candidate) || candidate.includes("?") || candidate.includes("#")) fail("identifier.invalid-doi");
+    try { candidate = decodeURIComponent(candidate); }
+    catch { return fail("identifier.invalid-doi"); }
+  }
+  if (CONTROL_OR_BIDI.test(candidate) || /[^\x21-\x7e]/u.test(candidate)) fail("identifier.invalid-doi");
+  const match = /^(10\.[0-9]{4,9})\/(.+)$/u.exec(candidate);
+  if (!match || Buffer.byteLength(candidate, "utf8") > 512) fail("identifier.invalid-doi");
+  return `${match[1]!.toLowerCase()}/${match[2]!.toLowerCase()}`;
+}
+
+function normalizePmidWithLimit(input: unknown, limit: number): string {
+  const value = boundedScalar(input, limit, "identifier.too-long");
+  if (CONTROL_OR_BIDI.test(value)) fail("identifier.invalid-pmid");
+  const match = /^(?:pmid:)?([0-9]{1,12})$/iu.exec(trimAsciiSpaces(value));
+  if (!match) fail("identifier.invalid-pmid");
+  const normalized = match[1]!.replace(/^0+/u, "");
+  if (normalized.length === 0) fail("identifier.invalid-pmid");
+  return normalized;
+}
+
+function normalizePmcidWithLimit(input: unknown, limit: number): string {
+  const value = boundedScalar(input, limit, "identifier.too-long");
+  if (CONTROL_OR_BIDI.test(value)) fail("identifier.invalid-pmcid");
+  const match = /^(?:pmcid:)?pmc([0-9]{1,12})$/iu.exec(trimAsciiSpaces(value));
+  if (!match) fail("identifier.invalid-pmcid");
+  const digits = match[1]!.replace(/^0+/u, "");
+  if (digits.length === 0) fail("identifier.invalid-pmcid");
+  return `PMC${digits}`;
+}
+
+function preflightAbsoluteUrl(value: string): { scheme: string; hasFragmentDelimiter: boolean } {
+  if (/\s|\\/u.test(value)) fail("url.invalid");
+  const schemePrefix = /^([A-Za-z][A-Za-z0-9+.-]*):/u.exec(value);
+  if (!schemePrefix) fail("url.invalid");
+  const normalizedScheme = schemePrefix[1]!.toLowerCase();
+  if (normalizedScheme !== "http" && normalizedScheme !== "https")
+    return { scheme: normalizedScheme, hasFragmentDelimiter: value.includes("#") };
+  const absolute = /^([A-Za-z][A-Za-z0-9+.-]*):\/\//u.exec(value);
+  if (!absolute) fail("url.invalid");
+  const authorityStart = absolute[0].length;
+  let authorityEnd = value.length;
+  for (const delimiter of ["/", "?", "#"] as const) {
+    const index = value.indexOf(delimiter, authorityStart);
+    if (index >= 0 && index < authorityEnd) authorityEnd = index;
+  }
+  if (authorityEnd === authorityStart) fail("url.invalid");
+  const authority = value.slice(authorityStart, authorityEnd);
+  if (authority.includes("@")) fail("url.credentials-forbidden");
+  if (/[^\x00-\x7f]/u.test(authority) || authority.includes("%") || !hasValidRawHostPort(authority)) fail("url.invalid");
+  return { scheme: normalizedScheme, hasFragmentDelimiter: value.includes("#") };
+}
+
+function hasValidRawHostPort(authority: string): boolean {
+  if (authority.startsWith("[")) {
+    const close = authority.indexOf("]");
+    if (close <= 1) return false;
+    const remainder = authority.slice(close + 1);
+    return remainder === "" || /^:[0-9]+$/u.test(remainder);
+  }
+  const firstColon = authority.indexOf(":");
+  if (firstColon < 0) return authority.length > 0;
+  if (firstColon !== authority.lastIndexOf(":")) return false;
+  return firstColon > 0 && /^:[0-9]+$/u.test(authority.slice(firstColon));
+}
+
 function doiFromResolver(value: string): string {
-  if (CONTROL_OR_BIDI.test(value) || MALFORMED_PERCENT.test(value)
+  if (CONTROL_OR_BIDI.test(value) || MALFORMED_PERCENT.test(value) || value.includes("?") || value.includes("#")
     || !/^https:\/\/(?:doi\.org|dx\.doi\.org)\//u.test(value)) fail("identifier.invalid-doi");
   const rawPath = /^https:\/\/[^/?#]+(\/[^?#]*)/u.exec(value)?.[1];
   if (!rawPath || rawPath.split("/").some((part) => /^(?:\.|%2e){1,2}$/iu.test(part))) fail("identifier.invalid-doi");
@@ -265,10 +318,35 @@ function trimAsciiSpaces(value: string): string { return value.replace(/^ +| +$/
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
 }
-function checkedConcat(prefix: string, suffix: string, limit: number): string {
-  const bytes = 2 + Buffer.byteLength(prefix, "utf8") + Buffer.byteLength(suffix, "utf8");
-  if (!Number.isSafeInteger(bytes) || bytes > limit) fail("identifier.too-long");
-  return prefix + suffix;
+function percentEncodedComponentBytes(value: string, start: number, end: number): number {
+  let total = 0;
+  for (let index = start; index < end;) {
+    const point = value.codePointAt(index);
+    if (point === undefined) fail("identifier.invalid-doi");
+    const width = point > 0xffff ? 2 : 1;
+    const utf8Bytes = point <= 0x7f ? 1 : point <= 0x7ff ? 2 : point <= 0xffff ? 3 : 4;
+    const unescaped = point <= 0x7f && /[A-Za-z0-9_.!~*'()-]/u.test(String.fromCharCode(point));
+    total = checkedAdd(total, unescaped ? 1 : checkedMultiply(utf8Bytes, 3));
+    index += width;
+  }
+  return total;
+}
+function assertResolverOutputBound(limit: number, ...contentParts: readonly number[]): void {
+  let canonicalBytes = 2;
+  for (const part of contentParts) canonicalBytes = checkedAdd(canonicalBytes, part);
+  if (canonicalBytes > limit) fail("identifier.too-long");
+}
+function checkedAdd(left: number, right: number): number {
+  const result = left + right;
+  if (!Number.isSafeInteger(left) || !Number.isSafeInteger(right) || right < 0 || !Number.isSafeInteger(result))
+    fail("identifier.too-long");
+  return result;
+}
+function checkedMultiply(value: number, multiplier: number): number {
+  const result = value * multiplier;
+  if (!Number.isSafeInteger(value) || !Number.isSafeInteger(multiplier) || value < 0 || multiplier < 0 || !Number.isSafeInteger(result))
+    fail("identifier.too-long");
+  return result;
 }
 function deepFreeze<T>(value: T): T {
   if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {

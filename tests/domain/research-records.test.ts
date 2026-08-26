@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { canonicalJson } from "../../src/crypto/canonical-json.js";
-import { parseResearchRecord } from "../../src/domain/research-records.js";
+import { parseResearchRecord, type SourceRecord } from "../../src/domain/research-records.js";
+import { ScholarlyIdentifierError, validateProspectiveSourceIdentityFields } from "../../src/scholarly/identifiers.js";
 
 const AT = "2026-08-25T12:00:00.000Z";
 const HASH = "a".repeat(64);
@@ -65,6 +66,13 @@ describe("closed research record schemas", () => {
     const parsed = parseResearchRecord("sources", legacy);
     expect(parsed.success).toBe(true);
     expect(parsed.success && canonicalJson(parsed.value)).toBe(before);
+    try {
+      validateProspectiveSourceIdentityFields(legacy as unknown as SourceRecord);
+      throw new Error("expected prospective validation to reject legacy source");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ScholarlyIdentifierError);
+      expect((error as ScholarlyIdentifierError).code).toBe("identifier.invalid-doi");
+    }
   });
 
   test("enforces confidence, exact refs and calculation status", () => {

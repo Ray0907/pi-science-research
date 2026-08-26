@@ -56,8 +56,10 @@ describe("scholarly identifiers", () => {
     expect(normalizeDoi("  DOI:10.1234/AbC  ")).toBe("10.1234/abc");
     expect(normalizeDoi("https://dx.doi.org/10.1234/A%2Fb")).toBe("10.1234/a/b");
     expect(normalizeDoi("10.123456789/a")).toBe("10.123456789/a");
-    for (const value of ["10.123/a", "10.1234567890/a", "ＤＯＩ:10.1234/a", "10．1234/a", "10.1234／a", "10.1234/Α"])
-      expect(code(() => normalizeDoi(value))).toBe("identifier.invalid-doi");
+    for (const value of [
+      "10.123/a", "10.1234567890/a", "ＤＯＩ:10.1234/a", "10．1234/a", "10.1234／a",
+      "10.1234/Α", "10.1234/а", "10.1234/é", "10.1234/é",
+    ]) expect(code(() => normalizeDoi(value))).toBe("identifier.invalid-doi");
   });
 
   test("rejects malformed DOI resolver URLs and ambiguous punctuation", () => {
@@ -80,7 +82,9 @@ describe("scholarly identifiers", () => {
 
   test("rejects Unicode digits, bidi controls, boxed strings and oversized identifiers", () => {
     expect(code(() => normalizePmid(new String("123")))).toBe("identifier.invalid-type");
+    expect(code(() => normalizeDoi("10.1234/a\0b"))).toBe("identifier.invalid-doi");
     expect(code(() => normalizeDoi("10.1234/a\u2066b"))).toBe("identifier.invalid-doi");
+    expect(code(() => normalizeDoi("10.1234/\ud800"))).toBe("identifier.invalid-type");
     expect(code(() => normalizeDoi("10.1234/" + "a".repeat(513)))).toBe("identifier.invalid-doi");
     expect(code(() => normalizeDoi("a".repeat(4096), { maxCanonicalScalarBytes: 32 }))).toBe("identifier.too-long");
   });
@@ -88,16 +92,27 @@ describe("scholarly identifiers", () => {
   test("canonicalizes safe URLs without changing query semantics", () => {
     expect(normalizeCanonicalUrl(" HTTPS://Example.COM:443/a/../Path?q=2&q=1&x=%7e "))
       .toBe("https://example.com/Path?q=2&q=1&x=%7e");
+    expect(normalizeCanonicalUrl("http://Example.COM:80/a", { allowHttp: true })).toBe("http://example.com/a");
     expect(normalizeCanonicalUrl("https://example.com/é")).toBe("https://example.com/%C3%A9");
+    expect(normalizeCanonicalUrl("https://example.com/%2F")).toBe("https://example.com/%2F");
+    expect(normalizeCanonicalUrl("https://example.com/?")).toBe("https://example.com/?");
+    expect(normalizeCanonicalUrl("https://[2001:db8::1]:443/a")).toBe("https://[2001:db8::1]/a");
     expect(normalizeCanonicalUrl("https://example.com/a")).toBe(normalizeCanonicalUrl(normalizeCanonicalUrl("https://example.com/a")));
   });
 
   test("rejects credentials, fragments, forbidden schemes and raw Unicode hosts", () => {
     expect(code(() => normalizeCanonicalUrl("https://u:p@example.com/a"))).toBe("url.credentials-forbidden");
+    expect(code(() => normalizeCanonicalUrl("https://@example.org/"))).toBe("url.credentials-forbidden");
     expect(code(() => normalizeCanonicalUrl("https://example.com/a#x"))).toBe("url.fragment-forbidden");
+    expect(code(() => normalizeCanonicalUrl("https://example.org/#"))).toBe("url.fragment-forbidden");
     expect(code(() => normalizeCanonicalUrl("ftp://example.com/a"))).toBe("url.unsupported-scheme");
+    expect(code(() => normalizeCanonicalUrl("mailto:reader@example.com"))).toBe("url.unsupported-scheme");
     expect(code(() => normalizeCanonicalUrl("http://example.com/a"))).toBe("url.unsupported-scheme");
-    expect(code(() => normalizeCanonicalUrl("https://éxample.org/a"))).toBe("url.invalid");
+    for (const malformed of [
+      "https:/example.org/", "https:example.org/", "https:///example.org/", "https:\\example.org/",
+      "https:\\\\example.org/", "https:/éxample.org/", "https://éxample.org/a", "https://example.org/%ZZ",
+      "https://example.org:/", "https://%65xample.org/", "https://[2001:db8::1/",
+    ]) expect(code(() => normalizeCanonicalUrl(malformed))).toBe("url.invalid");
     expect(code(() => normalizeCanonicalUrl("https://example.org/a b"))).toBe("url.invalid");
     expect(code(() => normalizeCanonicalUrl("https://example.org/\ud800"))).toBe("identifier.invalid-type");
     expect(code(() => normalizeCanonicalUrl("not a url"))).toBe("url.invalid");
@@ -133,18 +148,39 @@ describe("scholarly identifiers", () => {
       .toBe("url.http-host-not-approved");
     for (const approvedHttpHosts of [["*.example.org"], ["Example.org"], ["127.0.0.1"], ["example.org", "example.org"]])
       expect(code(() => validateProspectiveSourceIdentityFields(input, { ...policy, approvedHttpHosts }))).toBe("url.http-context-invalid");
+    expect(code(() => validateProspectiveSourceIdentityFields(input, { allowHttp: true, approvedHttpHosts: ["example.org"] })))
+      .toBe("url.http-context-invalid");
     expect(code(() => validateProspectiveSourceIdentityFields(input, { ...policy, accessPolicySha256: "bad" }))).toBe("url.http-context-invalid");
     expect(code(() => validateProspectiveSourceIdentityFields(input, { ...policy, approvedHttpHosts: ["x".repeat(254)] })))
       .toBe("identifier.invalid-options");
   });
 
   test("derives only allowlisted DOI PMID and PMCID resolver URLs", () => {
-    expect(canonicalDoiUrl("10.1234/A/B")).toBe("https://doi.org/10.1234/a%2Fb");
-    expect(canonicalPmidUrl("PMID:00012")).toBe("https://pubmed.ncbi.nlm.nih.gov/12/");
-    expect(canonicalPmcidUrl("pmcid:pmc00012")).toBe("https://pmc.ncbi.nlm.nih.gov/articles/PMC12/");
+    const cases = [
+      [canonicalDoiUrl, "10.1234/A/B", "https://doi.org/10.1234/a%2Fb"],
+      [canonicalPmidUrl, "PMID:00012", "https://pubmed.ncbi.nlm.nih.gov/12/"],
+      [canonicalPmcidUrl, "pmcid:pmc00012", "https://pmc.ncbi.nlm.nih.gov/articles/PMC12/"],
+    ] as const;
+    for (const [derive, input, expected] of cases) {
+      const exactBytes = Buffer.byteLength(canonicalJson(expected));
+      expect(derive(input, { maxCanonicalScalarBytes: exactBytes })).toBe(expected);
+      expect(code(() => derive(input, { maxCanonicalScalarBytes: exactBytes - 1 }))).toBe("identifier.too-long");
+    }
+    const multibyte = "10.1234/é";
+    const inputBytes = Buffer.byteLength(canonicalJson(multibyte));
+    expect(code(() => canonicalDoiUrl(multibyte, { maxCanonicalScalarBytes: inputBytes }))).toBe("identifier.invalid-doi");
+    expect(code(() => canonicalDoiUrl(multibyte, { maxCanonicalScalarBytes: inputBytes - 1 }))).toBe("identifier.too-long");
   });
 
   test("rejects canonical scalar bytes before identifier and URL parsing", () => {
+    const doi = "10.1234/exact";
+    const exactDoiBytes = Buffer.byteLength(canonicalJson(doi));
+    expect(normalizeDoi(doi, { maxCanonicalScalarBytes: exactDoiBytes })).toBe(doi);
+    expect(code(() => normalizeDoi(doi, { maxCanonicalScalarBytes: exactDoiBytes - 1 }))).toBe("identifier.too-long");
+    const multibyteUrl = "https://example.org/é";
+    const exactUrlBytes = Buffer.byteLength(canonicalJson(multibyteUrl));
+    expect(normalizeCanonicalUrl(multibyteUrl, { maxCanonicalScalarBytes: exactUrlBytes })).toBe("https://example.org/%C3%A9");
+    expect(code(() => normalizeCanonicalUrl(multibyteUrl, { maxCanonicalScalarBytes: exactUrlBytes - 1 }))).toBe("url.too-long");
     const oversized = "https://" + "x".repeat(100);
     expect(code(() => normalizeCanonicalUrl(oversized, { maxCanonicalScalarBytes: 20 }))).toBe("url.too-long");
     expect(code(() => normalizeDoi("10.1234/" + "x".repeat(100), { maxCanonicalScalarBytes: 20 }))).toBe("identifier.too-long");
@@ -156,6 +192,11 @@ describe("scholarly identifiers", () => {
   });
 
   test("rejects an oversized prospective source record before nested identity reads", () => {
+    const exact = source({ title: "nested".repeat(1_000), authors: [{ family: "Family".repeat(100), given: "Given", literal: null, orcid: null }] });
+    const exactBytes = Buffer.byteLength(canonicalJson(exact));
+    expect(validateProspectiveSourceIdentityFields(exact, undefined, { maxSourceRecordCanonicalBytes: exactBytes })).toEqual(exact);
+    expect(code(() => validateProspectiveSourceIdentityFields(exact, undefined, { maxSourceRecordCanonicalBytes: exactBytes - 1 })))
+      .toBe("identifier.record-too-large");
     let touched = false;
     const unsafe = { ...source(), title: "x".repeat(300), get identifiers() { touched = true; return source().identifiers; } };
     expect(code(() => validateProspectiveSourceIdentityFields(unsafe as SourceRecord, undefined, { maxSourceRecordCanonicalBytes: 256 })))
