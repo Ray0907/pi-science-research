@@ -353,10 +353,10 @@ describe("evidence admission", () => {
     const contradiction = evidence("ev-0000000000000002", { stance: "contradicting", verificationStatus: "rejected", recordedByAttemptId: ATTEMPT_D });
     const target = claim(undefined, { evidenceRefs: [refForEvidence(supporting), refForEvidence(contradiction)] });
     for (const attemptId of [ATTEMPT_A, ATTEMPT_C]) {
-      const colliding = verification(undefined, { attemptId, checkedEvidence: [refForEvidence(contradiction)], corrections: [{ claimId: target.claimId, description: "resolved" }] });
+      const colliding = verification(undefined, { attemptId, checkedEvidence: [refForEvidence(supporting), refForEvidence(contradiction)], corrections: [{ claimId: target.claimId, description: "resolved" }] });
       expect(evaluate({ ...set(), claims: [target], evidence: [supporting, contradiction], verifications: [colliding] }).blockers).toContain("claim.unresolved-conflict");
     }
-    const contradictionRecorder = verification(undefined, { attemptId: ATTEMPT_D, checkedEvidence: [refForEvidence(contradiction)], corrections: [{ claimId: target.claimId, description: "resolved" }] });
+    const contradictionRecorder = verification(undefined, { attemptId: ATTEMPT_D, checkedEvidence: [refForEvidence(supporting), refForEvidence(contradiction)], corrections: [{ claimId: target.claimId, description: "resolved" }] });
     expect(evaluate({ ...set(), claims: [target], evidence: [supporting, contradiction], verifications: [contradictionRecorder] }).blockers).not.toContain("claim.unresolved-conflict");
   });
   test("treats a conflicting claim supporting side as contradictory and requires both exact sides", () => {
@@ -371,15 +371,49 @@ describe("evidence admission", () => {
     expect(unresolved.contradictingEvidenceRefs).toEqual([refForEvidence(otherEvidence)]);
     expect(unresolved.blockers).toContain("claim.unresolved-conflict");
     const accepted = verification(undefined, {
-      checkedClaims: [refFor(target)], checkedEvidence: [refForEvidence(otherEvidence)],
+      checkedClaims: [refFor(target)], checkedEvidence: [refForEvidence(targetEvidence), refForEvidence(otherEvidence)],
       corrections: [{ claimId: target.claimId, description: "supported" }],
     });
     const conflictSet = { ...set(), claims: [target, other], evidence: [targetEvidence, otherEvidence] };
     expect(evaluate({ ...conflictSet, verifications: [accepted] }).blockers).not.toContain("claim.unresolved-conflict");
-    expect(evaluate({ ...conflictSet, verifications: [{ ...accepted, checkedEvidence: [] }] }).blockers).toContain("claim.unresolved-conflict");
+    expect(evaluate({ ...conflictSet, verifications: [{ ...accepted, checkedEvidence: [refForEvidence(targetEvidence)] }] }).blockers).toContain("claim.unresolved-conflict");
     expect(evaluate({ ...conflictSet, verifications: [{ ...accepted, corrections: [] }] }).blockers).toContain("claim.unresolved-conflict");
     expect(evaluate({ ...conflictSet, claims: [{ ...target, status: "disputed" }, other], verifications: [accepted] }).blockers).toContain("claim.unresolved-conflict");
     expect(evaluate({ ...conflictSet, evidence: [targetEvidence, { ...otherEvidence, verificationStatus: "verified" }], verifications: [accepted] }).blockers).toContain("claim.unresolved-conflict");
+  });
+  test("requires every exact supporting and closure contradiction in conflict verification", () => {
+    const supportA = evidence(undefined, { conflictsWith: ["ev-0000000000000004"] });
+    const supportB = evidence("ev-0000000000000002");
+    const directContradiction = evidence("ev-0000000000000003", { stance: "contradicting", verificationStatus: "rejected" });
+    const closureContradiction = evidence("ev-0000000000000004", { stance: "contradicting", verificationStatus: "rejected", conflictsWith: [supportA.evidenceId] });
+    const target = claim(undefined, { evidenceRefs: [refForEvidence(supportA), refForEvidence(supportB), refForEvidence(directContradiction)] });
+    const all = [supportA, supportB, directContradiction, closureContradiction];
+    const accepted = verification(undefined, { checkedEvidence: all.map(refForEvidence), corrections: [{ claimId: target.claimId, description: "resolved" }] });
+    const records = { ...set(), claims: [target], evidence: all };
+    expect(evaluate({ ...records, verifications: [accepted] }).blockers).not.toContain("claim.unresolved-conflict");
+    for (const omitted of all) {
+      const checkedEvidence = all.filter((item) => item !== omitted).map(refForEvidence);
+      expect(evaluate({ ...records, verifications: [{ ...accepted, checkedEvidence }] }).blockers).toContain("claim.unresolved-conflict");
+    }
+
+    const supportB2 = { ...supportB, revision: 2, claimRef: { claimId: target.claimId, revision: 2 } };
+    const directContradiction2 = { ...directContradiction, revision: 2, claimRef: { claimId: target.claimId, revision: 2 } };
+    const target2 = { ...target, revision: 2, evidenceRefs: [refForEvidence(supportB2), refForEvidence(directContradiction2)] };
+    const histories = { ...records, claims: [target, target2], evidence: [...all, supportB2, directContradiction2] };
+    for (const replacement of [refForEvidence(supportB2), refForEvidence(directContradiction2)]) {
+      const checkedEvidence = accepted.checkedEvidence.map((ref) => ref.evidenceId === replacement.evidenceId ? replacement : ref);
+      expect(evaluate({ ...histories, verifications: [{ ...accepted, checkedEvidence }] }, refFor(target)).blockers).toContain("claim.unresolved-conflict");
+    }
+  });
+  test("translates Task 2 provenance-step bounds to exact reference limits", () => {
+    const r = request("request-0000000000000001", source().sourceId, {
+      resultSourceIds: [], requestedUrl: "https://start.example/a", finalUrl: "https://final.example/a",
+      redirectUrls: ["https://redirect.example/1", "https://redirect.example/2", "https://redirect.example/3"],
+    });
+    expect(buildBoundedValidatedEvidenceSnapshot({ ...set(), requests: [r] }, { limits: { maxReferences: 5 } })).toBeDefined();
+    expect(errorCode(() => buildBoundedValidatedEvidenceSnapshot({ ...set(), requests: [r] }, { limits: { maxReferences: 4 } }))).toBe("evidence.too-many-references");
+    const hostile = { ...r, redirectUrls: new Proxy([], { ownKeys() { throw new Error("SECRET-PROVENANCE"); } }) };
+    expect(errorCode(() => buildBoundedValidatedEvidenceSnapshot({ ...set(), requests: [hostile as never] }, { limits: { maxReferences: 4 } }))).toBe("evidence.invalid-input");
   });
   test("deduplicates exact target evidence references deterministically", () => {
     const first = evidence(); const second = evidence("ev-0000000000000002");

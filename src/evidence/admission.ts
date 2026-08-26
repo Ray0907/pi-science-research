@@ -445,11 +445,13 @@ function conflictsResolved(
   verifications: VerificationRecord[], target: ClaimRecord, supporting: QualifiedEvidence[], contradictions: EvidenceRecord[],
 ): boolean {
   if (target.status !== "supported") return false;
-  const forbiddenAttempts = new Set([target.createdByAttemptId, ...supporting.map(({ evidence }) => evidence.recordedByAttemptId)]);
+  const supportingRecords = supporting.map(({ evidence }) => evidence);
+  const used = [...supportingRecords, ...contradictions];
+  const forbiddenAttempts = new Set([target.createdByAttemptId, ...supportingRecords.map((evidence) => evidence.recordedByAttemptId)]);
   return verifications.some((verification) => verification.result === "accepted" && !forbiddenAttempts.has(verification.attemptId)
     && verification.corrections.some((correction) => correction.claimId === target.claimId && asciiTrim(correction.description).length > 0)
-    && contradictions.every((record) => record.verificationStatus === "rejected"
-      && verification.checkedEvidence.some((ref) => ref.evidenceId === record.evidenceId && ref.revision === record.revision)));
+    && used.every((record) => verification.checkedEvidence.some((ref) => ref.evidenceId === record.evidenceId && ref.revision === record.revision))
+    && contradictions.every((record) => record.verificationStatus === "rejected"));
 }
 function enforceCurrentReferences(target: ClaimRecord, indexes: ReturnType<typeof getValidatedSnapshotIndexes>): void {
   const latestClaim = indexes.getLatestRevision("claims", target.claimId);
