@@ -65,6 +65,10 @@ export interface CreateOwnedRunRootOptions {
   onCheck?: (phase: string) => void | Promise<void>;
 }
 
+export interface RunRootVerificationOptions {
+  onCheck?: (phase: string) => void | Promise<void>;
+}
+
 export interface ContainedWriteOptions {
   onCheck?: (phase: string) => void | Promise<void>;
 }
@@ -230,7 +234,9 @@ export async function openOwnedRunRoot(
   path: string,
   runId: RunId,
   ownershipToken: string,
+  options: RunRootVerificationOptions = {},
 ): Promise<OwnedRunRoot> {
+  assertSimpleOptions(options, new Set(["onCheck"]));
   if (!ID_PATTERNS.run.test(runId) || !TOKEN_PATTERN.test(ownershipToken)) fail("run-root.owner-mismatch");
   assertPathBounds(path);
   await assertNoSymlinkSegments(resolve(path));
@@ -238,17 +244,40 @@ export async function openOwnedRunRoot(
   await assertNoSymlinkSegments(canonical);
   await assertIntrinsicUnsafeRoot(canonical);
   await assertGlobalForbiddenRoot(canonical, []);
-  const rootHandle = await openDirectoryNoFollow(canonical);
+  let rootHandle: FileHandle | undefined = await openDirectoryNoFollow(canonical);
   try {
     const rootStat = await rootHandle.stat();
     const pathStat = await safeLstat(canonical);
     if (!rootStat.isDirectory() || !sameInode(rootStat, pathStat)) fail("run-root.replaced");
-    const { marker, stat: markerStat, sha256 } = await readOwnerMarker(canonical);
-    assertOwner(marker, runId, ownershipToken);
-    assertMarkerRootBinding(marker, rootStat, "run-root.owner-mismatch");
-    return registerOwnedRoot(canonical, runId, ownershipToken, rootHandle, rootStat, markerStat, sha256);
+    const markerRead = await readOwnerMarker(canonical, options.onCheck);
+    assertOwner(markerRead.marker, runId, ownershipToken);
+    assertMarkerRootBinding(markerRead.marker, rootStat, "run-root.owner-mismatch");
+    await invokeCheck(options.onCheck, "after-open-owner-marker-read-before-final-root-check");
+    await rootHandle.close();
+    rootHandle = undefined;
+    const verified = await verifyOpenedRootPath(
+      canonical,
+      rootStat,
+      markerRead,
+      runId,
+      ownershipToken,
+    );
+    try {
+      return registerOwnedRoot(
+        canonical,
+        runId,
+        ownershipToken,
+        verified.handle,
+        verified.rootStat,
+        verified.markerStat,
+        verified.markerSha256,
+      );
+    } catch (error) {
+      await verified.handle.close().catch(() => undefined);
+      throw error;
+    }
   } catch (error) {
-    await rootHandle.close().catch(() => undefined);
+    await rootHandle?.close().catch(() => undefined);
     throw wrap(error);
   }
 }
@@ -347,7 +376,11 @@ async function assertContainedWriteInternal(
   }
 }
 
-export async function revalidateOwnedRunRoot(root: OwnedRunRoot): Promise<void> {
+export async function revalidateOwnedRunRoot(
+  root: OwnedRunRoot,
+  options: RunRootVerificationOptions = {},
+): Promise<void> {
+  assertSimpleOptions(options, new Set(["onCheck"]));
   const internal = asInternal(root);
   if (internal.closed) fail("run-root.closed");
   const handleStat = await internal.rootHandle.stat().catch(() => fail("run-root.replaced"));
@@ -356,13 +389,14 @@ export async function revalidateOwnedRunRoot(root: OwnedRunRoot): Promise<void> 
     fail("run-root.replaced");
   }
   if (Number(handleStat.dev) !== internal.dev || Number(handleStat.ino) !== internal.ino) fail("run-root.replaced");
-  const read = await readOwnerMarker(internal.path);
+  const read = await readOwnerMarker(internal.path, options.onCheck);
   if (
     Number(read.stat.dev) !== internal.markerDev || Number(read.stat.ino) !== internal.markerIno ||
     read.sha256 !== internal.markerSha256
   ) fail("run-root.replaced");
   assertOwner(read.marker, internal.runId, internal.ownershipToken);
   assertMarkerRootBinding(read.marker, handleStat, "run-root.replaced");
+  await verifyPinnedRootPath(internal.path, internal.rootHandle, handleStat);
 }
 
 function registerOwnedRoot(
@@ -406,7 +440,10 @@ function registerOwnedRoot(
   return root;
 }
 
-async function readOwnerMarker(root: string): Promise<{
+async function readOwnerMarker(
+  root: string,
+  onCheck?: (phase: string) => void | Promise<void>,
+): Promise<{
   marker: OwnerMarker;
   stat: Awaited<ReturnType<FileHandle["stat"]>>;
   sha256: string;
@@ -434,9 +471,94 @@ async function readOwnerMarker(root: string): Promise<{
     }
     const marker = parseOwnerMarker(value);
     if (`${canonicalJson(marker)}\n` !== text!) fail("run-root.marker-invalid");
+    await invokeCheck(onCheck, "after-marker-descriptor-validated-before-path-recheck");
+    const pathAfterRead = await safeLstat(markerPath);
+    if (
+      pathAfterRead.isSymbolicLink() || !pathAfterRead.isFile() || pathAfterRead.nlink !== 1 ||
+      !sameStableFileObservation(pathAfterRead, after)
+    ) fail("run-root.replaced");
+    const reopened = await openReadNoFollow(markerPath);
+    try {
+      const reopenedStat = await reopened.stat();
+      const finalPathStat = await safeLstat(markerPath);
+      if (
+        !reopenedStat.isFile() || reopenedStat.nlink !== 1 ||
+        finalPathStat.isSymbolicLink() || !finalPathStat.isFile() || finalPathStat.nlink !== 1 ||
+        !sameStableFileObservation(reopenedStat, after) ||
+        !sameStableFileObservation(finalPathStat, after)
+      ) fail("run-root.replaced");
+    } finally {
+      await reopened.close().catch(() => undefined);
+    }
     return { marker, stat: after, sha256: sha256Hex(bytes) };
   } finally {
     await handle.close().catch(() => undefined);
+  }
+}
+
+async function verifyOpenedRootPath(
+  path: string,
+  expectedRoot: Awaited<ReturnType<FileHandle["stat"]>>,
+  expectedMarker: Awaited<ReturnType<typeof readOwnerMarker>>,
+  runId: RunId,
+  ownershipToken: string,
+): Promise<{
+  handle: FileHandle;
+  rootStat: Awaited<ReturnType<FileHandle["stat"]>>;
+  markerStat: Awaited<ReturnType<FileHandle["stat"]>>;
+  markerSha256: string;
+}> {
+  const pathBefore = await safeLstat(path);
+  if (pathBefore.isSymbolicLink() || !pathBefore.isDirectory() || !sameInode(pathBefore, expectedRoot)) {
+    fail("run-root.replaced");
+  }
+  const handle = await openDirectoryNoFollow(path);
+  try {
+    const opened = await handle.stat();
+    if (!opened.isDirectory() || !sameInode(opened, expectedRoot) || !sameInode(opened, pathBefore)) {
+      fail("run-root.replaced");
+    }
+    const marker = await readOwnerMarker(path);
+    if (
+      !sameStableFileObservation(marker.stat, expectedMarker.stat) ||
+      marker.sha256 !== expectedMarker.sha256
+    ) fail("run-root.replaced");
+    assertOwner(marker.marker, runId, ownershipToken);
+    assertMarkerRootBinding(marker.marker, opened, "run-root.replaced");
+    const pathAfter = await safeLstat(path);
+    const finalStat = await handle.stat();
+    if (
+      pathAfter.isSymbolicLink() || !pathAfter.isDirectory() ||
+      !sameInode(pathAfter, expectedRoot) || !sameInode(finalStat, expectedRoot) ||
+      !sameInode(pathAfter, finalStat)
+    ) fail("run-root.replaced");
+    return { handle, rootStat: finalStat, markerStat: marker.stat, markerSha256: marker.sha256 };
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    throw wrap(error);
+  }
+}
+
+async function verifyPinnedRootPath(
+  path: string,
+  retainedHandle: FileHandle,
+  expectedRoot: Awaited<ReturnType<FileHandle["stat"]>>,
+): Promise<void> {
+  const pathBefore = await safeLstat(path);
+  if (pathBefore.isSymbolicLink() || !pathBefore.isDirectory() || !sameInode(pathBefore, expectedRoot)) {
+    fail("run-root.replaced");
+  }
+  const fresh = await openDirectoryNoFollow(path);
+  try {
+    const freshStat = await fresh.stat();
+    const retainedStat = await retainedHandle.stat();
+    const pathAfter = await safeLstat(path);
+    if (
+      !sameInode(freshStat, expectedRoot) || !sameInode(retainedStat, expectedRoot) ||
+      pathAfter.isSymbolicLink() || !pathAfter.isDirectory() || !sameInode(pathAfter, expectedRoot)
+    ) fail("run-root.replaced");
+  } finally {
+    await fresh.close().catch(() => undefined);
   }
 }
 
@@ -637,7 +759,7 @@ async function prepareAndPublishLeaf(
     finalHandle = await openDirectoryNoFollow(publishedPath);
     const finalStat = await finalHandle.stat();
     if (!sameInode(first, finalStat)) fail("run-root.replaced");
-    const markerRead = await readOwnerMarker(publishedPath);
+    const markerRead = await readOwnerMarker(publishedPath, options.onCheck);
     if (!sameStableFileObservation(markerRead.stat, markerStat!) || markerRead.sha256 !== markerSha256) fail("run-root.replaced");
     assertMarkerSeed(markerRead.marker, markerSeed);
     assertMarkerRootBinding(markerRead.marker, first, "run-root.replaced");
@@ -1126,6 +1248,18 @@ async function readBounded(handle: FileHandle, maximum: number): Promise<Buffer>
     chunks.push(chunk.subarray(0, bytesRead));
   }
   return Buffer.concat(chunks, total);
+}
+
+async function invokeCheck(
+  hook: ((phase: string) => void | Promise<void>) | undefined,
+  phase: string,
+): Promise<void> {
+  if (!hook) return;
+  try {
+    await hook(phase);
+  } catch (error) {
+    throw wrap(error);
+  }
 }
 
 async function durability(

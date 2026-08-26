@@ -447,6 +447,29 @@ test("cross-process create", async () => {
     }
   });
 
+  test("rejects marker pathname replacement after descriptor validation during creation", async () => {
+    const { project } = await fixture();
+    let replaced = false;
+    let replacementPath = "";
+    await expect(createOwnedRunRoot(options(project, {
+      topic: "marker-path-replacement",
+      onCheck: async (phase: string) => {
+        if (phase !== "after-marker-descriptor-validated-before-path-recheck" || replaced) return;
+        replaced = true;
+        const research = join(await realpath(project), "research");
+        const leaf = (await readdir(research)).find((entry) => entry.includes("marker-path-replacement") && !entry.startsWith(".tmp-"));
+        if (!leaf) throw new Error("published leaf absent");
+        replacementPath = join(research, leaf, ".pi-science-research-owner.json");
+        const bytes = await readFile(replacementPath);
+        await rename(replacementPath, `${replacementPath}.moved`);
+        await writeFile(replacementPath, bytes);
+      },
+    }))).rejects.toEqual(expectCode("run-root.replaced"));
+    expect(replaced).toBe(true);
+    expect((await lstat(replacementPath)).isFile()).toBe(true);
+    expect((await lstat(`${replacementPath}.moved`)).isFile()).toBe(true);
+  });
+
   test("rejects in-place marker mutation after the marker was previously read", async () => {
     const { project } = await fixture();
     let mutated = false;
@@ -608,6 +631,68 @@ describe("openOwnedRunRoot", () => {
 
     await expect(revalidateOwnedRunRoot(created)).rejects.toEqual(expectCode("run-root.replaced"));
     await created.close();
+  });
+
+  test("open rejects marker pathname replacement after descriptor validation", async () => {
+    const { project } = await fixture();
+    const created = await createOwnedRunRoot(options(project));
+    const markerPath = join(created.path, ".pi-science-research-owner.json");
+    await created.close();
+    let replaced = false;
+
+    await expect(openOwnedRunRoot(created.path, RUN_ID, TOKEN, {
+      onCheck: async (phase: string) => {
+        if (phase !== "after-marker-descriptor-validated-before-path-recheck" || replaced) return;
+        replaced = true;
+        const bytes = await readFile(markerPath);
+        await rename(markerPath, `${markerPath}.moved`);
+        await writeFile(markerPath, bytes);
+      },
+    })).rejects.toEqual(expectCode("run-root.replaced"));
+    expect(replaced).toBe(true);
+    expect((await lstat(markerPath)).isFile()).toBe(true);
+  });
+
+  test("active revalidation rejects marker pathname replacement", async () => {
+    const { project } = await fixture();
+    const created = await createOwnedRunRoot(options(project));
+    const markerPath = join(created.path, ".pi-science-research-owner.json");
+    let replaced = false;
+
+    await expect(revalidateOwnedRunRoot(created, {
+      onCheck: async (phase: string) => {
+        if (phase !== "after-marker-descriptor-validated-before-path-recheck" || replaced) return;
+        replaced = true;
+        const bytes = await readFile(markerPath);
+        await rename(markerPath, `${markerPath}.moved`);
+        await writeFile(markerPath, bytes);
+      },
+    })).rejects.toEqual(expectCode("run-root.replaced"));
+    expect(replaced).toBe(true);
+    await created.close();
+  });
+
+  test("open rejects root pathname replacement after reading a valid marker", async () => {
+    const { base, project } = await fixture();
+    const created = await createOwnedRunRoot(options(project));
+    const originalPath = created.path;
+    const marker = await readFile(join(originalPath, ".pi-science-research-owner.json"));
+    await created.close();
+    const moved = join(base, "moved-open-root");
+    let replaced = false;
+
+    await expect(openOwnedRunRoot(originalPath, RUN_ID, TOKEN, {
+      onCheck: async (phase: string) => {
+        if (phase !== "after-open-owner-marker-read-before-final-root-check" || replaced) return;
+        replaced = true;
+        await rename(originalPath, moved);
+        await mkdir(originalPath);
+        await writeFile(join(originalPath, ".pi-science-research-owner.json"), marker);
+      },
+    })).rejects.toEqual(expectCode("run-root.replaced"));
+    expect(replaced).toBe(true);
+    expect((await lstat(originalPath)).isDirectory()).toBe(true);
+    expect((await lstat(moved)).isDirectory()).toBe(true);
   });
 
   test("rejects a root reached through a symlinked parent alias", async () => {
