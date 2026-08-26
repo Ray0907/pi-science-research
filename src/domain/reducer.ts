@@ -556,6 +556,12 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
           || predecessor.intent.logicalRequestId !== event.payload.logicalRequestId
           || predecessor.intent.physicalAttemptOrdinal + 1 !== event.payload.nextPhysicalAttemptOrdinal) fail(event, index, "reducer.request-schedule-link");
         const failedRequest = predecessor!;
+        const owningAttempt = requireAttempt(event, index, failedRequest.intent.attemptId);
+        if (owningAttempt.phase === "committed" || owningAttempt.phase === "quarantined"
+          || owningAttempt.failureState === "cancelled" || owningAttempt.failureState === "terminal-failed"
+          || owningAttempt.failureState === "superseded") fail(event, index, "reducer.request-schedule-attempt-state");
+        if (tasks.get(owningAttempt.record.taskId)?.record.state !== "running") fail(event, index, "reducer.request-schedule-task-state");
+        if (runState === "completed" || runState === "cancelled" || runState === "failed") fail(event, index, "reducer.request-schedule-run-state");
         if (event.payload.attemptId !== failedRequest.intent.attemptId
           || requireAttempt(event, index, event.payload.attemptId).record.executionEpoch !== failedRequest.intent.executionEpoch
           || failedRequest.intent.executionEpoch !== currentEpoch

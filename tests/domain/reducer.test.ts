@@ -921,7 +921,70 @@ function scheduledRetryEvents(): Events {
   return events;
 }
 
+function requestScheduleReadyEvents(): Events {
+  const events = new Events(); events.base(); events.started();
+  events.add("identity_reserved", { kind: "request", id: REQUEST_1, origin: "child-import" });
+  const intent = events.add("request_intent_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: 1, journalEntrySha256: HASH, intent: requestIntent() });
+  events.add("request_result_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: 2, journalEntrySha256: HASH_B, intentLedgerSeq: intent.seq, request: requestResult() });
+  events.add("identity_reserved", { kind: "retry-schedule", id: REQUEST_RETRY, origin: "child-import" });
+  return events;
+}
+
+function appendRequestSchedule(events: Events): void {
+  events.add("request_retry_scheduled", { scheduleId: REQUEST_RETRY, attemptId: ATTEMPT_1, journalLocalSeq: 3, journalEntrySha256: "c".repeat(64),
+    logicalRequestId: "request-series", failedRequestId: REQUEST_1, nextPhysicalAttemptOrdinal: 2, notBeforeAt: LATER, delayMs: 1, reasonClass: "transient" });
+}
+
 describe("remaining cross-module ledger invariants", () => {
+  test("rejects request scheduling after owning attempt terminal states or commit", () => {
+    for (const state of ["cancelled", "terminal-failed"] as const) {
+      const events = requestScheduleReadyEvents();
+      events.add("attempt_failed", { attemptId: ATTEMPT_1, state, errorClass: "terminal", message: "safe" });
+      appendRequestSchedule(events);
+      expectCorruption(events.values, "reducer.request-schedule-attempt-state");
+    }
+
+    const committed = requestScheduleReadyEvents();
+    const result = committed.result(); committed.records(ATTEMPT_1, TX_1, result.seq);
+    appendRequestSchedule(committed);
+    expectCorruption(committed.values, "reducer.request-schedule-attempt-state");
+  });
+
+  test("rejects scheduling after supersession and task or run terminal state", () => {
+    const superseded = requestScheduleReadyEvents();
+    superseded.add("attempt_failed", { attemptId: ATTEMPT_1, state: "retryable-failed", errorClass: "retry", message: "safe" });
+    superseded.add("identity_reserved", { kind: "retry-schedule", id: RETRY_2, origin: "parent-generated" });
+    const replacementSchedule = superseded.add("retry_scheduled", { scheduleId: RETRY_2, logicalOperationId: LOGICAL, failedAttemptId: ATTEMPT_1,
+      nextAttemptOrdinal: 2, notBeforeAt: LATER, delayMs: 1, reasonClass: "retry" });
+    superseded.add("identity_reserved", { kind: "attempt", id: ATTEMPT_2, origin: "parent-generated" });
+    superseded.add("retry_started", { scheduleId: RETRY_2, logicalOperationId: LOGICAL, attemptId: ATTEMPT_2, attemptOrdinal: 2, scheduledFromSeq: replacementSchedule.seq });
+    superseded.add("dispatch_intent", { attempt: attemptRecord({ attemptId: ATTEMPT_2, attemptOrdinal: 2, retryOfAttemptId: ATTEMPT_1, attemptEnvelopeSha256: "d".repeat(64) }) });
+    superseded.add("attempt_failed", { attemptId: ATTEMPT_1, state: "superseded", errorClass: "superseded", message: "safe" });
+    appendRequestSchedule(superseded);
+    expectCorruption(superseded.values, "reducer.request-schedule-attempt-state");
+
+    const taskTerminal = requestScheduleReadyEvents();
+    taskTerminal.add("task_upserted", { task: taskRecord({ revision: 2, state: "cancelled", attemptIds: [ATTEMPT_1] }) });
+    appendRequestSchedule(taskTerminal);
+    expectCorruption(taskTerminal.values, "reducer.request-schedule-task-state");
+
+    const runTerminal = requestScheduleReadyEvents();
+    runTerminal.add("state_changed", { from: "researching", to: "verifying", blocker: null });
+    runTerminal.add("state_changed", { from: "verifying", to: "synthesizing", blocker: null });
+    runTerminal.add("identity_reserved", { kind: "revision", id: REVISION_1, origin: "parent-generated" });
+    runTerminal.add("revision_committed", { revisionId: REVISION_1, manifestSha256: HASH, completionCommitId: "complete" });
+    runTerminal.add("run_completed", { revisionId: REVISION_1, manifestSha256: HASH, runSnapshotSha256: HASH_B, completionCommitId: "complete", completedAt: LATER });
+    appendRequestSchedule(runTerminal);
+    expectCorruption(runTerminal.values, "reducer.request-schedule-run-state");
+  });
+
+  test("accepts durable request schedule imported before terminal attempt failure", () => {
+    const events = requestScheduleReadyEvents();
+    appendRequestSchedule(events);
+    events.add("attempt_failed", { attemptId: ATTEMPT_1, state: "terminal-failed", errorClass: "terminal", message: "safe" });
+    expect(reduceLedgerEvents(events.values).requests[REQUEST_1]).toMatchObject({ status: "retryable-error" });
+  });
+
   test("requires a prior retryable request result before scheduling", () => {
     const events = new Events(); events.base(); events.started();
     events.add("identity_reserved", { kind: "request", id: REQUEST_1, origin: "child-import" });
