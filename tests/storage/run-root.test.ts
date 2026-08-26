@@ -416,6 +416,65 @@ test("cross-process create", async () => {
     }))).rejects.toEqual(expectCode("run-root.replaced"));
   });
 
+  test.each([
+    { policy: "interactive", restore: false },
+    { policy: "allowlist", restore: true },
+  ] as const)("approval proof rejects a $policy ancestor swap at before-create (restore=$restore)", async ({ policy, restore }) => {
+    const { base, project } = await fixture();
+    const outside = join(base, `outside-${policy}`);
+    const moved = join(base, `outside-${policy}-old`);
+    const replacement = join(base, `outside-${policy}-replacement`);
+    await mkdir(outside);
+    await mkdir(replacement);
+    let swapped = false;
+
+    await expect(createOwnedRunRoot(options(project, {
+      requestedPath: join(outside, "run"),
+      allowAbsoluteRequestedPath: true,
+      ...(policy === "interactive"
+        ? { approveOutside: async () => true }
+        : { approvedOutsideRoots: [outside] }),
+      onCheck: async (phase: string) => {
+        if (phase !== "before-create" || swapped) return;
+        swapped = true;
+        await rename(outside, moved);
+        await rename(replacement, outside);
+        if (restore) {
+          await rename(outside, replacement);
+          await rename(moved, outside);
+        }
+      },
+    }))).rejects.toEqual(expectCode("run-root.replaced"));
+
+    expect(swapped).toBe(true);
+    await expect(lstat(join(outside, "run"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(lstat(join(replacement, "run"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("rechecks the approved outside chain immediately before exclusive creation", async () => {
+    const { base, project } = await fixture();
+    const outside = join(base, "outside-late-swap");
+    const moved = join(base, "outside-late-swap-old");
+    const replacement = join(base, "outside-late-swap-replacement");
+    await mkdir(outside);
+    await mkdir(replacement);
+    let swapped = false;
+
+    await expect(createOwnedRunRoot(options(project, {
+      requestedPath: join(outside, "run"),
+      allowAbsoluteRequestedPath: true,
+      approveOutside: async () => true,
+      onCheck: async (phase: string) => {
+        if (phase !== "after-leaf-candidate-check-before-mkdir" || swapped) return;
+        swapped = true;
+        await rename(outside, moved);
+        await rename(replacement, outside);
+      },
+    }))).rejects.toEqual(expectCode("run-root.replaced"));
+    expect(swapped).toBe(true);
+    await expect(lstat(join(outside, "run"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   test("rejects proxy/accessor options and wraps callback secrets", async () => {
     const { project } = await fixture();
     const proxied = new Proxy(options(project), {});
@@ -619,6 +678,45 @@ test("cross-process create", async () => {
       expect([sha256Hex(TOKEN), sha256Hex(OTHER_TOKEN)]).toContain(visibleMarker.ownershipTokenSha256);
     }
     await recovered.close();
+  });
+
+  test.each([
+    "research-parent-synced",
+    "leaf-parent-synced",
+    "leaf-final-directory-synced",
+    "leaf-marker-directory-synced",
+  ] as const)("does not fsync a swapped-and-restored directory at %s", async (step) => {
+    const { base, project } = await fixture();
+    const synced: string[] = [];
+    let swapped = false;
+    await expect(createOwnedRunRoot(options(project, {
+      topic: `sync-swap-${step}`,
+      onCheck: async (phase: string) => {
+        if (phase !== `before-${step}-directory-sync-verification` || swapped) return;
+        swapped = true;
+        const canonicalProject = await realpath(project);
+        const research = join(canonicalProject, "research");
+        const leaf = step.startsWith("leaf-") && step !== "leaf-parent-synced"
+          ? join(research, (await readdir(research)).find((entry) => entry.includes(`sync-swap-${step}`))!)
+          : undefined;
+        const target = step === "research-parent-synced"
+          ? canonicalProject
+          : step === "leaf-parent-synced" ? research : leaf!;
+        const moved = join(base, `moved-${step}`);
+        const replacement = join(base, `replacement-${step}`);
+        await mkdir(replacement);
+        await rename(target, moved);
+        await rename(replacement, target);
+        await rename(target, replacement);
+        await rename(moved, target);
+      },
+      durability: async (handle: { sync(): Promise<void> }, seen: string) => {
+        synced.push(seen);
+        await handle.sync();
+      },
+    }))).rejects.toEqual(expectCode("run-root.replaced"));
+    expect(swapped).toBe(true);
+    expect(synced).not.toContain(step);
   });
 
   test("fails closed when the project root is swapped during checks", async () => {

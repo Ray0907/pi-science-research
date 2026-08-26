@@ -128,6 +128,7 @@ interface InternalOwnedRunRoot extends OwnedRunRoot {
   readonly markerDev: number;
   readonly markerIno: number;
   closed: boolean;
+  closePromise: Promise<void> | undefined;
 }
 
 interface OwnerMarker {
@@ -149,6 +150,7 @@ class SynchronouslyPinnedDirectory implements OwnedDirectoryHandle {
   readonly fd: number;
   readonly initialStat: Stats;
   private closed = false;
+  private closePromise: Promise<void> | undefined;
 
   constructor(fd: number, initialStat: Stats) {
     this.fd = fd;
@@ -160,10 +162,26 @@ class SynchronouslyPinnedDirectory implements OwnedDirectoryHandle {
     return fstatSync(this.fd);
   }
 
-  async close(): Promise<void> {
-    if (this.closed) return;
-    this.closed = true;
-    closeSync(this.fd);
+  close(): Promise<void> {
+    if (this.closed) return Promise.resolve();
+    if (this.closePromise) return this.closePromise;
+    const attempt = Promise.resolve().then(() => {
+      try {
+        closeSync(this.fd);
+        this.closed = true;
+      } catch (error) {
+        if (descriptorIsConfirmedClosed(this.fd)) {
+          this.closed = true;
+          return;
+        }
+        throw error;
+      }
+    });
+    const tracked = attempt.finally(() => {
+      if (this.closePromise === tracked) this.closePromise = undefined;
+    });
+    this.closePromise = tracked;
+    return tracked;
   }
 }
 
@@ -239,9 +257,11 @@ async function createOwnedRunRootLocked(
   assertPathBounds(target);
   await assertNoSymlinkSegments(target);
   await assertForbiddenRoot(target, trustedProject, repositoryRoot, options);
-  await authorizeLocation(target, trustedProject, options);
+  const approvalProof = await authorizeLocation(target, trustedProject, options);
+  await recheckApprovalProof(approvalProof, false);
   await assertPinnedDirectory(trustedProject, projectStat);
   await options.onCheck?.("before-create");
+  await recheckApprovalProof(approvalProof, options.onCheck !== undefined);
   await assertPinnedDirectory(trustedProject, projectStat);
   await assertNoSymlinkSegments(target);
 
@@ -253,8 +273,9 @@ async function createOwnedRunRootLocked(
     createdAt,
     ownershipTokenSha256: sha256Hex(token),
   };
-  const published = await prepareAndPublishLeaf(target, collision, markerSeed, ancestorPins, options);
+  const published = await prepareAndPublishLeaf(target, collision, markerSeed, ancestorPins, approvalProof, options);
   try {
+    await recheckApprovalProof(approvalProof, false);
     return registerOwnedRoot(
       published.path,
       options.runId,
@@ -459,9 +480,18 @@ function registerOwnedRoot(
     markerSha256,
     async close() {
       if (internal.closed) return;
-      internal.closed = true;
-      openRootInodes.delete(internal.inodeKey);
-      await internal.rootHandle.close();
+      if (internal.closePromise) return internal.closePromise;
+      const attempt = (async () => {
+        await internal.rootHandle.close();
+        internal.closed = true;
+        openRootInodes.delete(internal.inodeKey);
+      })();
+      internal.closePromise = attempt;
+      try {
+        await attempt;
+      } finally {
+        if (internal.closePromise === attempt) internal.closePromise = undefined;
+      }
     },
   } as InternalOwnedRunRoot;
   const internal = root;
@@ -472,6 +502,7 @@ function registerOwnedRoot(
     markerDev: { value: Number(markerStat.dev), enumerable: false, writable: false },
     markerIno: { value: Number(markerStat.ino), enumerable: false, writable: false },
     closed: { value: false, enumerable: false, writable: true },
+    closePromise: { value: undefined, enumerable: false, writable: true },
   });
   for (const property of ["path", "runId", "dev", "ino", "markerSha256", "close"] as const) {
     Object.defineProperty(root, property, { writable: false, configurable: false });
@@ -640,6 +671,16 @@ interface PinnedAncestor {
   path: string;
   dev: number;
   ino: number;
+  ctimeMs: string;
+}
+
+interface ApprovedPathNode extends PinnedAncestor {
+  type: "directory" | "file" | "other";
+}
+
+interface LocationApprovalProof {
+  target: string;
+  nodes: readonly ApprovedPathNode[];
 }
 
 interface PublishedLeaf {
@@ -688,12 +729,12 @@ async function ensurePreparedResearchDirectory(
     await options.onCheck?.("after-research-final-open");
     await assertExpectedDirectory(path, first);
     if (!sameInode(await handle.stat(), first)) fail("run-root.replaced");
-    await durability(options, handle, "research-directory-synced");
+    await verifiedDirectoryDurability(options, handle, path, first, "research-directory-synced");
     await assertExpectedDirectory(path, first);
     await recheckPinnedAncestors(pins);
     const parentHandle = await openDirectoryNoFollow(parent);
     try {
-      await durability(options, parentHandle, "research-parent-synced");
+      await verifiedDirectoryDurability(options, parentHandle, parent, parentStat, "research-parent-synced");
     } finally {
       await parentHandle.close().catch(() => undefined);
     }
@@ -712,6 +753,7 @@ async function prepareAndPublishLeaf(
   useSuffix: boolean,
   markerSeed: OwnerMarkerSeed,
   ancestorPins: readonly PinnedAncestor[],
+  approvalProof: LocationApprovalProof,
   options: CreateOwnedRunRootOptions,
 ): Promise<PublishedLeaf> {
   const parent = dirname(base);
@@ -727,6 +769,7 @@ async function prepareAndPublishLeaf(
     }
     await options.onCheck?.("after-leaf-candidate-check-before-mkdir");
     await recheckPinnedAncestors(ancestorPins);
+    await recheckApprovalProof(approvalProof, false);
     try {
       await mkdir(candidate, { mode: 0o700 });
       // This synchronous open+fstat is deliberately the first operation after
@@ -751,6 +794,8 @@ async function prepareAndPublishLeaf(
   const first = leafPin.initialStat;
   let leafHandle: FileHandle | undefined;
   try {
+    // The synchronous leaf pin must precede this first post-creation await.
+    await recheckApprovalProof(approvalProof, false);
     await options.onCheck?.("after-final-leaf-sync-pin-before-path-check");
     await assertExpectedDirectory(publishedPath, first);
     await options.onCheck?.("after-final-leaf-path-check-before-secondary-open");
@@ -762,7 +807,7 @@ async function prepareAndPublishLeaf(
     await assertExpectedDirectory(publishedPath, first);
     if (!sameInode(await leafHandle.stat(), first)) fail("run-root.replaced");
     await recheckPinnedAncestors(ancestorPins);
-    await durability(options, leafHandle, "leaf-final-directory-synced");
+    await verifiedDirectoryDurability(options, leafHandle, publishedPath, first, "leaf-final-directory-synced");
 
     const marker: OwnerMarker = {
       schemaVersion: 1,
@@ -820,7 +865,7 @@ async function prepareAndPublishLeaf(
     await options.onCheck?.("after-marker-fsync-before-finalization");
     await assertExpectedDirectory(publishedPath, first);
     if (!sameInode(await leafPin.stat(), first)) fail("run-root.replaced");
-    await durability(options, leafHandle, "leaf-marker-directory-synced");
+    await verifiedDirectoryDurability(options, leafHandle, publishedPath, first, "leaf-marker-directory-synced");
     await recheckPinnedAncestors(ancestorPins);
 
     const markerRead = await readOwnerMarker(publishedPath, options.onCheck);
@@ -832,9 +877,11 @@ async function prepareAndPublishLeaf(
     await assertExpectedDirectory(publishedPath, first);
     if (!sameInode(await leafPin.stat(), first)) fail("run-root.replaced");
     await recheckPinnedAncestors(ancestorPins);
+    const expectedParent = ancestorPins.find((pin) => pin.path === parent);
+    if (!expectedParent) fail("run-root.replaced");
     const parentHandle = await openDirectoryNoFollow(parent);
     try {
-      await durability(options, parentHandle, "leaf-parent-synced");
+      await verifiedDirectoryDurability(options, parentHandle, parent, expectedParent, "leaf-parent-synced");
     } finally {
       await parentHandle.close().catch(() => undefined);
     }
@@ -918,12 +965,12 @@ async function pinExistingAncestors(path: string): Promise<PinnedAncestor[]> {
   let current = root;
   const rootStat = await safeLstat(root);
   if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) fail("run-root.symlink");
-  pins.push({ path: root, dev: Number(rootStat.dev), ino: Number(rootStat.ino) });
+  pins.push({ path: root, dev: Number(rootStat.dev), ino: Number(rootStat.ino), ctimeMs: String(rootStat.ctimeMs) });
   for (const segment of segments) {
     current = join(current, segment);
     const info = await safeLstat(current);
     if (info.isSymbolicLink() || !info.isDirectory()) fail("run-root.symlink");
-    pins.push({ path: current, dev: Number(info.dev), ino: Number(info.ino) });
+    pins.push({ path: current, dev: Number(info.dev), ino: Number(info.ino), ctimeMs: String(info.ctimeMs) });
   }
   return pins;
 }
@@ -958,27 +1005,77 @@ async function authorizeLocation(
   target: string,
   trustedProject: string,
   options: CreateOwnedRunRootOptions,
-): Promise<void> {
-  if (isStrictDescendantOrEqual(trustedProject, target)) return;
-  const anchorBefore = await nearestExistingDirectory(target);
+): Promise<LocationApprovalProof> {
+  const proof = await observeApprovalChain(target);
+  if (isStrictDescendantOrEqual(trustedProject, target)) return proof;
+
   const allowlist = options.approvedOutsideRoots ?? [];
   for (const entry of allowlist) {
     assertPathBounds(entry);
     const canonical = await canonicalExistingDirectory(entry);
     await assertIntrinsicUnsafeRoot(canonical);
     if (isStrictDescendantOrEqual(canonical, target)) {
-      const anchorAfter = await nearestExistingDirectory(target);
-      if (anchorBefore.path !== anchorAfter.path || !sameInode(anchorBefore.stat, anchorAfter.stat)) fail("run-root.replaced");
-      return;
+      await recheckApprovalProof(proof, false);
+      return proof;
     }
   }
   if (!options.approveOutside) fail("run-root.outside-denied");
   const approved = await options.approveOutside(target);
   if (approved !== true) fail("run-root.outside-denied");
-  const rechecked = await canonicalCandidate(target);
-  const anchorAfter = await nearestExistingDirectory(target);
-  if (rechecked !== target || anchorBefore.path !== anchorAfter.path || !sameInode(anchorBefore.stat, anchorAfter.stat)) {
-    fail("run-root.replaced");
+  await recheckApprovalProof(proof, true);
+  return proof;
+}
+
+async function observeApprovalChain(target: string): Promise<LocationApprovalProof> {
+  const canonicalTarget = await canonicalCandidate(target);
+  if (canonicalTarget !== target) fail("run-root.replaced");
+  const absolute = resolve(target);
+  const root = parsePath(absolute).root;
+  const paths = [root];
+  let current = root;
+  for (const segment of absolute.slice(root.length).split(sep).filter(Boolean)) {
+    current = join(current, segment);
+    paths.push(current);
+  }
+  if (paths.length > MAX_PATH_BYTES + 1) fail("run-root.path-too-long");
+
+  const nodes: ApprovedPathNode[] = [];
+  for (const path of paths) {
+    let info: Awaited<ReturnType<typeof lstat>>;
+    try {
+      info = await lstat(path);
+    } catch (error) {
+      if (isNodeError(error, "ENOENT")) break;
+      throw wrap(error);
+    }
+    if (info.isSymbolicLink()) fail("run-root.symlink");
+    const type = info.isDirectory() ? "directory" : info.isFile() ? "file" : "other";
+    nodes.push({
+      path,
+      dev: Number(info.dev),
+      ino: Number(info.ino),
+      ctimeMs: String(info.ctimeMs),
+      type,
+    });
+    if (type !== "directory") break;
+  }
+  return { target, nodes };
+}
+
+async function recheckApprovalProof(proof: LocationApprovalProof, requireStableCtime: boolean): Promise<void> {
+  for (let index = 0; index < proof.nodes.length; index += 1) {
+    const expected = proof.nodes[index]!;
+    const info = await safeLstat(expected.path);
+    const type = info.isDirectory() ? "directory" : info.isFile() ? "file" : "other";
+    if (
+      info.isSymbolicLink() || Number(info.dev) !== expected.dev || Number(info.ino) !== expected.ino ||
+      type !== expected.type ||
+      (requireStableCtime && index === proof.nodes.length - 1 && String(info.ctimeMs) !== expected.ctimeMs)
+    ) fail("run-root.replaced");
+  }
+  if (requireStableCtime) {
+    const current = await observeApprovalChain(proof.target);
+    if (current.nodes.length !== proof.nodes.length) fail("run-root.replaced");
   }
 }
 
@@ -1057,30 +1154,6 @@ async function inspectContainedPath(root: string, rel: string): Promise<{
     current = next;
   }
   fail("run-root.invalid-path");
-}
-
-async function nearestExistingDirectory(path: string): Promise<{
-  path: string;
-  stat: Awaited<ReturnType<typeof lstat>>;
-}> {
-  let current = resolve(path);
-  for (;;) {
-    try {
-      const info = await lstat(current);
-      if (info.isSymbolicLink()) fail("run-root.symlink");
-      if (!info.isDirectory()) {
-        current = dirname(current);
-        continue;
-      }
-      return { path: await realpath(current), stat: info };
-    } catch (error) {
-      if (error instanceof RunRootError) throw error;
-      if (!isNodeError(error, "ENOENT")) throw wrap(error);
-      const parent = dirname(current);
-      if (parent === current) fail("run-root.invalid-path");
-      current = parent;
-    }
-  }
 }
 
 async function canonicalCandidate(input: string): Promise<string> {
@@ -1225,6 +1298,15 @@ function sanitizeTopicSlug(topic: string): string {
   return slug || "research";
 }
 
+function descriptorIsConfirmedClosed(fd: number): boolean {
+  try {
+    fstatSync(fd);
+    return false;
+  } catch (error) {
+    return isNodeError(error, "EBADF");
+  }
+}
+
 function pinDirectoryImmediately(path: string): SynchronouslyPinnedDirectory {
   let fd: number | undefined;
   try {
@@ -1313,6 +1395,47 @@ async function invokeCheck(
   } catch (error) {
     throw wrap(error);
   }
+}
+
+async function verifiedDirectoryDurability(
+  options: CreateOwnedRunRootOptions,
+  handle: FileHandle,
+  path: string,
+  expected: { dev: number | bigint; ino: number | bigint },
+  step: RunRootDurabilityStep,
+): Promise<void> {
+  const beforeHandle = await handle.stat();
+  const beforePath = await safeLstat(path);
+  assertVerifiedDirectoryPair(beforeHandle, beforePath, expected);
+  await invokeCheck(options.onCheck, `before-${step}-directory-sync-verification`);
+  const checkedHandle = await handle.stat();
+  const checkedPath = await safeLstat(path);
+  assertVerifiedDirectoryPair(checkedHandle, checkedPath, expected);
+  if (options.onCheck && (
+    String(beforeHandle.ctimeMs) !== String(checkedHandle.ctimeMs) ||
+    String(beforePath.ctimeMs) !== String(checkedPath.ctimeMs)
+  )) fail("run-root.replaced");
+
+  await durability(options, handle, step);
+
+  const afterHandle = await handle.stat();
+  const afterPath = await safeLstat(path);
+  assertVerifiedDirectoryPair(afterHandle, afterPath, expected);
+  if (options.onCheck && (
+    String(checkedHandle.ctimeMs) !== String(afterHandle.ctimeMs) ||
+    String(checkedPath.ctimeMs) !== String(afterPath.ctimeMs)
+  )) fail("run-root.replaced");
+}
+
+function assertVerifiedDirectoryPair(
+  handleStat: { dev: number | bigint; ino: number | bigint; isDirectory(): boolean },
+  pathStat: { dev: number | bigint; ino: number | bigint; isDirectory(): boolean; isSymbolicLink(): boolean },
+  expected: { dev: number | bigint; ino: number | bigint },
+): void {
+  if (
+    !handleStat.isDirectory() || pathStat.isSymbolicLink() || !pathStat.isDirectory() ||
+    !sameInode(handleStat, expected) || !sameInode(pathStat, expected) || !sameInode(handleStat, pathStat)
+  ) fail("run-root.replaced");
 }
 
 async function durability(

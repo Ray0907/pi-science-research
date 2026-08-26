@@ -89,6 +89,90 @@ test("retains the original synchronous pin until OwnedRunRoot.close and closes i
   expect(() => realFstatSync(pinnedFd!)).toThrow(expect.objectContaining({ code: "EBADF" }));
 });
 
+test("retains registration after a close failure and releases it after a successful retry", async () => {
+  const project = await projectFixture();
+  const realFs = await vi.importActual<typeof import("node:fs")>("node:fs");
+  let pinnedFd: number | undefined;
+  let attempts = 0;
+  vi.doMock("node:fs", () => ({
+    ...realFs,
+    openSync(path: Parameters<typeof realOpenSync>[0], flags: number, mode?: number) {
+      const fd = realOpenSync(path, flags, mode);
+      if (String(path).endsWith("/owned") && (flags & constants.O_DIRECTORY) !== 0) pinnedFd = fd;
+      return fd;
+    },
+    closeSync(fd: number) {
+      if (fd === pinnedFd && attempts++ === 0) throw Object.assign(new Error("injected close failure"), { code: "EIO" });
+      return realCloseSync(fd);
+    },
+  }));
+
+  const { createOwnedRunRoot, openOwnedRunRoot } = await import("../../src/storage/run-root.js");
+  const owned = await createOwnedRunRoot(options(project));
+  await expect(owned.close()).rejects.toThrow("injected close failure");
+  expect(realFstatSync(pinnedFd!).isDirectory()).toBe(true);
+  await expect(openOwnedRunRoot(owned.path, RUN_ID, TOKEN)).rejects.toMatchObject({ code: "run-root.already-open" });
+  await owned.close();
+  const reopened = await openOwnedRunRoot(owned.path, RUN_ID, TOKEN);
+  await reopened.close();
+  expect(attempts).toBe(2);
+});
+
+test("treats an actual close followed by an error as confirmed closure", async () => {
+  const project = await projectFixture();
+  const realFs = await vi.importActual<typeof import("node:fs")>("node:fs");
+  let pinnedFd: number | undefined;
+  let injected = false;
+  vi.doMock("node:fs", () => ({
+    ...realFs,
+    openSync(path: Parameters<typeof realOpenSync>[0], flags: number, mode?: number) {
+      const fd = realOpenSync(path, flags, mode);
+      if (String(path).endsWith("/owned") && (flags & constants.O_DIRECTORY) !== 0) pinnedFd = fd;
+      return fd;
+    },
+    closeSync(fd: number) {
+      realCloseSync(fd);
+      if (fd === pinnedFd && !injected) {
+        injected = true;
+        throw Object.assign(new Error("post-close failure"), { code: "EIO" });
+      }
+    },
+  }));
+
+  const { createOwnedRunRoot, openOwnedRunRoot } = await import("../../src/storage/run-root.js");
+  const owned = await createOwnedRunRoot(options(project));
+  await owned.close();
+  expect(() => realFstatSync(pinnedFd!)).toThrow(expect.objectContaining({ code: "EBADF" }));
+  const reopened = await openOwnedRunRoot(owned.path, RUN_ID, TOKEN);
+  await reopened.close();
+});
+
+test("serializes concurrent closes into one successful descriptor release", async () => {
+  const project = await projectFixture();
+  const realFs = await vi.importActual<typeof import("node:fs")>("node:fs");
+  let pinnedFd: number | undefined;
+  let closes = 0;
+  vi.doMock("node:fs", () => ({
+    ...realFs,
+    openSync(path: Parameters<typeof realOpenSync>[0], flags: number, mode?: number) {
+      const fd = realOpenSync(path, flags, mode);
+      if (String(path).endsWith("/owned") && (flags & constants.O_DIRECTORY) !== 0) pinnedFd = fd;
+      return fd;
+    },
+    closeSync(fd: number) {
+      if (fd === pinnedFd) closes += 1;
+      return realCloseSync(fd);
+    },
+  }));
+
+  const { createOwnedRunRoot, openOwnedRunRoot } = await import("../../src/storage/run-root.js");
+  const owned = await createOwnedRunRoot(options(project));
+  await Promise.all([owned.close(), owned.close(), owned.close()]);
+  expect(closes).toBe(1);
+  const reopened = await openOwnedRunRoot(owned.path, RUN_ID, TOKEN);
+  await reopened.close();
+});
+
 test("closes the immediate descriptor when synchronous fstat fails", async () => {
   const project = await projectFixture();
   const realFs = await vi.importActual<typeof import("node:fs")>("node:fs");
