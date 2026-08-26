@@ -1,7 +1,11 @@
+import { execFile } from "node:child_process";
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+const execFileAsync = promisify(execFile);
 
 const projectRoot = new URL("../", import.meta.url);
 
@@ -34,6 +38,33 @@ describe("Pi package manifest", () => {
 
     expect(manifest.keywords).toContain("pi-package");
     expect(manifest.pi).toEqual({ extensions: ["./extensions/research/index.ts"] });
+  });
+
+  it("publishes only runtime sources and license files", async () => {
+    const manifest = JSON.parse(await readFile(new URL("package.json", projectRoot), "utf8")) as {
+      files?: string[];
+    };
+    expect(manifest.files).toEqual(["extensions", "src", "LICENSE"]);
+
+    const { stdout } = await execFileAsync(
+      "npm",
+      ["pack", "--dry-run", "--json", "--ignore-scripts"],
+      { cwd: projectRoot },
+    );
+    const packed = JSON.parse(stdout) as [{ files: Array<{ path: string }> }];
+    const paths = packed[0]!.files.map(({ path }) => path);
+    expect(paths).not.toEqual(expect.arrayContaining([
+      expect.stringMatching(/^docs\//),
+      expect.stringMatching(/^tests\//),
+      "tsconfig.json",
+      "vitest.config.ts",
+    ]));
+    expect(paths).toEqual(expect.arrayContaining([
+      "LICENSE",
+      "package.json",
+      "extensions/research/index.ts",
+      "src/index.ts",
+    ]));
   });
 });
 

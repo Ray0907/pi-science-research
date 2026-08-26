@@ -11,6 +11,11 @@
   "engines": {
     "node": ">=22.19.0"
   },
+  "files": [
+    "extensions",
+    "src",
+    "LICENSE"
+  ],
   "pi": {
     "extensions": [
       "./extensions/research/index.ts"
