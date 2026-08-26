@@ -204,15 +204,43 @@ describe("evidence admission", () => {
     const v = verification(undefined, { checkedEvidence: c.evidenceRefs, corrections: [{ claimId: c.claimId, description: "resolved" }] });
     expect(evaluate({ ...set(), claims: [c], evidence: [evidence(), contradiction], verifications: [v] }).blockers).not.toContain("claim.unresolved-conflict");
   });
-  test("requires snapshot-selected accepted exact-revision verification for conflict and independent credit", () => {
-    const v1 = verification(); const v2 = { ...v1, revision: 2, result: "incomplete" as const };
-    expect(evaluate({ ...set(), verifications: [v1, v2] }).independentVerificationCredit).toBe(0);
+  test("uses only the deterministic latest applicable verification revision for independent credit", () => {
+    const baseSource = source(); const independentSource = source("src-admission.0002");
+    const base = evidence();
+    const independent = evidence("ev-0000000000000002", { sourceRef: refForSource(independentSource), recordedByAttemptId: ATTEMPT_B });
+    const target = claim(undefined, { evidenceRefs: [refForEvidence(base)], evidenceRule: { ...claim().evidenceRule, minimumLineages: 2, independentVerificationAllowed: true } });
+    const qualifying = verification(undefined, {
+      attemptId: ATTEMPT_B, checkedClaims: [refFor(target)], checkedEvidence: [refForEvidence(independent)], independentEvidenceIds: [independent.evidenceId],
+    });
+    const incomplete = { ...qualifying, revision: 2, result: "incomplete" as const };
+    const records = { ...set(), sources: [baseSource, independentSource], claims: [target], evidence: [base, independent] };
+    const superseded = evaluate({ ...records, verifications: [qualifying, incomplete] });
+    expect(superseded.independentVerificationCredit).toBe(0);
+    expect(superseded.effectiveIndependentCount).toBe(1);
+    expect(superseded.blockers).toContain("claim.independent-verification-required");
+    const selected = evaluate({ ...records, verifications: [{ ...qualifying, result: "incomplete" }, { ...incomplete, result: "accepted" }] });
+    expect(selected.independentVerificationCredit).toBe(1);
+    expect(selected.effectiveIndependentCount).toBe(2);
+    expect(selected.blockers).not.toContain("claim.independent-verification-required");
+
+    const base2 = { ...base, revision: 2, claimRef: { claimId: target.claimId, revision: 2 } };
+    const independent2 = { ...independent, revision: 2, claimRef: { claimId: target.claimId, revision: 2 } };
+    const target2 = { ...target, revision: 2, evidenceRefs: [refForEvidence(base2)] };
+    const wrongEvidenceRevision = { ...qualifying, checkedEvidence: [refForEvidence(independent2)] };
+    const wrong = evaluate({ ...records, claims: [target, target2], evidence: [base, base2, independent, independent2], verifications: [wrongEvidenceRevision] }, refFor(target));
+    expect(wrong.independentVerificationCredit).toBe(0);
+    expect(wrong.effectiveIndependentCount).toBe(1);
+    expect(wrong.blockers).toContain("claim.independent-verification-required");
   });
-  test("credits at most one verifier-owned checked independent evidence component", () => {
-    const s2 = source("src-admission.0002");
-    const extra = evidence("ev-0000000000000002", { sourceRef: refForSource(s2), recordedByAttemptId: ATTEMPT_B });
-    const v = verification(undefined, { checkedEvidence: [refForEvidence(extra)], independentEvidenceIds: [extra.evidenceId] });
-    expect(evaluate({ ...set(), sources: [source(), s2], evidence: [evidence(), extra], verifications: [v] }).independentVerificationCredit).toBeLessThanOrEqual(1);
+  test("uses only the deterministic latest applicable verification revision for conflict resolution", () => {
+    const supporting = evidence(undefined, { conflictsWith: ["ev-0000000000000002"] });
+    const contradiction = evidence("ev-0000000000000002", { stance: "contradicting", verificationStatus: "rejected", conflictsWith: [supporting.evidenceId] });
+    const target = claim(undefined, { evidenceRefs: [refForEvidence(supporting)] });
+    const qualifying = verification(undefined, { checkedClaims: [refFor(target)], checkedEvidence: [refForEvidence(supporting), refForEvidence(contradiction)], corrections: [{ claimId: target.claimId, description: "resolved" }] });
+    const incomplete = { ...qualifying, revision: 2, result: "incomplete" as const };
+    const records = { ...set(), claims: [target], evidence: [supporting, contradiction] };
+    expect(evaluate({ ...records, verifications: [qualifying, incomplete] }).blockers).toContain("claim.unresolved-conflict");
+    expect(evaluate({ ...records, verifications: [{ ...qualifying, result: "incomplete" }, { ...incomplete, result: "accepted" }] }).blockers).not.toContain("claim.unresolved-conflict");
   });
   test("reports retrieved derived base verification and effective counts exactly", () => {
     const d = derived("method", null, { sourceRef: refForSource(source()) });

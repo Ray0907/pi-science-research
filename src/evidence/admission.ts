@@ -456,7 +456,8 @@ function conflictsResolved(
 function enforceCurrentReferences(target: ClaimRecord, indexes: ReturnType<typeof getValidatedSnapshotIndexes>): void {
   const latestClaim = indexes.getLatestRevision("claims", target.claimId);
   if (latestClaim !== target.revision) return;
-  const prior = indexes.getExactRecord({ kind: "claims", id: target.claimId, revision: target.revision - 1 }) as ClaimRecord | undefined;
+  const prior = target.revision === 1 ? undefined
+    : indexes.getExactRecord({ kind: "claims", id: target.claimId, revision: target.revision - 1 }) as ClaimRecord | undefined;
   const retained = new Set((prior?.evidenceRefs ?? []).map((ref) => `${ref.evidenceId}\0${ref.revision}`));
   for (const ref of target.evidenceRefs) if (!retained.has(`${ref.evidenceId}\0${ref.revision}`)
     && indexes.getLatestRevision("evidence", String(ref.evidenceId)) !== Number(ref.revision)) fail("evidence.stale-latest-ref");

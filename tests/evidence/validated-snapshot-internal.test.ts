@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 
 import * as rootExports from "../../src/index.js";
 import { canonicalJson } from "../../src/crypto/canonical-json.js";
+import { sha256Hex } from "../../src/crypto/hash.js";
 import type { RequestRecord } from "../../src/domain/events.js";
 import type { ClaimRecord, EvidenceRecord, SourceRecord } from "../../src/domain/research-records.js";
 import {
@@ -81,6 +82,50 @@ describe("validated evidence snapshot internals", () => {
       "validateSourceCanonicalUrlProvenanceFromSnapshotInternal", "validateSourceIdentityOptionsForEvidenceSnapshotInternal",
       "validatePreparedSourceIdentityFieldsInternal",
     ]) expect(name in rootExports).toBe(false);
+  });
+  test("deep-freezes outgoing exact keys across mutation and repeated traversal", () => {
+    const snapshot = buildBoundedValidatedEvidenceSnapshot(records());
+    const indexes = getValidatedSnapshotIndexes(snapshot);
+    const key = { kind: "claims" as const, id: claim().claimId, revision: 1 };
+    const refs = indexes.getOutgoingReferences(key);
+    const before = { snapshotSha256: sha256Hex(canonicalJson(snapshot.records)), canonical: indexes.getCanonicalRecordString(key), refs: canonicalJson(refs) };
+    expect(before.snapshotSha256).toBe(snapshot.snapshotSha256);
+    expect(Object.isFrozen(refs)).toBe(true);
+    expect(refs.every((ref) => Object.isFrozen(ref))).toBe(true);
+    expect(() => ((refs[0] as { id: string }).id = "ev-9999999999999999")).toThrow();
+    expect(indexes.getOutgoingReferences(key)).toBe(refs);
+    expect({ snapshotSha256: sha256Hex(canonicalJson(snapshot.records)), canonical: indexes.getCanonicalRecordString(key), refs: canonicalJson(indexes.getOutgoingReferences(key)) }).toEqual(before);
+  });
+  test("closes and redacts every validated index lookup argument", () => {
+    const indexes = getValidatedSnapshotIndexes(buildBoundedValidatedEvidenceSnapshot(records()));
+    const valid = { kind: "claims", id: claim().claimId, revision: 1 };
+    const accessor: Record<string, unknown> = { id: claim().claimId, revision: 1 };
+    Object.defineProperty(accessor, "kind", { enumerable: true, get() { throw new Error("SECRET-KEY-GETTER"); } });
+    const hostileKeys: unknown[] = [
+      new Proxy({}, { ownKeys() { throw new Error("SECRET-KEY-PROXY"); }, get() { throw new Error("SECRET-KEY-PROXY"); } }),
+      accessor, Object.assign(Object.create(null), valid), { ...valid, extra: true },
+      { ...valid, kind: Symbol("SECRET-KIND") }, { ...valid, kind: new String("claims") },
+      { ...valid, id: Symbol("SECRET-ID") }, { ...valid, id: new String(claim().claimId) }, { ...valid, id: "claim-bad" },
+      { ...valid, revision: Symbol("SECRET-REVISION") }, { ...valid, revision: new Number(1) }, { ...valid, revision: 0 },
+      { kind: "requests", id: "request-0000000000000001", revision: 1 }, { kind: "sources", id: claim().claimId, revision: 1 },
+    ];
+    const assertClosed = (action: () => unknown): void => {
+      try { action(); throw new Error("expected rejection"); }
+      catch (error) {
+        expect(error).toBeInstanceOf(EvidenceAdmissionError);
+        expect((error as EvidenceAdmissionError).code).toBe("evidence.invalid-input");
+        expect((error as Error).message).toBe("Evidence admission rejected (evidence.invalid-input)");
+      }
+    };
+    for (const key of hostileKeys) for (const lookup of [
+      () => indexes.getExactRecord(key as never),
+      () => indexes.getOutgoingReferences(key as never),
+      () => indexes.getCanonicalRecordString(key as never),
+    ]) assertClosed(lookup);
+    for (const [kind, id] of [
+      [Symbol("SECRET-LATEST"), claim().claimId], [new String("claims"), claim().claimId], ["requests", "request-0000000000000001"],
+      ["claims", Symbol("SECRET-LATEST-ID")], ["claims", new String(claim().claimId)], ["claims", "claim-bad"], ["claims", source().sourceId],
+    ] as const) assertClosed(() => indexes.getLatestRevision(kind as never, id as never));
   });
   test("rejects structurally identical forged snapshot with evidence.snapshot-invalid", () => {
     const snapshot = buildBoundedValidatedEvidenceSnapshot(records());
@@ -196,6 +241,27 @@ describe("validated evidence snapshot internals", () => {
     expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: [a, b] }), { limits: { maxLineageComponents: 1 } }, componentVisits))).toBe("evidence.too-many-records");
     expect(componentVisits.revisionIndexInsertions).toBe(0);
     expect(componentVisits.lineageVisits).toBe(0);
+  });
+  test("preflights all array counts and Task 2 policy before touching later records", () => {
+    let touched = 0;
+    const accessorClaims: unknown[] = [];
+    Object.defineProperty(accessorClaims, "0", { enumerable: true, get() { touched += 1; throw new Error("SECRET-LATE-COUNT"); } });
+    accessorClaims.length = 1;
+    const maxPerKind = { sources: 3, claims: 3, evidence: 3, verifications: 3, requests: 3, calculations: 3 };
+    const countVisits = diagnostics();
+    expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ claims: accessorClaims as never, calculations: [{} as never] }), {
+      limits: { maxPerKind, maxTotalRecords: 3, maxLineageComponents: 3 },
+    }, countVisits))).toBe("evidence.too-many-records");
+    expect(touched).toBe(0);
+    expect(countVisits).toEqual(diagnostics());
+
+    const hostileClaim = new Proxy({}, { ownKeys() { touched += 1; throw new Error("SECRET-LATE-POLICY"); }, get() { touched += 1; throw new Error("SECRET-LATE-POLICY"); } });
+    const unattributed = source({ identifiers: { doi: null, pmid: null, pmcid: null }, canonicalUrl: "https://example.org/unattributed" });
+    const policyVisits = diagnostics();
+    expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: [unattributed], claims: [hostileClaim as never] }), undefined, policyVisits))).toBe("evidence.source-url-unattributed");
+    expect(touched).toBe(0);
+    expect(policyVisits.canonicalRecordVisits).toBe(1);
+    expect(policyVisits.revisionIndexInsertions).toBe(0);
   });
   test("validates nested source policy before touching hostile record arrays", () => {
     const hostile = new Proxy({}, { ownKeys() { throw new Error("SECRET-RECORDS"); }, get() { throw new Error("SECRET-RECORDS"); } });
