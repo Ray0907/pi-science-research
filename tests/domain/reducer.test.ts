@@ -313,6 +313,20 @@ describe("pure ledger recovery reduction", () => {
     });
   });
 
+  test("does not block already settled terminal or cancelled never attempts", () => {
+    for (const failureState of ["terminal-failed", "cancelled"] as const) {
+      const events = new Events();
+      events.base(attemptRecord({ attemptKind: "calculation", replayPolicy: "never", billingStatus: "not-applicable" }));
+      events.started();
+      events.add("attempt_failed", { attemptId: ATTEMPT_1, state: failureState, errorClass: "settled", message: "settled" });
+      events.add("cancel_requested", { executionEpoch: 0, reason: "user-pause" });
+      expect(recoveryDecisionFor(reduceLedgerEvents(events.values), LOGICAL)).toEqual({
+        kind: "no-action",
+        reason: "terminal",
+      });
+    }
+  });
+
   test("quarantines a result arriving after its epoch cancellation", () => {
     const events = new Events();
     events.base();
@@ -323,6 +337,19 @@ describe("pure ledger recovery reduction", () => {
     expect(recoveryDecisionFor(reduceLedgerEvents(events.values), LOGICAL)).toEqual({
       kind: "quarantined",
       reason: "cancelled-epoch",
+    });
+  });
+
+  test("keeps a pre-boundary uncommitted result eligible for the same transaction", () => {
+    const events = new Events();
+    events.base();
+    events.started();
+    events.result();
+    events.add("cancel_requested", { executionEpoch: 0, reason: "user-pause" });
+
+    expect(recoveryDecisionFor(reduceLedgerEvents(events.values), LOGICAL)).toEqual({
+      kind: "finish-transaction",
+      transactionId: TX_1,
     });
   });
 
@@ -337,7 +364,7 @@ describe("pure ledger recovery reduction", () => {
     expect(recoveryDecisionFor(reduceLedgerEvents(events.values), LOGICAL)).toEqual({ kind: "skip-committed" });
   });
 
-  test("cancellation suppresses a scheduled retry until a later resume epoch", () => {
+  test("cancellation permanently suppresses a schedule accepted in that epoch", () => {
     const events = scheduledRetryEvents();
     const cancel = events.add("cancel_requested", { executionEpoch: 0, reason: "user-pause" });
     expect(recoveryDecisionFor(reduceLedgerEvents(events.values), LOGICAL)).toEqual({
@@ -352,19 +379,9 @@ describe("pure ledger recovery reduction", () => {
       checkpointStage: "researching",
       ownerTokenSha256: HASH,
     });
-    expect(recoveryDecisionFor(reduceLedgerEvents(events.values), LOGICAL)).toMatchObject({
-      kind: "retry-safe-read",
-      schedule: { scheduleId: RETRY_1, nextAttemptOrdinal: 2 },
-    });
-
-    events.add("identity_reserved", { kind: "attempt", id: ATTEMPT_2, origin: "parent-generated" });
-    const scheduleSeq = events.values.find((event) => event.type === "retry_scheduled")!.seq;
-    events.add("retry_started", { scheduleId: RETRY_1, logicalOperationId: LOGICAL, attemptId: ATTEMPT_2, attemptOrdinal: 2, scheduledFromSeq: scheduleSeq });
-    events.add("dispatch_intent", { attempt: attemptRecord({ attemptId: ATTEMPT_2, executionEpoch: 1, attemptOrdinal: 2, retryOfAttemptId: ATTEMPT_1, attemptEnvelopeSha256: "c".repeat(64) }) });
-    expect(recoveryDecisionFor(reduceLedgerEvents(events.values), LOGICAL)).toMatchObject({
-      kind: "needs-retry-schedule",
-      failedAttemptId: ATTEMPT_2,
-      nextAttemptOrdinal: 3,
+    expect(recoveryDecisionFor(reduceLedgerEvents(events.values), LOGICAL)).toEqual({
+      kind: "quarantined",
+      reason: "cancelled-epoch",
     });
   });
 
@@ -412,6 +429,69 @@ describe("pure ledger recovery reduction", () => {
       sourceRefs: [], claimRefs: [], evidenceRefs: [], verificationRefs: [], requestIds: [], calculationIds: [],
     });
     expectCorruption(events.values, "reducer.transaction-quarantined");
+  });
+
+  test("permanently quarantines attempts from every cancelled epoch across multiple resumes", () => {
+    const events = new Events();
+    events.base();
+    events.started();
+    const cancel0 = events.add("cancel_requested", { executionEpoch: 0, reason: "user-pause" });
+    events.add("resume_epoch_started", { priorEpoch: 0, executionEpoch: 1, priorCancelSeq: cancel0.seq, checkpointStage: "researching", ownerTokenSha256: HASH });
+
+    const epoch1Operation = "operation-epoch-1";
+    events.add("identity_reserved", { kind: "attempt", id: ATTEMPT_2, origin: "parent-generated" });
+    events.add("dispatch_intent", { attempt: attemptRecord({ attemptId: ATTEMPT_2, logicalOperationId: epoch1Operation, executionEpoch: 1, attemptEnvelopeSha256: "c".repeat(64) }) });
+    events.started(ATTEMPT_2);
+    const cancel1 = events.add("cancel_requested", { executionEpoch: 1, reason: "user-pause" });
+    events.add("resume_epoch_started", { priorEpoch: 1, executionEpoch: 2, priorCancelSeq: cancel1.seq, checkpointStage: "researching", ownerTokenSha256: HASH });
+
+    const epoch2Operation = "operation-epoch-2";
+    events.add("identity_reserved", { kind: "attempt", id: ATTEMPT_3, origin: "parent-generated" });
+    events.add("dispatch_intent", { attempt: attemptRecord({ attemptId: ATTEMPT_3, logicalOperationId: epoch2Operation, executionEpoch: 2, attemptEnvelopeSha256: "d".repeat(64) }) });
+    events.started(ATTEMPT_3);
+    events.result(ATTEMPT_1, TX_1);
+    events.result(ATTEMPT_2, "tx-0000000000000002");
+
+    const state = reduceLedgerEvents(events.values);
+    expect(recoveryDecisionFor(state, LOGICAL)).toEqual({ kind: "quarantined", reason: "cancelled-epoch" });
+    expect(recoveryDecisionFor(state, epoch1Operation)).toEqual({ kind: "quarantined", reason: "cancelled-epoch" });
+    expect(recoveryDecisionFor(state, epoch2Operation)).toMatchObject({ kind: "needs-retry-schedule", failedAttemptId: ATTEMPT_3 });
+    expect(state.cancelledEpochs).toEqual({ "0": cancel0.seq, "1": cancel1.seq });
+  });
+
+  test("quarantines old retry work and accepts a replacement schedule only after resume", () => {
+    const blocked = new Events();
+    blocked.base();
+    blocked.started();
+    blocked.add("attempt_failed", { attemptId: ATTEMPT_1, state: "retryable-failed", errorClass: "timeout", message: "redacted" });
+    blocked.add("cancel_requested", { executionEpoch: 0, reason: "user-pause" });
+    blocked.add("identity_reserved", { kind: "retry-schedule", id: RETRY_1, origin: "parent-generated" });
+    blocked.add("retry_scheduled", { scheduleId: RETRY_1, logicalOperationId: LOGICAL, failedAttemptId: ATTEMPT_1, nextAttemptOrdinal: 2, notBeforeAt: LATER, delayMs: 1, reasonClass: "blocked" });
+    expectCorruption(blocked.values, "reducer.retry-after-cancel");
+
+    const oldSchedule = scheduledRetryEvents();
+    const cancel = oldSchedule.add("cancel_requested", { executionEpoch: 0, reason: "user-pause" });
+    oldSchedule.add("resume_epoch_started", { priorEpoch: 0, executionEpoch: 1, priorCancelSeq: cancel.seq, checkpointStage: "researching", ownerTokenSha256: HASH });
+    oldSchedule.add("identity_reserved", { kind: "attempt", id: ATTEMPT_2, origin: "parent-generated" });
+    const oldScheduleSeq = oldSchedule.values.find((event) => event.type === "retry_scheduled")!.seq;
+    oldSchedule.add("retry_started", { scheduleId: RETRY_1, logicalOperationId: LOGICAL, attemptId: ATTEMPT_2, attemptOrdinal: 2, scheduledFromSeq: oldScheduleSeq });
+    expectCorruption(oldSchedule.values, "reducer.retry-after-cancel");
+
+    const replacement = scheduledRetryEvents();
+    const replacementCancel = replacement.add("cancel_requested", { executionEpoch: 0, reason: "user-pause" });
+    replacement.add("resume_epoch_started", { priorEpoch: 0, executionEpoch: 1, priorCancelSeq: replacementCancel.seq, checkpointStage: "researching", ownerTokenSha256: HASH });
+    replacement.add("identity_reserved", { kind: "retry-schedule", id: RETRY_2, origin: "parent-generated" });
+    replacement.add("retry_scheduled", { scheduleId: RETRY_2, logicalOperationId: LOGICAL, failedAttemptId: ATTEMPT_1, nextAttemptOrdinal: 2, notBeforeAt: LATER, delayMs: 2, reasonClass: "resumed" });
+    expect(recoveryDecisionFor(reduceLedgerEvents(replacement.values), LOGICAL)).toMatchObject({
+      kind: "retry-safe-read",
+      schedule: { scheduleId: RETRY_2 },
+    });
+    const cancel1 = replacement.add("cancel_requested", { executionEpoch: 1, reason: "user-pause" });
+    replacement.add("resume_epoch_started", { priorEpoch: 1, executionEpoch: 2, priorCancelSeq: cancel1.seq, checkpointStage: "researching", ownerTokenSha256: HASH });
+    expect(recoveryDecisionFor(reduceLedgerEvents(replacement.values), LOGICAL)).toEqual({
+      kind: "quarantined",
+      reason: "cancelled-epoch",
+    });
   });
 
   test("keeps later-epoch work eligible while old-epoch late results stay quarantined", () => {
@@ -682,6 +762,16 @@ describe("semantic corruption", () => {
     ];
 
     for (const item of cases) expectCorruption(item.build(), item.code);
+  });
+
+  test("rejects direct supersession without a durably started distinct replacement", () => {
+    for (const started of [false, true]) {
+      const events = new Events();
+      events.base();
+      if (started) events.started();
+      events.add("attempt_failed", { attemptId: ATTEMPT_1, state: "superseded", errorClass: "invalid", message: "invalid" });
+      expectCorruption(events.values, "reducer.superseded-without-replacement");
+    }
   });
 
   test("rejects a second durable schedule for an already consumed retry edge", () => {

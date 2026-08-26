@@ -36,6 +36,7 @@ export interface ReducedOperationState {
   readonly logicalOperationId: string;
   readonly attempts: readonly ReducedAttemptState[];
   readonly schedules: readonly RetrySchedule[];
+  readonly activeScheduleIds: readonly string[];
   readonly consumedScheduleIds: readonly string[];
   readonly startedRetries: readonly ReducedStartedRetryState[];
 }
@@ -75,11 +76,13 @@ interface MutableAttempt {
 interface MutableSchedule {
   readonly schedule: RetrySchedule;
   readonly eventSeq: number;
+  readonly executionEpoch: number;
   consumedByAttemptId: string | null;
 }
 
 interface MutableOperation {
   readonly attempts: MutableAttempt[];
+  readonly attemptOrdinals: Set<number>;
   readonly schedules: MutableSchedule[];
 }
 
@@ -108,8 +111,9 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
   const tasks = new Map<string, { record: TaskRecord; event: FoundationLedgerEvent; index: number }>();
   const reservations = new Map<string, Set<string>>();
   const schedules = new Map<string, MutableSchedule>();
-  const retryEdges = new Set<string>();
-  const pendingScheduleOperations = new Set<string>();
+  const retryEdges = new Map<string, MutableSchedule>();
+  const pendingScheduleOperations = new Map<string, MutableSchedule>();
+  const pendingSchedulesByEpoch = new Map<number, Set<MutableSchedule>>();
   const retryStartsByAttempt = new Map<string, MutableSchedule>();
   const startedRetryPredecessors = new Set<string>();
   const committedOperations = new Set<string>();
@@ -191,7 +195,7 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
 
         let operation = operations.get(record.logicalOperationId);
         if (!operation) {
-          operation = { attempts: [], schedules: [] };
+          operation = { attempts: [], attemptOrdinals: new Set(), schedules: [] };
           operations.set(record.logicalOperationId, operation);
         }
         const expectedOrdinal = operation.attempts.length + 1;
@@ -206,6 +210,7 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
           }
           const startedSchedule = retryStartsByAttempt.get(record.attemptId);
           if (!startedSchedule
+            || startedSchedule.executionEpoch !== record.executionEpoch
             || startedSchedule.schedule.logicalOperationId !== record.logicalOperationId
             || startedSchedule.schedule.nextAttemptOrdinal !== record.attemptOrdinal
             || startedSchedule.schedule.failedAttemptId !== predecessor.record.attemptId) {
@@ -215,6 +220,7 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
         const attempt: MutableAttempt = { record, phase: "intent", failureState: null, result: null, quarantineReason: null };
         attempts.set(record.attemptId, attempt);
         operation.attempts.push(attempt);
+        operation.attemptOrdinals.add(record.attemptOrdinal);
         break;
       }
       case "dispatch_started": {
@@ -286,9 +292,12 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
       }
       case "attempt_failed": {
         const attempt = requireAttempt(event, index, event.payload.attemptId);
+        const retryWasStarted = startedRetryPredecessors.has(attempt.record.attemptId);
+        if (event.payload.state === "superseded" && !retryWasStarted) {
+          fail(event, index, "reducer.superseded-without-replacement");
+        }
         if (attempt.phase === "committed" || attempt.phase === "records") fail(event, index, "reducer.attempt-transition");
         if (attempt.failureState !== null) {
-          const retryWasStarted = startedRetryPredecessors.has(attempt.record.attemptId);
           if (attempt.failureState === "retryable-failed" && event.payload.state === "superseded" && retryWasStarted) {
             attempt.failureState = "superseded";
             attempt.phase = "failed";
@@ -309,19 +318,26 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
         if (predecessor.failureState !== "retryable-failed" || predecessor.record.replayPolicy !== "safe-read") fail(event, index, "reducer.retry-predecessor");
         if (predecessor.record.logicalOperationId !== event.payload.logicalOperationId
           || event.payload.nextAttemptOrdinal !== predecessor.record.attemptOrdinal + 1) fail(event, index, "reducer.retry-edge");
+        if (cancelledEpochs.has(currentEpoch)) fail(event, index, "reducer.retry-after-cancel");
         const operation = operations.get(event.payload.logicalOperationId)!;
         const edge = retryEdge(event.payload.logicalOperationId, event.payload.failedAttemptId, event.payload.nextAttemptOrdinal);
-        if (retryEdges.has(edge)) fail(event, index, "reducer.duplicate-retry-edge");
-        if (pendingScheduleOperations.has(event.payload.logicalOperationId)) fail(event, index, "reducer.multiple-pending-schedules");
-        const cancellationSeq = cancelledEpochs.get(predecessor.record.executionEpoch);
-        if (cancellationSeq !== undefined && event.seq > cancellationSeq && currentEpoch === predecessor.record.executionEpoch) {
-          fail(event, index, "reducer.retry-after-cancel");
+        const priorEdge = retryEdges.get(edge);
+        if (priorEdge && !cancelledEpochs.has(priorEdge.executionEpoch)) fail(event, index, "reducer.duplicate-retry-edge");
+        if (operation.attemptOrdinals.has(event.payload.nextAttemptOrdinal)) {
+          fail(event, index, "reducer.duplicate-retry-edge");
         }
+        if (pendingScheduleOperations.has(event.payload.logicalOperationId)) fail(event, index, "reducer.multiple-pending-schedules");
         const schedule: RetrySchedule = Object.freeze({ schemaVersion: 1, ...event.payload, replayPolicy: "safe-read" });
-        const mutable: MutableSchedule = { schedule, eventSeq: event.seq, consumedByAttemptId: null };
+        const mutable: MutableSchedule = { schedule, eventSeq: event.seq, executionEpoch: currentEpoch, consumedByAttemptId: null };
         schedules.set(schedule.scheduleId, mutable);
-        retryEdges.add(edge);
-        pendingScheduleOperations.add(event.payload.logicalOperationId);
+        retryEdges.set(edge, mutable);
+        pendingScheduleOperations.set(event.payload.logicalOperationId, mutable);
+        let epochSchedules = pendingSchedulesByEpoch.get(currentEpoch);
+        if (!epochSchedules) {
+          epochSchedules = new Set();
+          pendingSchedulesByEpoch.set(currentEpoch, epochSchedules);
+        }
+        epochSchedules.add(mutable);
         operation.schedules.push(mutable);
         break;
       }
@@ -334,13 +350,15 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
         if (event.payload.logicalOperationId !== startedSchedule.schedule.logicalOperationId
           || event.payload.attemptOrdinal !== startedSchedule.schedule.nextAttemptOrdinal) fail(event, index, "reducer.retry-start-link");
         if (!reserved("attempt", event.payload.attemptId) || attempts.has(event.payload.attemptId)) fail(event, index, "reducer.retry-attempt-identity");
-        const predecessor = requireAttempt(event, index, startedSchedule.schedule.failedAttemptId);
-        const cancellationSeq = cancelledEpochs.get(predecessor.record.executionEpoch);
-        if (cancellationSeq !== undefined && event.seq > cancellationSeq && currentEpoch === predecessor.record.executionEpoch) {
+        requireAttempt(event, index, startedSchedule.schedule.failedAttemptId);
+        if (cancelledEpochs.has(startedSchedule.executionEpoch) || startedSchedule.executionEpoch !== currentEpoch) {
           fail(event, index, "reducer.retry-after-cancel");
         }
         startedSchedule.consumedByAttemptId = event.payload.attemptId;
-        pendingScheduleOperations.delete(startedSchedule.schedule.logicalOperationId);
+        if (pendingScheduleOperations.get(startedSchedule.schedule.logicalOperationId) === startedSchedule) {
+          pendingScheduleOperations.delete(startedSchedule.schedule.logicalOperationId);
+        }
+        pendingSchedulesByEpoch.get(startedSchedule.executionEpoch)?.delete(startedSchedule);
         startedRetryPredecessors.add(startedSchedule.schedule.failedAttemptId);
         retryStartsByAttempt.set(event.payload.attemptId, startedSchedule);
         break;
@@ -349,6 +367,12 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
         if (runId === null || event.payload.executionEpoch !== currentEpoch) fail(event, index, "reducer.cancel-epoch");
         if (cancelledEpochs.has(currentEpoch)) fail(event, index, "reducer.duplicate-cancel");
         cancelledEpochs.set(currentEpoch, event.seq);
+        for (const schedule of pendingSchedulesByEpoch.get(currentEpoch) ?? []) {
+          if (pendingScheduleOperations.get(schedule.schedule.logicalOperationId) === schedule) {
+            pendingScheduleOperations.delete(schedule.schedule.logicalOperationId);
+          }
+        }
+        pendingSchedulesByEpoch.delete(currentEpoch);
         break;
       }
       case "resume_epoch_started": {
@@ -435,9 +459,11 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
       quarantineReason: attempt.quarantineReason,
     }));
     const scheduleOutput = operation.schedules.map(({ schedule }) => schedule);
+    const activeScheduleIds = operation.schedules.flatMap(({ schedule, executionEpoch }) =>
+      cancelledEpochs.has(executionEpoch) ? [] : [schedule.scheduleId]);
     const consumed = operation.schedules.flatMap(({ schedule, consumedByAttemptId }) => consumedByAttemptId === null ? [] : [schedule.scheduleId]);
-    const startedRetries = operation.schedules.flatMap<ReducedStartedRetryState>(({ schedule, consumedByAttemptId }) => {
-      if (consumedByAttemptId === null || attempts.has(consumedByAttemptId)) return [];
+    const startedRetries = operation.schedules.flatMap<ReducedStartedRetryState>(({ schedule, executionEpoch, consumedByAttemptId }) => {
+      if (cancelledEpochs.has(executionEpoch) || consumedByAttemptId === null || attempts.has(consumedByAttemptId)) return [];
       return [Object.freeze({
         attemptId: consumedByAttemptId as AttemptId,
         attemptOrdinal: schedule.nextAttemptOrdinal,
@@ -448,6 +474,7 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
       logicalOperationId,
       attempts: Object.freeze(attemptOutput),
       schedules: Object.freeze(scheduleOutput),
+      activeScheduleIds: Object.freeze(activeScheduleIds),
       consumedScheduleIds: Object.freeze(consumed),
       startedRetries: Object.freeze(startedRetries),
     });
@@ -468,9 +495,7 @@ export function recoveryDecisionFor(state: ReducedLedgerState, logicalOperationI
   if (operation.attempts.some((attempt) => attempt.phase === "committed")) return Object.freeze({ kind: "skip-committed" });
   const latest = operation.attempts.at(-1);
   if (!latest) return Object.freeze({ kind: "not-found" });
-  if (state.currentEpoch === latest.executionEpoch && state.cancelledEpochs[String(latest.executionEpoch)] !== undefined) {
-    return Object.freeze({ kind: "quarantined", reason: "cancelled-epoch" });
-  }
+  const activeSchedules = new Set(operation.activeScheduleIds);
   const startedRetry = operation.startedRetries.at(-1);
   if (startedRetry) {
     return Object.freeze({
@@ -480,22 +505,28 @@ export function recoveryDecisionFor(state: ReducedLedgerState, logicalOperationI
       schedule: startedRetry.schedule,
     });
   }
-  if (latest.phase === "quarantined") {
-    return Object.freeze({ kind: "quarantined", reason: latest.quarantineReason ?? "superseded" });
-  }
-  if ((latest.phase === "result" || latest.phase === "records") && latest.transactionId) {
-    return Object.freeze({ kind: "finish-transaction", transactionId: latest.transactionId as TransactionId });
-  }
-  if (latest.replayPolicy === "never") return Object.freeze({ kind: "block-never", code: "uncertain-nonreplayable" });
   const consumed = new Set(operation.consumedScheduleIds);
-  const pending = operation.schedules.find((schedule) => !consumed.has(schedule.scheduleId)
+  const pending = operation.schedules.find((schedule) => activeSchedules.has(schedule.scheduleId)
+    && !consumed.has(schedule.scheduleId)
     && schedule.failedAttemptId === latest.attemptId
     && schedule.nextAttemptOrdinal === latest.ordinal + 1);
   if (pending) return Object.freeze({ kind: "retry-safe-read", schedule: pending });
   if (latest.failureState === "terminal-failed" || latest.failureState === "cancelled") {
     return Object.freeze({ kind: "no-action", reason: "terminal" });
   }
+  const cancelSeq = state.cancelledEpochs[String(latest.executionEpoch)];
+  if ((latest.phase === "result" || latest.phase === "records")
+    && latest.transactionId
+    && latest.resultSeq !== null
+    && (cancelSeq === undefined || latest.resultSeq < cancelSeq)) {
+    return Object.freeze({ kind: "finish-transaction", transactionId: latest.transactionId as TransactionId });
+  }
+  if (cancelSeq !== undefined) return Object.freeze({ kind: "quarantined", reason: "cancelled-epoch" });
+  if (latest.phase === "quarantined") {
+    return Object.freeze({ kind: "quarantined", reason: latest.quarantineReason ?? "superseded" });
+  }
   if (latest.failureState === "superseded") return Object.freeze({ kind: "no-action", reason: "superseded" });
+  if (latest.replayPolicy === "never") return Object.freeze({ kind: "block-never", code: "uncertain-nonreplayable" });
   return Object.freeze({
     kind: "needs-retry-schedule",
     failedAttemptId: latest.attemptId as AttemptId,
