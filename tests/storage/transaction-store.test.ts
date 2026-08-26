@@ -1,4 +1,4 @@
-import { cp, link, lstat, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile, type FileHandle } from "node:fs/promises";
+import { cp, link, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, utimes, writeFile, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -196,28 +196,28 @@ describe("canonical transaction store", () => {
     }
   });
 
-  test("cleans exact dual namespaces and roll-forwards cleanup crashes", async () => {
-    for (const crash of [false, true]) {
-      const runRoot = await root();
-      const ref = await committed(runRoot);
-      const committedDir = join(runRoot, ".state/transactions/committed", TX);
-      const stageDir = join(runRoot, ".state/transactions/.staging", TX);
-      await cp(committedDir, stageDir, { recursive: true });
-      if (crash) {
-        let failed = false;
-        await expectCode(commitTransaction(runRoot, TX, { onStep: async (step) => {
-          if (step === "staging-cleaned" && !failed) { failed = true; throw new Error("cleanup-crash"); }
-        } }), "transaction.io-failed");
-      }
-      await expect(commitTransaction(runRoot, TX)).resolves.toEqual(ref);
-      await expect(lstat(stageDir)).rejects.toMatchObject({ code: "ENOENT" });
-    }
+  test("quarantines exact duplicate staging atomically and idempotently", async () => {
+    const runRoot = await root();
+    const ref = await committed(runRoot);
+    const committedDir = join(runRoot, ".state/transactions/committed", TX);
+    const stageDir = join(runRoot, ".state/transactions/.staging", TX);
+    await cp(committedDir, stageDir, { recursive: true });
+    const steps: TransactionProtocolStep[] = [];
+    await expect(commitTransaction(runRoot, TX, { randomToken: () => "d".repeat(64), onStep: async (step) => { steps.push(step); } })).resolves.toEqual(ref);
+    expect(steps.filter((step) => step === "staging-quarantined" || step.startsWith("quarantine-"))).toEqual([
+      "staging-quarantined", "quarantine-source-parent-synced", "quarantine-destination-parent-synced",
+    ]);
+    await expect(lstat(stageDir)).rejects.toMatchObject({ code: "ENOENT" });
+    const quarantine = join(runRoot, ".state/transactions/.staging", `.quarantine-${TX}-${"d".repeat(64)}`);
+    expect(await readFile(join(quarantine, "manifest.json"))).toEqual(await readFile(join(committedDir, "manifest.json")));
+    await expect(commitTransaction(runRoot, TX)).resolves.toEqual(ref);
+    expect(await lstat(quarantine)).toMatchObject({ isDirectory: expect.any(Function) });
     const conflictRoot = await root();
     await committed(conflictRoot);
-    const committedDir = join(conflictRoot, ".state/transactions/committed", TX);
-    const stageDir = join(conflictRoot, ".state/transactions/.staging", TX);
-    await cp(committedDir, stageDir, { recursive: true });
-    await writeFile(join(stageDir, "claims.jsonl"), "{}\n");
+    const conflictCommittedDir = join(conflictRoot, ".state/transactions/committed", TX);
+    const conflictStageDir = join(conflictRoot, ".state/transactions/.staging", TX);
+    await cp(conflictCommittedDir, conflictStageDir, { recursive: true });
+    await writeFile(join(conflictStageDir, "claims.jsonl"), "{}\n");
     await expectCode(commitTransaction(conflictRoot, TX), "transaction.id-conflict");
   });
 
@@ -242,12 +242,48 @@ describe("canonical transaction store", () => {
     await symlink(outsideFile, join(stage, "claims.jsonl"));
     await expectCode(commitTransaction(childSymlinkRoot, TX), "transaction.unsafe-file");
     expect(await readFile(outsideFile)).toEqual(matching);
-    await expect(lstat(join(stage, "claims.jsonl"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await lstat(join(stage, "claims.jsonl"))).toMatchObject({ isSymbolicLink: expect.any(Function) });
+  });
+
+  test("moves a concurrently swapped staging symlink only and fails closed on parent swaps", async () => {
+    const runRoot = await root();
+    await committed(runRoot);
+    const stage = join(runRoot, ".state/transactions/.staging", TX);
+    const original = join(runRoot, ".state/transactions/.staging", `${TX}-original`);
+    await cp(join(runRoot, ".state/transactions/committed", TX), stage, { recursive: true });
+    const outside = await root();
+    const outsideFile = join(outside, "untouched");
+    await writeFile(outsideFile, "outside");
+    await expectCode(commitTransaction(runRoot, TX, {
+      randomToken: () => "c".repeat(64),
+      rename: async (from, to) => {
+        if (from === stage) {
+          await rename(from, original);
+          await symlink(outside, from, "dir");
+        }
+        await rename(from, to);
+      },
+    }), "transaction.unsafe-file");
+    expect(await readFile(outsideFile, "utf8")).toBe("outside");
+    const movedLink = join(runRoot, ".state/transactions/.staging", `.quarantine-${TX}-${"c".repeat(64)}`);
+    expect((await lstat(movedLink)).isSymbolicLink()).toBe(true);
+
+    const parentRoot = await root();
+    await committed(parentRoot);
+    await cp(join(parentRoot, ".state/transactions/committed", TX), join(parentRoot, ".state/transactions/.staging", TX), { recursive: true });
+    const staging = join(parentRoot, ".state/transactions/.staging");
+    const displaced = join(parentRoot, ".state/transactions/.staging-displaced");
+    await expectCode(commitTransaction(parentRoot, TX, { rename: async (from, to) => {
+      await rename(from, to);
+      await rename(staging, displaced);
+      await mkdir(staging, { mode: 0o700 });
+    } }), "transaction.unsafe-root");
+    expect((await readdir(displaced)).some((entry) => entry.startsWith(`.quarantine-${TX}-`))).toBe(true);
   });
 
   test("rolls forward every atomic lock acquire and release crash prefix", async () => {
     const acquireSteps: TransactionProtocolStep[] = ["lock-owner-synced", "lock-directory-synced", "lock-active-renamed", "lock-parent-synced"];
-    const releaseSteps: TransactionProtocolStep[] = ["lock-release-renamed", "lock-release-parent-synced", "lock-trash-cleaned", "lock-released"];
+    const releaseSteps: TransactionProtocolStep[] = ["lock-release-renamed", "lock-release-parent-synced", "lock-owner-removed", "lock-trash-cleaned", "lock-released"];
     for (const failAt of [...acquireSteps, ...releaseSteps]) {
       const runRoot = await root();
       await prepareTransaction(runRoot, input());
@@ -261,10 +297,11 @@ describe("canonical transaction store", () => {
       const lockEntries = crashedEntries.filter((entry) => entry.startsWith(".mutation-lock"));
       if (failAt === "lock-owner-synced" || failAt === "lock-directory-synced") expect(lockEntries[0]).toMatch(/^\.mutation-lock\.acquire-/);
       else if (failAt === "lock-active-renamed" || failAt === "lock-parent-synced") expect(lockEntries).toContain(".mutation-lock");
-      else if (failAt === "lock-release-renamed" || failAt === "lock-release-parent-synced") expect(lockEntries[0]).toMatch(/^\.mutation-lock\.release-/);
+      else if (failAt === "lock-release-renamed" || failAt === "lock-release-parent-synced" || failAt === "lock-owner-removed") expect(lockEntries[0]).toMatch(/^\.mutation-lock\.release-/);
       else expect(lockEntries).toEqual([]);
       await expect(commitTransaction(runRoot, TX, {
         randomToken: () => "f".repeat(64), isProcessAlive: () => false,
+        now: () => new Date(Date.now() + 10_000), lockTrashMinAgeMs: 1,
       })).resolves.toBeDefined();
       const entries = await (await import("node:fs/promises")).readdir(join(runRoot, ".state/transactions"));
       expect(entries.filter((entry) => entry.startsWith(".mutation-lock"))).toEqual([]);
@@ -298,6 +335,58 @@ describe("canonical transaction store", () => {
     await writeFile(join(lockPath, "owner.json"), `${canonicalJson(owner)}\n`);
     await expectCode(commitTransaction(runRoot, TX, { isProcessAlive: () => true }), "transaction.locked");
     await expect(commitTransaction(runRoot, TX, { isProcessAlive: () => false, randomToken: () => "e".repeat(64), pid: 123 })).resolves.toBeDefined();
+  });
+
+  test("ages ownerless lock trash and fails closed on malicious contents", async () => {
+    const now = new Date("2026-08-26T12:00:00.000Z");
+    const makeTrash = async (runRoot: string, kind: "acquire" | "release", token: string, ageMs: number, content: "empty" | "partial" | "symlink" | "unknown") => {
+      const path = join(runRoot, ".state/transactions", `.mutation-lock.${kind}-${token}`);
+      await mkdir(path, { mode: 0o700 });
+      if (content === "partial") await writeFile(join(path, "owner.json"), "{\n", { mode: 0o600 });
+      if (content === "unknown") await writeFile(join(path, "unexpected"), "x");
+      if (content === "symlink") await symlink(join(runRoot, "outside"), join(path, "owner.json"));
+      const then = new Date(now.getTime() - ageMs);
+      await utimes(path, then, then);
+      return path;
+    };
+
+    for (const kind of ["acquire", "release"] as const) {
+      const recentRoot = await root();
+      await prepareTransaction(recentRoot, input());
+      const recent = await makeTrash(recentRoot, kind, kind === "acquire" ? "1".repeat(64) : "7".repeat(64), 30_000, "empty");
+      await commitTransaction(recentRoot, TX, { now: () => now, lockTrashMinAgeMs: 60_000 });
+      expect((await lstat(recent)).isDirectory()).toBe(true);
+    }
+
+    for (const kind of ["acquire", "release"] as const) {
+      for (const content of ["empty", "partial"] as const) {
+        const runRoot = await root();
+        await prepareTransaction(runRoot, input());
+        const digit = kind === "acquire" ? (content === "empty" ? "2" : "3") : (content === "empty" ? "8" : "9");
+        const stale = await makeTrash(runRoot, kind, digit.repeat(64), 120_000, content);
+        await commitTransaction(runRoot, TX, { now: () => now, lockTrashMinAgeMs: 60_000 });
+        await expect(lstat(stale)).rejects.toMatchObject({ code: "ENOENT" });
+      }
+    }
+
+    const liveRoot = await root();
+    await prepareTransaction(liveRoot, input());
+    const liveToken = "4".repeat(64);
+    const livePath = await makeTrash(liveRoot, "acquire", liveToken, 120_000, "empty");
+    const liveStat = await lstat(livePath);
+    const liveOwner = { schemaVersion: 1, pid: 4242, ownerToken: liveToken, createdAt: AT, dev: String(liveStat.dev), ino: String(liveStat.ino) };
+    await writeFile(join(livePath, "owner.json"), `${canonicalJson(liveOwner)}\n`, { mode: 0o600 });
+    await commitTransaction(liveRoot, TX, { now: () => now, lockTrashMinAgeMs: 60_000, isProcessAlive: () => true });
+    expect((await lstat(livePath)).isDirectory()).toBe(true);
+
+    for (const content of ["symlink", "unknown"] as const) {
+      const runRoot = await root();
+      await writeFile(join(runRoot, "outside"), "outside");
+      await prepareTransaction(runRoot, input());
+      await makeTrash(runRoot, "release", content === "symlink" ? "5".repeat(64) : "6".repeat(64), 120_000, content);
+      await expectCode(commitTransaction(runRoot, TX, { now: () => now, lockTrashMinAgeMs: 60_000 }), "transaction.lock-corrupt");
+      expect(await readFile(join(runRoot, "outside"), "utf8")).toBe("outside");
+    }
   });
 
   test("excludes independent module instances racing the same transaction root", async () => {

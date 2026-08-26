@@ -51,6 +51,7 @@ const DEFAULT_MAX_TRANSACTION_BYTES = 64 * 1024 * 1024;
 const DEFAULT_MAX_DEPTH = 64;
 const DEFAULT_MAX_NODES = 500_000;
 const DEFAULT_MAX_KEYS = 500_000;
+const DEFAULT_LOCK_TRASH_MIN_AGE_MS = 5 * 60 * 1000;
 const READ_CHUNK_BYTES = 64 * 1024;
 const fatalUtf8 = new TextDecoder("utf-8", { fatal: true });
 const rootQueues = new Map<string, Promise<void>>();
@@ -81,12 +82,16 @@ export type TransactionProtocolStep =
   | "committed-parent-synced"
   | `mkdir-${"state" | "transactions" | "staging" | "committed" | "transaction"}-${"directory" | "parent"}-synced`
   | "staging-cleaned"
+  | "staging-quarantined"
+  | "quarantine-source-parent-synced"
+  | "quarantine-destination-parent-synced"
   | "lock-owner-synced"
   | "lock-directory-synced"
   | "lock-active-renamed"
   | "lock-parent-synced"
   | "lock-release-renamed"
   | "lock-release-parent-synced"
+  | "lock-owner-removed"
   | "lock-trash-cleaned"
   | "lock-released";
 
@@ -113,6 +118,7 @@ export interface TransactionStoreOptions {
   now?: () => Date;
   randomToken?: () => string;
   isProcessAlive?: (pid: number) => boolean | Promise<boolean>;
+  lockTrashMinAgeMs?: number;
   onAncestorCheck?: (phase: string) => void | Promise<void>;
 }
 
@@ -917,36 +923,36 @@ async function cleanupMatchingStaging(root: string, transactionId: string, commi
     const entries = await readdir(stage, { withFileTypes: true }).catch(() => fail("transaction.id-conflict"));
     const expected = new Set([...KINDS.map((kind) => `${kind}.jsonl`), MANIFEST_FILE]);
     const suspicious = entries.find((entry) => entry.isSymbolicLink() || !entry.isFile() || !expected.has(entry.name));
-    if (suspicious) {
-      if (suspicious.isSymbolicLink()) {
-        await assertStage();
-        await unlink(join(stage, suspicious.name)).catch(() => fail("transaction.unsafe-file"));
-      }
-      fail("transaction.unsafe-file");
-    }
+    if (suspicious) fail("transaction.unsafe-file");
+    if (entries.length !== expected.size || entries.some((entry) => !expected.has(entry.name))) fail("transaction.id-conflict");
     for (const entry of entries) {
       await assertStage();
       const stagedBytes = await readSafeFile(join(stage, entry.name), limits.maxFileBytes, limits);
       const committedBytes = await readSafeFile(join(destination, entry.name), limits.maxFileBytes, limits);
       if (!stagedBytes.equals(committedBytes)) fail("transaction.id-conflict");
     }
-    if (entries.some((entry) => entry.name === MANIFEST_FILE)) {
-      const stagedManifest = await verifyDirectory(root, ".staging", transactionId, limits).catch(() => fail("transaction.id-conflict"));
-      if (stagedManifest.manifestSha256 !== committed.manifestSha256) fail("transaction.id-conflict");
-    }
-    const removalOrder = [...entries].sort((left, right) => Number(right.name === MANIFEST_FILE) - Number(left.name === MANIFEST_FILE));
-    for (const entry of removalOrder) {
-      await assertStage();
-      const child = await lstat(join(stage, entry.name)).catch(() => fail("transaction.unsafe-file"));
-      if (!child.isFile() || child.isSymbolicLink() || child.nlink !== 1) fail("transaction.unsafe-file");
-      await unlink(join(stage, entry.name)).catch(() => fail("transaction.io-failed"));
-      await protocolStep("staging-cleaned", options);
-    }
+    const stagedManifest = await verifyDirectory(root, ".staging", transactionId, limits).catch(() => fail("transaction.id-conflict"));
+    if (stagedManifest.manifestSha256 !== committed.manifestSha256) fail("transaction.id-conflict");
     await assertStage();
+    await assertPinnedHierarchy(guard, "before-quarantine-rename", options);
+    const token = options.randomToken?.() ?? randomBytes(32).toString("hex");
+    if (!/^[a-f0-9]{64}$/.test(token)) fail("transaction.invalid-input");
+    const quarantine = join(root, ".state/transactions/.staging", `.quarantine-${transactionId}-${token}`);
+    if (await pathExists(quarantine)) fail("transaction.id-conflict");
+    await (options.rename ?? nodeRename)(stage, quarantine).catch((error) => { throw normalize(error); });
+    await protocolStep("staging-quarantined", options);
+    const stagingPin = guard.find((item) => item.path === join(root, ".state/transactions/.staging"));
+    if (!stagingPin) fail("transaction.unsafe-root");
+    await durability(stagingPin.handle, "quarantine-source-parent-synced", options);
+    await protocolStep("quarantine-source-parent-synced", options);
+    await durability(stagingPin.handle, "quarantine-destination-parent-synced", options);
+    await protocolStep("quarantine-destination-parent-synced", options);
+    await assertPinnedHierarchy(guard, "after-quarantine-rename", options);
+    const quarantined = await lstat(quarantine).catch(() => fail("transaction.unsafe-file"));
+    const descriptor = await handle.stat().catch(() => fail("transaction.unsafe-file"));
+    if (!quarantined.isDirectory() || quarantined.isSymbolicLink() || quarantined.dev !== pinned.dev || quarantined.ino !== pinned.ino
+      || descriptor.dev !== pinned.dev || descriptor.ino !== pinned.ino) fail("transaction.unsafe-file");
   } finally { await handle.close().catch(() => undefined); }
-  await assertPinnedHierarchy(guard, "after-staging-files", options);
-  try { await rmdir(stage); } catch { fail("transaction.io-failed"); }
-  await assertPinnedHierarchy(guard, "after-staging-cleanup", options);
 }
 
 /**
@@ -1233,18 +1239,54 @@ async function releaseMutationLock(root: string, lock: MutationLock, options: Tr
 
 async function recoverLockTrash(parent: string, options: TransactionStoreOptions): Promise<void> {
   const entries = await readdir(parent, { withFileTypes: true }).catch(() => fail("transaction.lock-corrupt"));
+  const nowMs = (options.now?.() ?? new Date()).getTime();
+  if (!Number.isFinite(nowMs)) fail("transaction.invalid-input");
+  const minimumAgeMs = positiveLimit(options.lockTrashMinAgeMs ?? DEFAULT_LOCK_TRASH_MIN_AGE_MS);
   for (const entry of entries) {
     const match = /^\.mutation-lock\.(?:acquire|release)-([a-f0-9]{64})$/.exec(entry.name);
     if (!match) continue;
-    if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+    if (!entry.isDirectory() || entry.isSymbolicLink()) fail("transaction.lock-corrupt");
     const path = join(parent, entry.name);
-    let ownerRecord: ReadLockOwner;
-    try { ownerRecord = await readLockOwner(path, options); } catch { continue; }
-    if (ownerRecord.owner.ownerToken !== match[1]) continue;
-    if (await (options.isProcessAlive ?? defaultProcessAlive)(ownerRecord.owner.pid)) continue;
-    await deleteLockDirectory(path, match[1]!, options);
+    const before = await lstat(path).catch(() => fail("transaction.lock-corrupt"));
+    if (!before.isDirectory() || before.isSymbolicLink() || (before.mode & 0o077) !== 0) fail("transaction.lock-corrupt");
+    let ownerRecord: ReadLockOwner | undefined;
+    try { ownerRecord = await readLockOwner(path, options); } catch { ownerRecord = undefined; }
+    if (ownerRecord) {
+      if (ownerRecord.owner.ownerToken !== match[1]) fail("transaction.lock-corrupt");
+      if (await (options.isProcessAlive ?? defaultProcessAlive)(ownerRecord.owner.pid)) continue;
+      await deleteLockDirectory(path, match[1]!, options);
+      await syncDirectory(parent, "lock-released", options);
+      continue;
+    }
+    if (nowMs - before.mtimeMs < minimumAgeMs) continue;
+    await deleteOwnerlessLockTrash(path, before, options);
     await syncDirectory(parent, "lock-released", options);
   }
+}
+
+async function deleteOwnerlessLockTrash(path: string, before: Awaited<ReturnType<typeof lstat>>, options: TransactionStoreOptions): Promise<void> {
+  const entries = await readdir(path, { withFileTypes: true }).catch(() => fail("transaction.lock-corrupt"));
+  if (entries.length > 1 || (entries.length === 1 && entries[0]!.name !== "owner.json")) fail("transaction.lock-corrupt");
+  if (entries.length === 1) {
+    const entry = entries[0]!;
+    if (!entry.isFile() || entry.isSymbolicLink()) fail("transaction.lock-corrupt");
+    const ownerPath = join(path, "owner.json");
+    const ownerBefore = await lstat(ownerPath).catch(() => fail("transaction.lock-corrupt"));
+    if (!ownerBefore.isFile() || ownerBefore.isSymbolicLink() || ownerBefore.nlink !== 1 || ownerBefore.size > 4096) fail("transaction.lock-corrupt");
+    const limits = limitsFrom({ ...options, maxFileBytes: 4096, maxLineBytes: 4096, maxDepth: 8, maxNodes: 32, maxKeys: 16,
+      maxArrayLength: 16, maxStringBytes: 4096, maxScalarBytes: 4096 });
+    await readSafeFile(ownerPath, 4096, limits).catch(() => fail("transaction.lock-corrupt"));
+    const ownerAfter = await lstat(ownerPath).catch(() => fail("transaction.lock-corrupt"));
+    const directory = await lstat(path).catch(() => fail("transaction.lock-corrupt"));
+    if (ownerAfter.dev !== ownerBefore.dev || ownerAfter.ino !== ownerBefore.ino || ownerAfter.nlink !== 1
+      || directory.dev !== before.dev || directory.ino !== before.ino) fail("transaction.lock-corrupt");
+    await unlink(ownerPath).catch(() => fail("transaction.lock-corrupt"));
+    await protocolStep("lock-owner-removed", options);
+  }
+  const empty = await lstat(path).catch(() => fail("transaction.lock-corrupt"));
+  if (empty.dev !== before.dev || empty.ino !== before.ino) fail("transaction.lock-corrupt");
+  await rmdir(path).catch(() => fail("transaction.lock-corrupt"));
+  await protocolStep("lock-trash-cleaned", options);
 }
 
 async function deleteLockDirectory(path: string, token: string, options: TransactionStoreOptions): Promise<void> {
@@ -1256,6 +1298,7 @@ async function deleteLockDirectory(path: string, token: string, options: Transac
   const current = await lstat(path).catch(() => fail("transaction.lock-corrupt"));
   if (current.dev !== before.dev || current.ino !== before.ino) fail("transaction.lock-corrupt");
   await unlink(join(path, "owner.json")).catch(() => fail("transaction.lock-corrupt"));
+  await protocolStep("lock-owner-removed", options);
   const empty = await lstat(path).catch(() => fail("transaction.lock-corrupt"));
   if (empty.dev !== before.dev || empty.ino !== before.ino) fail("transaction.lock-corrupt");
   await rmdir(path).catch(() => fail("transaction.lock-corrupt"));
