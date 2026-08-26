@@ -96,7 +96,7 @@ const LIMITS = Object.freeze({
 const OPTION_KEYS = Object.freeze([...Object.keys(LIMITS), "sourceUrlPolicy"]);
 const PROVENANCE_FIELDS = new Set([
   "canonicalUrl", "title", "authors", "containerTitle", "publisher", "volume", "issue", "pages", "published",
-  "publicationType", "peerReviewStatus", "accessLevel", "identifiers.doi", "identifiers.pmid", "identifiers.pmcid",
+  "publicationType", "peerReviewStatus", "accessLevel", "published.date", "identifiers.doi", "identifiers.pmid", "identifiers.pmcid",
   "lineage.studyId", "lineage.cohortIds", "lineage.datasetIds",
 ]);
 const ACCESS_ORDER = ["metadata-only", "abstract-only", "partial-text", "full-text"] as const;
@@ -150,6 +150,13 @@ export function buildRequestProvenanceIndex(
   sources: readonly SourceRecord[], requests: readonly RequestRecord[], options?: SourceIdentityOptions,
   diagnostics?: RequestProvenanceDiagnostics,
 ): RequestProvenanceIndex {
+  return buildRequestProvenanceIndexInternal(sources, requests, options, diagnostics, "sources");
+}
+
+function buildRequestProvenanceIndexInternal(
+  sources: readonly SourceRecord[], requests: readonly RequestRecord[], options: SourceIdentityOptions | undefined,
+  diagnostics: RequestProvenanceDiagnostics | undefined, aggregateShape: "source" | "sources",
+): RequestProvenanceIndex {
   const normalized = normalizeOptions(options);
   validateDiagnostics(diagnostics);
   const sourceInputs = safeArray(sources, normalized.maxSources, "source.too-many-records");
@@ -169,7 +176,10 @@ export function buildRequestProvenanceIndex(
     cumulativeRecordBytes = accumulateRecordBytes(cumulativeRecordBytes, validated.json, normalized);
     validatedRequests.push(validated);
   }
-  assertAggregateWrapper(["requests", "sources"], [validatedRequests, validatedSources], normalized);
+  if (aggregateShape === "source") {
+    if (validatedSources.length !== 1) fail("source.invalid-input");
+    assertSingleSourceAggregate(validatedSources[0]!, validatedRequests, normalized);
+  } else assertAggregateWrapper(["requests", "sources"], [validatedRequests, validatedSources], normalized);
   let steps = 0;
   for (const { record } of validatedSources) {
     steps = checkedAdd(steps, record.retrievalRequestIds.length);
@@ -245,7 +255,7 @@ export function validateSourceCanonicalUrlProvenanceOnce(
   source: SourceRecord, requests: readonly RequestRecord[], options?: SourceIdentityOptions,
   diagnostics?: RequestProvenanceDiagnostics,
 ): SourceUrlProvenance {
-  const index = buildRequestProvenanceIndex([source], requests, options, diagnostics);
+  const index = buildRequestProvenanceIndexInternal([source], requests, options, diagnostics, "source");
   const state = indexState.get(index as object);
   if (!state || state.sourceCanonicalJson.length !== 1) fail("source.provenance-index-mismatch");
   return selectProvenance(state, sha256Hex(state.sourceCanonicalJson[0]!));
@@ -290,11 +300,7 @@ function validateSource(source: SourceRecord, options: NormalizedOptions): Valid
       maxSourceRecordCanonicalBytes: options.maxSourceRecordCanonicalBytes,
     });
   } catch (error) {
-    if (error instanceof ScholarlyIdentifierError) {
-      if (error.code === "identifier.invalid-options" || error.code === "url.http-context-invalid") fail("source.invalid-options");
-      if (error.code.startsWith("url.")) fail("source.url-policy-invalid");
-      if (error.code === "identifier.record-too-large") fail("source.record-too-large");
-    }
+    if (error instanceof ScholarlyIdentifierError) return translateIdentifierError(error);
     return fail("source.invalid-input");
   }
   const json = canonicalJson(record);
@@ -373,7 +379,14 @@ function provenanceForSource(
     ["pmcid", source.identifiers.pmcid, canonicalPmcidUrl],
   ];
   for (const [kind, identifier, derive] of resolvers) {
-    if (identifier !== null && derive(identifier, { maxCanonicalScalarBytes: options.maxCanonicalScalarBytes }) === source.canonicalUrl)
+    if (identifier === null) continue;
+    let resolverUrl: string;
+    try { resolverUrl = derive(identifier, { maxCanonicalScalarBytes: options.maxCanonicalScalarBytes }); }
+    catch (error) {
+      if (error instanceof ScholarlyIdentifierError) return translateIdentifierError(error);
+      return fail("source.invalid-input");
+    }
+    if (resolverUrl === source.canonicalUrl)
       addWitness(Object.freeze({ kind: "identifier-resolver", identifierKind: kind }), `0\0${kind}`);
   }
   const retrievalRequestIds = new Set(source.retrievalRequestIds);
@@ -434,7 +447,7 @@ function mergeValidated(existing: readonly ValidatedSource[], incoming: readonly
     const prior = existingById.get(id);
     if (prior) {
       if (records.length !== 1 || records[0]!.record.revision !== prior.at(-1)!.record.revision + 1) fail("source.revision-gap");
-      assertStableIdentifiers(prior.at(-1)!.record, records[0]!.record);
+      assertStableIdentifierHistory(prior, records[0]!.record);
     } else if (records.length !== 1 || records[0]!.record.revision !== 1) fail("source.revision-gap");
   }
   const nodes: MergeNode[] = [];
@@ -527,9 +540,18 @@ function revisionChains(records: readonly ValidatedSource[], existing: boolean):
   }
   for (const list of groups.values()) {
     list.sort((left, right) => left.record.revision - right.record.revision);
-    if (existing) for (let index = 0; index < list.length; index += 1) {
-      if (list[index]!.record.revision !== index + 1) fail("source.revision-gap");
-      if (index > 0) assertStableIdentifiers(list[index - 1]!.record, list[index]!.record);
+    if (existing) {
+      const stableIdentifiers: Partial<Record<"doi" | "pmid" | "pmcid", string>> = {};
+      for (let index = 0; index < list.length; index += 1) {
+        const record = list[index]!.record;
+        if (record.revision !== index + 1) fail("source.revision-gap");
+        for (const field of ["doi", "pmid", "pmcid"] as const) {
+          const value = record.identifiers[field];
+          if (value === null) continue;
+          if (stableIdentifiers[field] === undefined) stableIdentifiers[field] = value;
+          else if (stableIdentifiers[field] !== value) fail("source.invalid-input");
+        }
+      }
     }
   }
   return groups;
@@ -560,8 +582,13 @@ function mergeGroup(base: SourceRecord, candidates: readonly SourceRecord[], ret
       else if (current !== null && next !== null && canonicalJson(current) !== canonicalJson(next))
         conflicts.push(conflict("source.metadata-conflict", field, [merged, candidate], [current, next]));
     }
-    if (canonicalJson(merged.published) !== canonicalJson(candidate.published))
+    if (merged.published.date === null && candidate.published.date !== null) {
+      if (hasProvenance(candidate, "published") || hasProvenance(candidate, "published.date"))
+        merged.published = JSON.parse(canonicalJson(candidate.published)) as SourceRecord["published"];
+    } else if (merged.published.date !== null && candidate.published.date !== null
+      && canonicalJson(merged.published) !== canonicalJson(candidate.published)) {
       conflicts.push(conflict("source.metadata-conflict", "published", [merged, candidate], [merged.published, candidate.published]));
+    }
     if (merged.lineage.studyId === null && candidate.lineage.studyId !== null && hasProvenance(candidate, "lineage.studyId"))
       merged.lineage.studyId = candidate.lineage.studyId;
     else if (merged.lineage.studyId !== null && candidate.lineage.studyId !== null && merged.lineage.studyId !== candidate.lineage.studyId)
@@ -604,9 +631,12 @@ function sameSemantic(left: SourceRecord, right: SourceRecord): boolean {
   return canonicalJson({ ...left, revision: 0, sourceId: "src-semantic.0000001" })
     === canonicalJson({ ...right, revision: 0, sourceId: "src-semantic.0000001" });
 }
-function assertStableIdentifiers(left: SourceRecord, right: SourceRecord): void {
-  for (const field of ["doi", "pmid", "pmcid"] as const)
-    if (left.identifiers[field] !== null && right.identifiers[field] !== null && left.identifiers[field] !== right.identifiers[field]) fail("source.invalid-input");
+function assertStableIdentifierHistory(history: readonly ValidatedSource[], next: SourceRecord): void {
+  for (const field of ["doi", "pmid", "pmcid"] as const) {
+    const stable = history.map(({ record }) => record.identifiers[field]).find((value) => value !== null);
+    if (stable !== undefined && stable !== null && next.identifiers[field] !== null && next.identifiers[field] !== stable)
+      fail("source.invalid-input");
+  }
 }
 function strongKeys(record: SourceRecord): string[] {
   const keys: string[] = [];
@@ -635,6 +665,15 @@ function finishOptions(snapshot: Record<string, unknown>, originalPolicy: Source
     if (!Number.isSafeInteger(value) || (value as number) < 1 || (value as number) > hard) fail("source.invalid-options");
     values[key] = value as number;
   }
+  if (values.maxCanonicalScalarBytes! > values.maxSourceRecordCanonicalBytes!
+    || values.maxCanonicalScalarBytes! > values.maxRequestRecordCanonicalBytes!
+    || values.maxSourceRecordCanonicalBytes! > values.maxAggregateCanonicalBytes!
+    || values.maxRequestRecordCanonicalBytes! > values.maxAggregateCanonicalBytes!
+    || values.maxSources! > values.maxProvenanceSteps!
+    || values.maxRequests! > values.maxProvenanceSteps!) fail("source.invalid-options");
+  assertSafeOptionProduct(values.maxSources!, values.maxSourceRecordCanonicalBytes!);
+  assertSafeOptionProduct(values.maxRequests!, values.maxRequestRecordCanonicalBytes!);
+  assertSafeOptionProduct(values.maxProvenanceSteps!, values.maxCanonicalScalarBytes!);
   const policySnapshot = (snapshot.sourceUrlPolicy ?? {}) as Record<string, unknown>;
   if (!isPlain(policySnapshot)) fail("source.invalid-options");
   const policyKeys = ["allowHttp", "approvedHttpHosts", "accessPolicySha256", "maxApprovedHttpHosts"];
@@ -652,6 +691,10 @@ function finishOptions(snapshot: Record<string, unknown>, originalPolicy: Source
     optionsSha256: sha256Hex(canonicalJson(normalizedForHash)),
     allowHttp: policy.allowHttp, approvedHttpHosts: policy.approvedHttpHosts, accessPolicySha256: policy.accessPolicySha256,
   }) as unknown as NormalizedOptions;
+}
+
+function assertSafeOptionProduct(left: number, right: number): void {
+  if (!Number.isSafeInteger(left * right)) fail("source.invalid-options");
 }
 
 function validatePolicyOptions(policy: Record<string, unknown>): {
@@ -728,6 +771,25 @@ function accumulateRecordBytes(total: number, json: string, options: NormalizedO
 function assertAggregateBytes(encoded: string, options: NormalizedOptions): void {
   if (Buffer.byteLength(encoded, "utf8") > options.maxAggregateCanonicalBytes) fail("source.input-too-large");
 }
+function assertSingleSourceAggregate(
+  source: { json: string }, requests: readonly { json: string }[], options: NormalizedOptions,
+): void {
+  let bytes = 2;
+  bytes = checkedAdd(bytes, Buffer.byteLength(canonicalJson("requests"), "utf8"));
+  bytes = checkedAdd(bytes, 2);
+  for (let index = 0; index < requests.length; index += 1) {
+    if (index > 0) bytes = checkedAdd(bytes, 1);
+    bytes = checkedAdd(bytes, Buffer.byteLength(requests[index]!.json, "utf8"));
+    if (bytes > options.maxAggregateCanonicalBytes) fail("source.input-too-large");
+  }
+  bytes = checkedAdd(bytes, 2);
+  bytes = checkedAdd(bytes, Buffer.byteLength(canonicalJson("source"), "utf8"));
+  bytes = checkedAdd(bytes, 1);
+  bytes = checkedAdd(bytes, Buffer.byteLength(source.json, "utf8"));
+  if (bytes > options.maxAggregateCanonicalBytes) fail("source.input-too-large");
+  const encoded = `{"requests":[${requests.map(({ json }) => json).join(",")}],"source":${source.json}}`;
+  if (Buffer.byteLength(encoded, "utf8") !== bytes) fail("source.input-too-large");
+}
 function assertAggregateWrapper(
   keys: readonly string[], collections: readonly (readonly { json: string }[])[], options: NormalizedOptions,
 ): void {
@@ -801,6 +863,12 @@ function deepFreeze<T>(value: T): T {
     Object.freeze(value);
   }
   return value;
+}
+function translateIdentifierError(error: ScholarlyIdentifierError): never {
+  if (error.code === "identifier.invalid-options" || error.code === "url.http-context-invalid") fail("source.invalid-options");
+  if (error.code === "identifier.record-too-large") fail("source.record-too-large");
+  if (error.code.startsWith("url.")) fail("source.url-policy-invalid");
+  return fail("source.invalid-input");
 }
 function fail(code: SourceIdentityErrorCode): never { throw new SourceIdentityError(code); }
 
