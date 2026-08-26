@@ -28,6 +28,7 @@ import {
 
 const H = "a".repeat(64);
 const H2 = "b".repeat(64);
+const H3 = "c".repeat(64);
 const NOW = "2026-08-25T12:34:56.789Z";
 const ids = {
   run: "run-abcdefghijklmnop",
@@ -47,9 +48,10 @@ const ids = {
 
 const blocker = { code: "blocked", message: "blocked safely" };
 const evidenceRule = {
-  minSources: 1,
-  requirePrimary: true,
-  requireIndependentLineages: 2,
+  minimumLineages: 2,
+  independentVerificationAllowed: true,
+  primarySourceRequired: true,
+  fullTextRequired: false,
 };
 const usage = {
   inputTokens: 1,
@@ -208,6 +210,14 @@ describe("durable identity formats", () => {
     expect(isTimestamp("2026-08-25T12:34:56Z")).toBe(false);
   });
 
+  test("uses the approved SourceId syntax and generated sources satisfy it", () => {
+    expect(ID_PATTERNS.source.source).toBe("^src-[a-z0-9][a-z0-9._-]{7,127}$");
+    for (const valid of ["src-a1234567", "src-a.bc_def-", `src-a${"b".repeat(127)}`]) expect(ID_PATTERNS.source.test(valid)).toBe(true);
+    for (const invalid of ["src-a123456", "src-.1234567", "src-_1234567", "src--1234567", `src-a${"b".repeat(128)}`]) expect(ID_PATTERNS.source.test(invalid)).toBe(false);
+    const generator = createIdGenerator({ randomBytes: (size) => Buffer.alloc(size, 7), now: () => new Date(NOW) });
+    expect(ID_PATTERNS.source.test(generator.next("source"))).toBe(true);
+  });
+
   test("generates all IDs from injected bytes without reuse in one instance", () => {
     let byte = 0;
     const generator = createIdGenerator({ randomBytes: (size) => Buffer.alloc(size, byte++), now: () => new Date(NOW) });
@@ -243,7 +253,7 @@ describe("closed record schemas", () => {
   });
 
   test("requires and closes nested records and rejects null arrays", () => {
-    expectInvalid(TaskRecordSchema, { ...taskFixture(), evidenceRule: { requirePrimary: true, requireIndependentLineages: 2 } }, "/evidenceRule/minSources");
+    expectInvalid(TaskRecordSchema, { ...taskFixture(), evidenceRule: { independentVerificationAllowed: true, primarySourceRequired: true, fullTextRequired: false } }, "/evidenceRule/minimumLineages");
     expectInvalid(TaskRecordSchema, { ...taskFixture(), state: "blocked", blocker: { message: "x" } }, "/blocker/code");
     expectInvalid(AttemptRecordSchema, attemptFixture({ billingStatus: "reported", reportedUsage: { ...usage, outputTokens: undefined } }), "/reportedUsage/outputTokens");
     expectInvalid(AttemptRecordSchema, attemptFixture({ state: "retryable-failed", error: { message: "x" } }), "/error/class");
@@ -288,6 +298,20 @@ describe("closed record schemas", () => {
     expectInvalid(AttemptRecordSchema, attemptFixture({ thinkingLevel: "extreme" }), "/thinkingLevel");
     expectInvalid(RunSnapshotSchema, runFixture({ depth: "exhaustive" }), "/depth");
     expectInvalid(CanonicalTransactionManifestSchema, { ...manifestFixture(), files: [{ ...manifestFixture().files[0], kind: "other" }] }, "/files/0/kind");
+  });
+
+  test("uses the exact EvidenceRule fields without inventing a numeric range", () => {
+    expectValid(TaskRecordSchema, taskFixture());
+    expectValid(TaskRecordSchema, { ...taskFixture(), evidenceRule: { ...evidenceRule, minimumLineages: -1 } });
+    expectValid(TaskRecordSchema, { ...taskFixture(), evidenceRule: { ...evidenceRule, minimumLineages: 1.5 } });
+    expectInvalid(TaskRecordSchema, { ...taskFixture(), evidenceRule: { ...evidenceRule, minimumLineages: "one" } }, "/evidenceRule/minimumLineages");
+    expectInvalid(TaskRecordSchema, { ...taskFixture(), evidenceRule: { ...evidenceRule, minimumLineages: Number.NaN } }, "/evidenceRule/minimumLineages");
+    expectInvalid(TaskRecordSchema, { ...taskFixture(), evidenceRule: { ...evidenceRule, minSources: 1 } }, "/evidenceRule/minSources");
+  });
+
+  test("accepts undocumented-empty attempt and retry strings", () => {
+    expectValid(AttemptRecordSchema, attemptFixture({ logicalOperationId: "", providerModel: "", capabilityId: "" }));
+    expectValid(RetryScheduleSchema, scheduleFixture({ logicalOperationId: "", reasonClass: "" }));
   });
 
   test("enforces task state matrix", () => {
@@ -370,6 +394,25 @@ describe("retry series", () => {
   test("accepts one consumed edge and allows physical prompt differences", () => {
     const result = validateRetrySeries([failed, { ...retried, renderedPromptSha256: H2 }], [scheduleFixture()]);
     expect(result.success).toBe(true);
+  });
+
+  test("permits execution epoch and thinking level to change across retries", () => {
+    expect(validateRetrySeries([failed, { ...retried, executionEpoch: 1, thinkingLevel: "high" }], [scheduleFixture()]).success).toBe(true);
+  });
+
+  test("reports retry issues at original input indices across unsorted groups", () => {
+    const changedRetry = { ...retried, providerModel: "other/model" };
+    const otherGroup = attemptFixture({
+      attemptId: "attempt-cdefghijklmnopqr",
+      logicalOperationId: "logical-2",
+      attemptEnvelopeSha256: H3,
+    });
+    const result = validateRetrySeries([changedRetry, otherGroup, failed], [scheduleFixture()]);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.issues).toContainEqual({ path: "/attempts/0/providerModel", code: "retry.immutable-change" });
+      expect(result.issues).not.toContainEqual({ path: "/attempts/1/providerModel", code: "retry.immutable-change" });
+    }
   });
 
   test("rejects immutable changes, missing schedules, and invalid predecessors", () => {

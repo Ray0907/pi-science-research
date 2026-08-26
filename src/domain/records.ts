@@ -58,9 +58,10 @@ export const CheckpointStageSchema = StringEnum(["planning", "researching", "ver
 export const ManifestFileKindSchema = StringEnum(["sources", "claims", "evidence", "verifications", "requests", "calculations"] as const);
 
 const EvidenceRuleSchema = Type.Object({
-  minSources: NonNegativeIntegerSchema,
-  requirePrimary: Type.Boolean(),
-  requireIndependentLineages: NonNegativeIntegerSchema,
+  minimumLineages: Type.Number(),
+  independentVerificationAllowed: Type.Boolean(),
+  primarySourceRequired: Type.Boolean(),
+  fullTextRequired: Type.Boolean(),
 }, closed);
 
 export const TaskRecordSchema = Type.Object({
@@ -94,13 +95,13 @@ export const AttemptRecordSchema = Type.Object({
   runId: id("run"),
   taskId: id("task"),
   executionEpoch: NonNegativeIntegerSchema,
-  logicalOperationId: Type.String({ minLength: 1 }),
+  logicalOperationId: Type.String(),
   attemptOrdinal: PositiveIntegerSchema,
   retryOfAttemptId: Type.Union([id("attempt"), Type.Null()]),
   attemptKind: AttemptKindSchema,
   replayPolicy: ReplayPolicySchema,
   state: AttemptStateSchema,
-  providerModel: Type.String({ minLength: 1 }),
+  providerModel: Type.String(),
   thinkingLevel: ThinkingLevelSchema,
   promptTemplateSha256: Sha256Schema,
   renderedPromptSha256: Sha256Schema,
@@ -108,7 +109,7 @@ export const AttemptRecordSchema = Type.Object({
   attemptEnvelopeSha256: Sha256Schema,
   toolAllowlist: Type.Array(Type.String()),
   deadlineAt: TimestampSchema,
-  capabilityId: Type.String({ minLength: 1 }),
+  capabilityId: Type.String(),
   resultSha256: Type.Union([Sha256Schema, Type.Null()]),
   billingStatus: BillingStatusSchema,
   reportedUsage: Type.Union([AttemptUsageRecordSchema, Type.Null()]),
@@ -161,12 +162,12 @@ export type RunSnapshot = Static<typeof RunSnapshotSchema>;
 export const RetryScheduleSchema = Type.Object({
   schemaVersion: Type.Literal(1),
   scheduleId: id("retry"),
-  logicalOperationId: Type.String({ minLength: 1 }),
+  logicalOperationId: Type.String(),
   failedAttemptId: id("attempt"),
   nextAttemptOrdinal: PositiveIntegerSchema,
   notBeforeAt: TimestampSchema,
   delayMs: NonNegativeNumberSchema,
-  reasonClass: Type.String({ minLength: 1 }),
+  reasonClass: Type.String(),
   replayPolicy: Type.Literal("safe-read"),
 }, closed);
 export type RetrySchedule = Static<typeof RetryScheduleSchema>;
@@ -317,8 +318,11 @@ export function validateRetrySeries(attemptInputs: readonly unknown[], scheduleI
     scheduleIds.add(schedule.scheduleId);
   });
 
-  const groups = new Map<string, AttemptRecord[]>();
-  for (const attempt of attempts) groups.set(attempt.logicalOperationId, [...(groups.get(attempt.logicalOperationId) ?? []), attempt]);
+  const groups = new Map<string, IndexedAttempt[]>();
+  attempts.forEach((attempt, inputIndex) => {
+    const indexed = { attempt, inputIndex };
+    groups.set(attempt.logicalOperationId, [...(groups.get(attempt.logicalOperationId) ?? []), indexed]);
+  });
   for (const [logicalOperationId, group] of groups) validateGroup(logicalOperationId, group, schedules.filter((schedule) => schedule.logicalOperationId === logicalOperationId), issues);
   schedules.forEach((schedule, index) => {
     if (!groups.has(schedule.logicalOperationId)) issues.push(issue(`/schedules/${index}`, "retry.orphan-logical-operation"));
@@ -331,37 +335,45 @@ function collectParsed<T>(result: ParseResult<T>, prefix: string, output: T[], i
   else issues.push(...result.issues.map((item) => issue(`${prefix}${item.path === "/" ? "" : item.path}`, item.code)));
 }
 
-function validateGroup(logicalOperationId: string, unsorted: AttemptRecord[], schedules: RetrySchedule[], issues: ValidationIssue[]): void {
-  const group = [...unsorted].sort((a, b) => a.attemptOrdinal - b.attemptOrdinal);
-  const first = group[0];
+interface IndexedAttempt {
+  attempt: AttemptRecord;
+  inputIndex: number;
+}
+
+function validateGroup(logicalOperationId: string, unsorted: IndexedAttempt[], schedules: RetrySchedule[], issues: ValidationIssue[]): void {
+  const group = [...unsorted].sort((a, b) => a.attempt.attemptOrdinal - b.attempt.attemptOrdinal);
+  const first = group[0]?.attempt;
   if (!first) return;
-  const immutable: (keyof AttemptRecord)[] = ["runId", "taskId", "executionEpoch", "attemptKind", "providerModel", "thinkingLevel", "promptTemplateSha256", "logicalInputSha256", "toolAllowlist", "deadlineAt", "replayPolicy"];
-  group.forEach((attempt, index) => {
-    if (attempt.attemptOrdinal !== index + 1) issues.push(issue(`/attempts/${index}/attemptOrdinal`, "retry.nonconsecutive-ordinal"));
-    for (const key of immutable) if (JSON.stringify(attempt[key]) !== JSON.stringify(first[key])) issues.push(issue(`/attempts/${index}/${String(key)}`, "retry.immutable-change"));
+  const immutable: (keyof AttemptRecord)[] = ["runId", "taskId", "attemptKind", "providerModel", "promptTemplateSha256", "logicalInputSha256", "toolAllowlist", "deadlineAt", "replayPolicy"];
+  group.forEach(({ attempt, inputIndex }, index) => {
+    const inputPath = `/attempts/${inputIndex}`;
+    if (attempt.attemptOrdinal !== index + 1) issues.push(issue(`${inputPath}/attemptOrdinal`, "retry.nonconsecutive-ordinal"));
+    for (const key of immutable) if (JSON.stringify(attempt[key]) !== JSON.stringify(first[key])) issues.push(issue(`${inputPath}/${String(key)}`, "retry.immutable-change"));
     if (index > 0) {
-      const predecessor = group[index - 1]!;
-      if (attempt.retryOfAttemptId !== predecessor.attemptId) issues.push(issue(`/attempts/${index}/retryOfAttemptId`, "retry.wrong-backlink"));
-      if (predecessor.state !== "retryable-failed") issues.push(issue(`/attempts/${index}`, "retry.invalid-predecessor-state"));
+      const predecessor = group[index - 1]!.attempt;
+      if (attempt.retryOfAttemptId !== predecessor.attemptId) issues.push(issue(`${inputPath}/retryOfAttemptId`, "retry.wrong-backlink"));
+      if (predecessor.state !== "retryable-failed") issues.push(issue(inputPath, "retry.invalid-predecessor-state"));
       const edge = schedules.filter((schedule) => schedule.failedAttemptId === predecessor.attemptId && schedule.nextAttemptOrdinal === attempt.attemptOrdinal);
-      if (edge.length !== 1) issues.push(issue(`/attempts/${index}`, "retry.schedule-edge-count"));
+      if (edge.length !== 1) issues.push(issue(inputPath, "retry.schedule-edge-count"));
     }
   });
   if (first.replayPolicy === "never" && schedules.length > 0) issues.push(issue("/schedules", "retry.never-scheduled"));
 
   const consumed = new Set<string>();
   for (let index = 1; index < group.length; index += 1) {
-    for (const schedule of schedules.filter((candidate) => candidate.failedAttemptId === group[index - 1]!.attemptId && candidate.nextAttemptOrdinal === group[index]!.attemptOrdinal)) consumed.add(schedule.scheduleId);
+    const predecessor = group[index - 1]!.attempt;
+    const attempt = group[index]!.attempt;
+    for (const schedule of schedules.filter((candidate) => candidate.failedAttemptId === predecessor.attemptId && candidate.nextAttemptOrdinal === attempt.attemptOrdinal)) consumed.add(schedule.scheduleId);
   }
   const pending = schedules.filter((schedule) => !consumed.has(schedule.scheduleId));
   if (pending.length > 1) issues.push(issue("/schedules", "retry.multiple-pending"));
   if (pending.length === 1) {
     const schedule = pending[0]!;
-    const last = group.at(-1)!;
+    const last = group.at(-1)!.attempt;
     if (schedule.failedAttemptId !== last.attemptId || schedule.nextAttemptOrdinal !== last.attemptOrdinal + 1 || last.state !== "retryable-failed") issues.push(issue("/schedules", "retry.non-immediate-pending"));
   }
   for (const schedule of schedules) {
-    if (!group.some((attempt) => attempt.attemptId === schedule.failedAttemptId)) issues.push(issue("/schedules", "retry.orphan-failed-attempt"));
+    if (!group.some(({ attempt }) => attempt.attemptId === schedule.failedAttemptId)) issues.push(issue("/schedules", "retry.orphan-failed-attempt"));
   }
   void logicalOperationId;
 }

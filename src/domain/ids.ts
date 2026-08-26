@@ -4,7 +4,7 @@ export const ID_PATTERNS = {
   run: /^run-[a-z0-9]{16,64}$/,
   task: /^task-[a-z0-9]{16,64}$/,
   attempt: /^attempt-[a-z0-9]{16,64}$/,
-  source: /^src-[a-z0-9]{16,64}$/,
+  source: /^src-[a-z0-9][a-z0-9._-]{7,127}$/,
   claim: /^claim-[a-z0-9]{16,64}$/,
   evidence: /^ev-[a-z0-9]{16,64}$/,
   verification: /^verify-[a-z0-9]{16,64}$/,
