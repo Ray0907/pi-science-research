@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { FileHandle } from "node:fs/promises";
 import { resolve } from "node:path";
+import { TextDecoder } from "node:util";
 
 import { canonicalJson } from "../crypto/canonical-json.js";
 import { hashLedgerEvent } from "../crypto/hash.js";
@@ -21,7 +22,6 @@ import {
   AtomicFileError,
   defaultDurability,
   openAppendOnlyLeaf,
-  truncateDurably,
   type DurabilityHook,
   type DurabilityReason,
 } from "./atomic.js";
@@ -32,15 +32,30 @@ export type { DurabilityReason } from "./atomic.js";
 const ZERO_HASH = "0".repeat(64);
 export const DEFAULT_MAX_LEDGER_LINE_BYTES = 4 * 1024 * 1024;
 const READ_CHUNK_BYTES = 64 * 1024;
+const fatalUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
 const openPaths = new Set<string>();
 const openPhysicalFiles = new Set<string>();
 let registryQueue: Promise<void> = Promise.resolve();
+
+export interface LedgerDescriptorStat {
+  dev: bigint | number;
+  ino: bigint | number;
+  isFile(): boolean;
+}
+
+export interface EventLedgerIo {
+  stat(handle: FileHandle): Promise<LedgerDescriptorStat>;
+  append(handle: FileHandle, bytes: Uint8Array): Promise<void>;
+  truncate(handle: FileHandle, size: number): Promise<void>;
+  close(handle: FileHandle): Promise<void>;
+}
 
 export interface EventLedgerOptions {
   now?: () => Date;
   eventId?: () => string;
   durability?: DurabilityHook;
   maxLineBytes?: number;
+  io?: Partial<EventLedgerIo>;
 }
 
 export interface EventLedger {
@@ -58,7 +73,11 @@ export type EventLedgerErrorCode =
   | "ledger.symlink"
   | "ledger.open-failed"
   | "ledger.read-failed"
+  | "ledger.invalid-utf8"
+  | "ledger.not-file"
   | "ledger.write-failed"
+  | "ledger.truncate-failed"
+  | "ledger.close-failed"
   | "ledger.durability-failed"
   | "ledger.line-too-large"
   | "ledger.empty-line"
@@ -88,6 +107,7 @@ export class EventLedgerError extends Error {
 
 export async function openEventLedger(path: string, options: EventLedgerOptions = {}): Promise<EventLedger> {
   const canonicalPath = resolve(path);
+  const io = resolveIo(options.io);
   let pathRegistered = false;
   let physicalIdentity: string | undefined;
   let physicalRegistered = false;
@@ -102,19 +122,21 @@ export async function openEventLedger(path: string, options: EventLedgerOptions 
     const maxLineBytes = validateMaxLineBytes(options.maxLineBytes ?? DEFAULT_MAX_LEDGER_LINE_BYTES);
     const durability = options.durability ?? defaultDurability;
     handle = await openLeaf(canonicalPath);
-    const stat = await handle.stat({ bigint: true });
-    physicalIdentity = `${stat.dev}:${stat.ino}`;
+    const stat = await descriptorStat(io, handle);
+    if (!stat.isFile()) throw new EventLedgerError("ledger.not-file");
+    physicalIdentity = descriptorIdentity(stat);
     await withRegistry(() => {
       if (openPhysicalFiles.has(physicalIdentity!)) throw new EventLedgerError("ledger.already-open");
       openPhysicalFiles.add(physicalIdentity!);
       physicalRegistered = true;
     });
-    const events = await scanLedger(handle, maxLineBytes, true, durability);
+    const events = await scanLedger(handle, maxLineBytes, true, durability, io);
     return createLedger(handle, events, {
       now: options.now ?? (() => new Date()),
       eventId: options.eventId ?? (() => `event-${randomUUID()}`),
       durability,
       maxLineBytes,
+      io,
     }, async () => releaseRegistry(canonicalPath, physicalRegistered ? physicalIdentity : undefined));
   } catch (error) {
     await handle?.close().catch(() => undefined);
@@ -128,6 +150,7 @@ interface ResolvedOptions {
   eventId: () => string;
   durability: DurabilityHook;
   maxLineBytes: number;
+  io: EventLedgerIo;
 }
 
 function createLedger(
@@ -183,13 +206,15 @@ function createLedger(
     const event = parsed.value as FoundationEventOfType<T>;
     if (eventIds.has(event.eventId)) throw new EventLedgerError("event.duplicate-id");
     validateReservationEvent(event, reservations, "append");
-    validateReservedReferences(event, reservations);
+    validateReservedReferences(event, reservations, "append");
 
     const encoded = Buffer.from(`${canonicalJson(event)}\n`, "utf8");
     if (encoded.byteLength - 1 > options.maxLineBytes) throw new EventLedgerError("ledger.line-too-large");
     try {
-      await appendFully(handle, encoded);
+      await options.io.append(handle, encoded);
     } catch {
+      // A failed or partial write makes the live writer uncertain; it remains
+      // readable for diagnostics but all subsequent writes fail closed.
       fatal = true;
       throw new EventLedgerError("ledger.write-failed");
     }
@@ -237,7 +262,7 @@ function createLedger(
       return enqueue(async () => {
         let scanned: FoundationLedgerEvent[];
         try {
-          scanned = await scanLedger(handle, options.maxLineBytes, false, options.durability);
+          scanned = await scanLedger(handle, options.maxLineBytes, false, options.durability, options.io);
         } catch (error) {
           throw normalizeReadError(error);
         }
@@ -251,7 +276,7 @@ function createLedger(
       closeRequested = true;
       closePromise = enqueue(async () => {
         try {
-          await handle.close();
+          await closeLedgerHandle(handle, options.io.close);
         } finally {
           await releaseOpenRegistration();
         }
@@ -266,6 +291,7 @@ async function scanLedger(
   maxLineBytes: number,
   recoverTornTail: boolean,
   durability: DurabilityHook,
+  io: EventLedgerIo,
 ): Promise<FoundationLedgerEvent[]> {
   const events: FoundationLedgerEvent[] = [];
   const eventIds = new Set<string>();
@@ -311,7 +337,12 @@ async function scanLedger(
   if (partsLength > 0 || lineOverflow) {
     if (!recoverTornTail) throw new EventLedgerError("ledger.torn-tail");
     try {
-      await truncateDurably(handle, committedBoundary, durability);
+      await io.truncate(handle, committedBoundary);
+    } catch {
+      throw new EventLedgerError("ledger.truncate-failed");
+    }
+    try {
+      await durability(handle, "truncate");
     } catch {
       throw new EventLedgerError("ledger.durability-failed");
     }
@@ -337,9 +368,16 @@ function parseLedgerLine(
   eventIds: Set<string>,
   reservations: Set<string>,
 ): FoundationLedgerEvent {
+  let decoded: string;
+  try {
+    decoded = fatalUtf8Decoder.decode(line);
+  } catch {
+    throw new EventLedgerError("ledger.invalid-utf8");
+  }
+
   let input: unknown;
   try {
-    input = JSON.parse(line.toString("utf8"));
+    input = JSON.parse(decoded);
   } catch {
     throw new EventLedgerError("ledger.invalid-json");
   }
@@ -350,7 +388,7 @@ function parseLedgerLine(
   } catch {
     throw new EventLedgerError("ledger.schema-invalid");
   }
-  if (canonical !== line.toString("utf8")) throw new EventLedgerError("ledger.noncanonical-line");
+  if (!Buffer.from(canonical, "utf8").equals(line)) throw new EventLedgerError("ledger.noncanonical-line");
   const parsed = parse(FoundationLedgerEventSchema, input);
   if (!parsed.success) throw new EventLedgerError("ledger.schema-invalid");
   const event = parsed.value as unknown as FoundationLedgerEvent;
@@ -359,7 +397,7 @@ function parseLedgerLine(
   if (event.entrySha256 !== hashLedgerEvent(event)) throw new EventLedgerError("ledger.hash-mismatch");
   if (eventIds.has(event.eventId)) throw new EventLedgerError("ledger.duplicate-event-id");
   validateReservationEvent(event, reservations, "replay");
-  validateReservedReferences(event, reservations);
+  validateReservedReferences(event, reservations, "replay");
   return cloneEvent(event);
 }
 
@@ -375,7 +413,11 @@ function validateReservationEvent(
   }
 }
 
-function validateReservedReferences(event: FoundationLedgerEvent, reservations: Set<string>): void {
+function validateReservedReferences(
+  event: FoundationLedgerEvent,
+  reservations: Set<string>,
+  mode: "append" | "replay",
+): void {
   const references: { kind: ReservedIdentityKind; id: string }[] = [];
   const add = (kind: ReservedIdentityKind, id: string | null) => {
     if (id !== null) references.push({ kind, id });
@@ -455,7 +497,7 @@ function validateReservedReferences(event: FoundationLedgerEvent, reservations: 
   }
 
   if (references.some(({ kind, id }) => !reservations.has(reservationKey(kind, id)))) {
-    throw new EventLedgerError("identity.not-reserved");
+    throw new EventLedgerError(mode === "append" ? "identity.not-reserved" : "ledger.schema-invalid");
   }
 }
 
@@ -501,6 +543,47 @@ async function openLeaf(path: string): Promise<FileHandle> {
   } catch (error) {
     if (error instanceof AtomicFileError && error.code === "symlink") throw new EventLedgerError("ledger.symlink");
     throw new EventLedgerError("ledger.open-failed");
+  }
+}
+
+const defaultIo: EventLedgerIo = {
+  stat: async (handle) => handle.stat({ bigint: true }),
+  append: appendFully,
+  truncate: async (handle, size) => handle.truncate(size),
+  close: async (handle) => handle.close(),
+};
+
+function resolveIo(overrides: Partial<EventLedgerIo> | undefined): EventLedgerIo {
+  return { ...defaultIo, ...overrides };
+}
+
+async function descriptorStat(io: EventLedgerIo, handle: FileHandle): Promise<LedgerDescriptorStat> {
+  try {
+    return await io.stat(handle);
+  } catch {
+    throw new EventLedgerError("ledger.open-failed");
+  }
+}
+
+function descriptorIdentity(stat: LedgerDescriptorStat): string {
+  if (!isDescriptorNumber(stat.dev) || !isDescriptorNumber(stat.ino)) {
+    throw new EventLedgerError("ledger.open-failed");
+  }
+  return `${stat.dev}:${stat.ino}`;
+}
+
+function isDescriptorNumber(value: bigint | number): boolean {
+  return typeof value === "bigint" ? value >= 0n : Number.isSafeInteger(value) && value >= 0;
+}
+
+async function closeLedgerHandle(handle: FileHandle, closeOperation: EventLedgerIo["close"]): Promise<void> {
+  try {
+    await closeOperation(handle);
+  } catch {
+    // The injected/primary close may fail before closing. Retry the native close
+    // only for cleanup, while preserving a fixed primary failure classification.
+    await handle.close().catch(() => undefined);
+    throw new EventLedgerError("ledger.close-failed");
   }
 }
 

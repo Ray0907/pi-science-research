@@ -1,4 +1,4 @@
-import { link, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { link, mkdtemp, readFile, rm, symlink, writeFile, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -251,6 +251,56 @@ describe("append-only event ledger", () => {
     await reopened.close();
   });
 
+  test("rejects malformed UTF-8 on open and verify without normalizing replacement characters", async () => {
+    const path = await ledgerPath();
+    const seed = await openEventLedger(path, deterministicOptions());
+    await seed.reserveIdentity("attempt", ids.attempt, "parent-generated");
+    await seed.append("attempt_failed", {
+      attemptId: ids.attempt,
+      state: "terminal-failed",
+      errorClass: "utf8-check",
+      message: "valid replacement \uFFFD character",
+    });
+    await seed.close();
+    const canonicalBytes = await readFile(path);
+    const replacement = Buffer.from("\uFFFD", "utf8");
+    const replacementOffset = canonicalBytes.indexOf(replacement);
+    expect(replacementOffset).toBeGreaterThanOrEqual(0);
+    const malformedBytes = Buffer.concat([
+      canonicalBytes.subarray(0, replacementOffset),
+      Buffer.from([0x80]),
+      canonicalBytes.subarray(replacementOffset + replacement.byteLength),
+    ]);
+
+    const live = await openEventLedger(path, deterministicOptions({ eventId: () => "unused-live" }));
+    await writeFile(path, malformedBytes);
+    await expect(live.verify()).rejects.toMatchObject({ code: "ledger.invalid-utf8" });
+    await live.close();
+    await expect(openEventLedger(path, deterministicOptions())).rejects.toMatchObject({ code: "ledger.invalid-utf8" });
+  });
+
+  test("maps hash-valid unreserved lifecycle references to replay corruption", async () => {
+    const path = await ledgerPath();
+    const eventWithoutHash = {
+      schemaVersion: 1,
+      seq: 1,
+      occurredAt: TIMESTAMP,
+      eventId: "unreserved-event",
+      type: "attempt_failed",
+      payload: {
+        attemptId: ids.attempt,
+        state: "terminal-failed",
+        errorClass: "corrupt",
+        message: "unreserved",
+      },
+      prevSha256: ZERO_HASH,
+    };
+    const event = { ...eventWithoutHash, entrySha256: hashLedgerEvent(eventWithoutHash) };
+    await writeFile(path, `${canonicalJson(event)}\n`);
+
+    await expect(openEventLedger(path, deterministicOptions())).rejects.toMatchObject({ code: "ledger.schema-invalid" });
+  });
+
   test("fails closed for malformed interior JSON, invalid hashes, and schema-invalid complete lines", async () => {
     const path = await ledgerPath();
     const first = await openEventLedger(path, deterministicOptions());
@@ -305,6 +355,19 @@ describe("append-only event ledger", () => {
     await reopened.close();
   });
 
+  test("rejects a non-regular opened descriptor and releases all registrations", async () => {
+    const path = await ledgerPath();
+    const secret = "SECRET-DESCRIPTOR";
+    await expect(openEventLedger(path, deterministicOptions({
+      io: {
+        stat: async () => ({ dev: 1n, ino: 2n, isFile: () => false, secret }),
+      },
+    }))).rejects.toMatchObject({ code: "ledger.not-file" });
+
+    const healthy = await openEventLedger(path, deterministicOptions());
+    await healthy.close();
+  });
+
   test("rejects concurrent opens through hard links and symlinked parent aliases, then releases physical identity", async () => {
     const path = await ledgerPath();
     const root = dirname(path);
@@ -331,6 +394,79 @@ describe("append-only event ledger", () => {
     await writeFile(target, "");
     await symlink(target, path);
     await expect(openEventLedger(path, deterministicOptions())).rejects.toMatchObject({ code: "ledger.symlink" });
+  });
+
+  test("fails closed after injected append write failure without advancing state", async () => {
+    const path = await ledgerPath();
+    const secret = "SECRET-WRITE";
+    const ledger = await openEventLedger(path, deterministicOptions({
+      io: { append: async (handle: FileHandle, bytes: Uint8Array) => {
+        const partialLength = Math.max(1, Math.floor(bytes.byteLength / 2));
+        await handle.write(bytes, 0, partialLength, null);
+        throw new Error(secret);
+      } },
+    }));
+
+    await expect(ledger.reserveIdentity("attempt", ids.attempt, "parent-generated")).rejects.toMatchObject({ code: "ledger.write-failed" });
+    expect(String(await ledger.reserveIdentity("request", ids.request, "parent-generated").catch((error) => error))).not.toContain(secret);
+    expect(await ledger.readAll()).toEqual([]);
+    await ledger.close();
+    expect((await readFile(path)).byteLength).toBeGreaterThan(0);
+    const healthy = await openEventLedger(path, deterministicOptions());
+    expect(await healthy.readAll()).toEqual([]);
+    await healthy.close();
+  });
+
+  test("fails closed after append durability rejection and reconciles stored bytes on reopen", async () => {
+    const path = await ledgerPath();
+    const secret = "SECRET-SYNC";
+    const ledger = await openEventLedger(path, deterministicOptions({
+      durability: async () => { throw new Error(secret); },
+    }));
+
+    await expect(ledger.reserveIdentity("attempt", ids.attempt, "parent-generated")).rejects.toMatchObject({ code: "ledger.durability-failed" });
+    expect(await ledger.readAll()).toEqual([]);
+    await expect(ledger.reserveIdentity("request", ids.request, "parent-generated")).rejects.toMatchObject({ code: "ledger.unavailable" });
+    await ledger.close();
+
+    const healthy = await openEventLedger(path, deterministicOptions({ eventId: () => "healthy-unused" }));
+    expect(await healthy.readAll()).toHaveLength(1);
+    await healthy.close();
+  });
+
+  test("releases descriptor and registries after torn-tail truncate and fsync failures", async () => {
+    for (const failure of ["truncate", "fsync"] as const) {
+      const path = await ledgerPath(`${failure}.jsonl`);
+      const seed = await openEventLedger(path, deterministicOptions());
+      await seed.reserveIdentity("attempt", ids.attempt, "parent-generated");
+      await seed.close();
+      await writeFile(path, Buffer.concat([await readFile(path), Buffer.from("{torn") ]));
+      const options = failure === "truncate"
+        ? deterministicOptions({ io: { truncate: async () => { throw new Error("SECRET-TRUNCATE"); } } })
+        : deterministicOptions({ durability: async (_handle: unknown, reason: DurabilityReason) => {
+          if (reason === "truncate") throw new Error("SECRET-FSYNC");
+        } });
+
+      await expect(openEventLedger(path, options)).rejects.toMatchObject({
+        code: failure === "truncate" ? "ledger.truncate-failed" : "ledger.durability-failed",
+      });
+      const healthy = await openEventLedger(path, deterministicOptions({ eventId: () => `healthy-${failure}` }));
+      expect(await healthy.readAll()).toHaveLength(1);
+      await healthy.close();
+    }
+  });
+
+  test("releases descriptor and registries when injected close fails", async () => {
+    const path = await ledgerPath();
+    const ledger = await openEventLedger(path, deterministicOptions({
+      io: { close: async () => { throw new Error("SECRET-CLOSE"); } },
+    }));
+    await ledger.reserveIdentity("attempt", ids.attempt, "parent-generated");
+    await expect(ledger.close()).rejects.toMatchObject({ code: "ledger.close-failed" });
+
+    const healthy = await openEventLedger(path, deterministicOptions({ eventId: () => "healthy-close" }));
+    expect(await healthy.readAll()).toHaveLength(1);
+    await healthy.close();
   });
 
   test("returns copies that cannot mutate internal state", async () => {
