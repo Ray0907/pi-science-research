@@ -96,6 +96,11 @@ export type TransactionProtocolStep =
   | "lock-trash-cleaned"
   | "lock-released";
 
+export interface RequestIndexDiagnostics {
+  eventVisits: number;
+  requestRecordsValidated: number;
+}
+
 export interface TransactionStoreOptions {
   maxFileBytes?: number;
   maxLineBytes?: number;
@@ -124,6 +129,7 @@ export interface TransactionStoreOptions {
   onAncestorCheck?: (phase: string) => void | Promise<void>;
   onReadOnlyCheck?: (phase: string, path: string) => void | Promise<void>;
   onHandleOpened?: (kind: "read-only-hierarchy" | "mutation-hierarchy" | "transaction-directory" | "transaction-file", path: string, handle: FileHandle) => void | Promise<void>;
+  requestIndexDiagnostics?: RequestIndexDiagnostics;
 }
 
 export interface TransactionManifestRef {
@@ -326,6 +332,7 @@ export async function inspectCanonicalTransactionsReadOnly(
 ): Promise<ReadOnlyTransactionIntegrity> {
   const reduced = reduceLedgerEvents(events);
   const ledger = canonicalLedgerLinks(events);
+  const requestIndex = buildCanonicalRequestIndex(events, options.requestIndexDiagnostics);
   const root = resolve(runRoot);
   await assertSafeDirectory(root);
   const stateDirectory = join(root, ".state");
@@ -358,7 +365,7 @@ export async function inspectCanonicalTransactionsReadOnly(
         const verified = await verifyCommittedEvent(root, event, limits, options);
         assertResultManifestLink(result, verified.manifest, ledger.runId, attempt);
         validateCatalogAndReferences(verified.records, catalog, limits);
-        assertCanonicalRequestRecords(verified.records.requests, events);
+        assertCanonicalRequestRecords(verified.records.requests, requestIndex, options.requestIndexDiagnostics);
         verifiedByTransaction.set(event.payload.transactionId, verified);
       }
       if (event.type === "attempt_committed") {
@@ -389,7 +396,7 @@ export async function inspectCanonicalTransactionsReadOnly(
         const decision = recoveryDecisionFor(reduced, attempt.logicalOperationId);
         if (decision.kind === "finish-transaction" && decision.transactionId === transactionId) {
           validateCatalogAndReferences(verified.records, catalog, limits);
-          assertCanonicalRequestRecords(verified.records.requests, events);
+          assertCanonicalRequestRecords(verified.records.requests, requestIndex, options.requestIndexDiagnostics);
           pendingCount++;
         }
       } else {
@@ -424,6 +431,7 @@ export async function reconcileCanonicalTransactions(
 ): Promise<TransactionReconciliationDecision[]> {
   const reduced = reduceLedgerEvents(events);
   const ledger = canonicalLedgerLinks(events);
+  const requestIndex = buildCanonicalRequestIndex(events, options.requestIndexDiagnostics);
   const root = await initializeRoot(runRoot, options);
   return withMutationLock(root, options, async () => {
     const results = new Map<string, Extract<FoundationLedgerEvent, { type: "result_recorded" }>>();
@@ -437,7 +445,7 @@ export async function reconcileCanonicalTransactions(
       if (event.type !== "records_committed") continue;
       const verified = await verifyCommittedEvent(root, event, limitsFrom(options), options);
       ledgerCatalog = validateCatalogAndReferences(verified.records, ledgerCatalog, limitsFrom(options));
-      assertCanonicalRequestRecords(verified.records.requests, events);
+      assertCanonicalRequestRecords(verified.records.requests, requestIndex, options.requestIndexDiagnostics);
     }
     const decisions: TransactionReconciliationDecision[] = [];
     for (const [transactionId, result] of results) {
@@ -455,7 +463,7 @@ export async function reconcileCanonicalTransactions(
           const decision = recoveryDecisionFor(reduced, attempt.logicalOperationId);
           if (decision.kind === "finish-transaction" && decision.transactionId === transactionId) {
             validateCatalogAndReferences(verified.records, ledgerCatalog, limitsFrom(options));
-            assertCanonicalRequestRecords(verified.records.requests, events);
+            assertCanonicalRequestRecords(verified.records.requests, requestIndex, options.requestIndexDiagnostics);
             decisions.push(Object.freeze({ kind: "finish-transaction", transactionId: transactionId as TransactionId }));
           }
         }
@@ -780,17 +788,60 @@ function validateCatalogAndReferences(records: Record<CanonicalRecordKind, JsonR
   return catalog;
 }
 
-function assertCanonicalRequestRecords(records: readonly JsonRecord[], events: readonly FoundationLedgerEvent[]): void {
-  const canonicalResults = new Map<string, JsonRecord>();
+interface CanonicalRequestIndex {
+  readonly result: (requestId: string) => JsonRecord | undefined;
+  readonly start: (requestId: string) => Extract<FoundationLedgerEvent, { type: "request_retry_started" }> | undefined;
+  readonly schedule: (scheduleId: string) => Extract<FoundationLedgerEvent, { type: "request_retry_scheduled" }> | undefined;
+}
+
+function buildCanonicalRequestIndex(
+  events: readonly FoundationLedgerEvent[],
+  diagnostics?: RequestIndexDiagnostics,
+): CanonicalRequestIndex {
+  const results = new Map<string, JsonRecord>();
+  const starts = new Map<string, Extract<FoundationLedgerEvent, { type: "request_retry_started" }>>();
+  const schedules = new Map<string, Extract<FoundationLedgerEvent, { type: "request_retry_scheduled" }>>();
   for (const event of events) {
-    if (event.type !== "request_result_recorded") continue;
-    const id = event.payload.request.requestId;
-    if (canonicalResults.has(id)) fail("transaction.invalid-reference");
-    canonicalResults.set(id, event.payload.request as unknown as JsonRecord);
+    if (diagnostics) diagnostics.eventVisits += 1;
+    if (event.type === "request_result_recorded") {
+      if (results.has(event.payload.request.requestId)) fail("transaction.invalid-reference");
+      results.set(event.payload.request.requestId, event.payload.request as unknown as JsonRecord);
+    } else if (event.type === "request_retry_started") {
+      if (starts.has(event.payload.requestId)) fail("transaction.invalid-reference");
+      starts.set(event.payload.requestId, event);
+    } else if (event.type === "request_retry_scheduled") {
+      if (schedules.has(event.payload.scheduleId)) fail("transaction.invalid-reference");
+      schedules.set(event.payload.scheduleId, event);
+    }
   }
+  return Object.freeze({
+    result: (requestId: string) => results.get(requestId),
+    start: (requestId: string) => starts.get(requestId),
+    schedule: (scheduleId: string) => schedules.get(scheduleId),
+  });
+}
+
+function assertCanonicalRequestRecords(
+  records: readonly JsonRecord[],
+  index: CanonicalRequestIndex,
+  diagnostics?: RequestIndexDiagnostics,
+): void {
   for (const record of records) {
-    const canonical = canonicalResults.get(String(record.requestId));
+    if (diagnostics) diagnostics.requestRecordsValidated += 1;
+    const requestId = String(record.requestId);
+    const canonical = index.result(requestId);
     if (!canonical || canonicalJson(canonical) !== canonicalJson(record)) fail("transaction.invalid-reference");
+    if (Number(record.physicalAttemptOrdinal) > 1) {
+      const start = index.start(requestId);
+      const schedule = start ? index.schedule(start.payload.scheduleId) : undefined;
+      if (!start || !schedule || start.payload.scheduledFromLedgerSeq !== schedule.seq
+        || start.payload.attemptId !== record.attemptId
+        || start.payload.physicalAttemptOrdinal !== record.physicalAttemptOrdinal
+        || schedule.payload.failedRequestId !== record.retryOfRequestId
+        || schedule.payload.nextPhysicalAttemptOrdinal !== record.physicalAttemptOrdinal) fail("transaction.invalid-reference");
+      const predecessor = index.result(schedule.payload.failedRequestId);
+      if (!predecessor || predecessor.status !== "retryable-error") fail("transaction.invalid-reference");
+    }
   }
 }
 

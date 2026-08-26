@@ -179,6 +179,17 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
     return attempt!;
   };
   const reserved = (kind: string, id: string) => reservations.get(kind)?.has(id) === true;
+  const requireLiveRequestTarget = (event: FoundationLedgerEvent, index: number, attemptId: string): MutableAttempt => {
+    const attempt = requireAttempt(event, index, attemptId);
+    if (attempt.phase !== "started" || attempt.failureState !== null) fail(event, index, "reducer.request-target-state");
+    const task = tasks.get(attempt.record.taskId)?.record;
+    if (!task || task.state !== "running" || task.attemptIds.filter((id) => id === attemptId).length !== 1
+      || attemptTaskOwners.get(attemptId) !== task.taskId) fail(event, index, "reducer.request-target-task");
+    if (attempt.record.executionEpoch !== currentEpoch || cancelledEpochs.has(attempt.record.executionEpoch)) {
+      fail(event, index, "reducer.request-target-epoch");
+    }
+    return attempt;
+  };
   const recordJournal = (event: FoundationLedgerEvent & { payload: { attemptId: string; journalLocalSeq: number; journalEntrySha256: string } }, index: number): void => {
     const key = `${event.payload.attemptId}\0${event.payload.journalLocalSeq}`;
     const hashKey = `${event.payload.attemptId}\0${event.payload.journalEntrySha256}`;
@@ -509,11 +520,12 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
         recordJournal(event, index);
         const intent = event.payload.intent;
         if (intent.attemptId !== event.payload.attemptId || intent.executionEpoch !== attempt.record.executionEpoch) fail(event, index, "reducer.request-owner");
-        if (cancelledEpochs.has(intent.executionEpoch)) fail(event, index, "reducer.request-cancelled");
         if (!reserved("request", intent.requestId) || requests.has(intent.requestId)) fail(event, index, "reducer.request-identity");
         if (intent.physicalAttemptOrdinal === 1) {
+          if (cancelledEpochs.has(intent.executionEpoch)) fail(event, index, "reducer.request-cancelled");
           if (intent.retryOfRequestId !== null || requestStarts.has(intent.requestId)) fail(event, index, "reducer.request-backlink");
         } else {
+          requireLiveRequestTarget(event, index, event.payload.attemptId);
           const started = requestStarts.get(intent.requestId);
           const predecessor = intent.retryOfRequestId === null ? undefined : requests.get(intent.retryOfRequestId);
           if (!started || !predecessor || started.attemptId !== intent.attemptId || started.ordinal !== intent.physicalAttemptOrdinal
@@ -577,7 +589,7 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
       }
       case "request_retry_started": {
         if (resumeTransitionPending) fail(event, index, "reducer.resume-transition-pending");
-        const attempt = requireAttempt(event, index, event.payload.attemptId);
+        const attempt = requireLiveRequestTarget(event, index, event.payload.attemptId);
         recordJournal(event, index);
         if (scheduleClasses.get(event.payload.scheduleId) !== "request") fail(event, index, "reducer.schedule-namespace");
         const schedule = requestSchedules.get(event.payload.scheduleId);

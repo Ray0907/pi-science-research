@@ -1123,6 +1123,39 @@ describe("read-only transaction race resistance", () => {
     expect(await reconcileCanonicalTransactions(runRoot, baseEvents())).toEqual([{ kind: "finish-transaction", transactionId: TX }]);
   });
 
+  test("indexes request ledger links once for many committed transactions without mutating shared input", async () => {
+    const runRoot = await root();
+    eventSeq = 1;
+    const events: FoundationLedgerEvent[] = [event("run_created", { run: runSnapshot() })];
+    const attemptIds: string[] = [];
+    const count = 12;
+    for (let index = 1; index <= count; index += 1) {
+      const suffix = String(index).padStart(16, "0");
+      const attemptId = `attempt-${suffix}` as typeof ATTEMPT;
+      const transactionId = `tx-${suffix}` as typeof TX;
+      attemptIds.push(attemptId);
+      events.push(event("identity_reserved", { kind: "attempt", id: attemptId, origin: "parent-generated" }));
+      events.push(event("task_upserted", { task: { ...task(), revision: index, attemptIds: [...attemptIds] } }));
+      events.push(event("identity_reserved", { kind: "transaction", id: transactionId, origin: "parent-generated" }));
+      const attemptRecord = attempt({ attemptId, logicalOperationId: `operation-${suffix}`, attemptEnvelopeSha256: suffix.padEnd(64, "a") });
+      events.push(event("dispatch_intent", { attempt: attemptRecord }));
+      events.push(event("dispatch_started", { attemptId, pid: null, requestCorrelation: null }));
+      const result = event("result_recorded", { attemptId, resultSha256: HASH, manifestSha256: null, transactionId });
+      events.push(result);
+      const value = input({ schemaVersion: 1, transactionId, attemptId, sourceResultSeq: result.seq, sources: [], claims: [], evidence: [], verifications: [], requests: [], calculations: [] });
+      await prepareTransaction(runRoot, value);
+      const ref = await commitTransaction(runRoot, transactionId);
+      events.push(event("records_committed", { transactionId, sourceResultSeq: result.seq, transactionManifestPath: ref.relativePath,
+        transactionManifestSha256: ref.sha256, sourceRefs: [], claimRefs: [], evidenceRefs: [], verificationRefs: [], requestIds: [], calculationIds: [] }));
+      events.push(event("attempt_committed", { attemptId, transactionId, taskId: TASK, sourceResultSeq: result.seq }));
+    }
+    const frozen = JSON.stringify(events);
+    const diagnostics = { eventVisits: 0, requestRecordsValidated: 0 };
+    await expect(inspectCanonicalTransactionsReadOnly(runRoot, events, { requestIndexDiagnostics: diagnostics })).resolves.toMatchObject({ committedCount: count });
+    expect(diagnostics).toEqual({ eventVisits: events.length, requestRecordsValidated: 0 });
+    expect(JSON.stringify(events)).toBe(frozen);
+  });
+
   test.each(["transaction-directory", "transaction-file"])("closes a newly opened %s handle when its first validation throws", async (targetKind) => {
     const runRoot = await root();
     await committed(runRoot);

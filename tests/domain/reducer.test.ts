@@ -935,7 +935,75 @@ function appendRequestSchedule(events: Events): void {
     logicalRequestId: "request-series", failedRequestId: REQUEST_1, nextPhysicalAttemptOrdinal: 2, notBeforeAt: LATER, delayMs: 1, reasonClass: "transient" });
 }
 
+function requestStartReadyEvents(): Events {
+  const events = requestScheduleReadyEvents();
+  appendRequestSchedule(events);
+  events.add("identity_reserved", { kind: "attempt", id: ATTEMPT_2, origin: "parent-generated" });
+  events.add("dispatch_intent", { attempt: attemptRecord({ attemptId: ATTEMPT_2, logicalOperationId: "replacement-child", attemptEnvelopeSha256: "d".repeat(64) }) });
+  events.started(ATTEMPT_2);
+  events.add("identity_reserved", { kind: "request", id: REQUEST_2, origin: "child-import" });
+  return events;
+}
+
+function appendRequestStart(events: Events): FoundationLedgerEvent {
+  const schedule = events.values.find((event) => event.type === "request_retry_scheduled" && event.payload.scheduleId === REQUEST_RETRY)!;
+  return events.add("request_retry_started", { scheduleId: REQUEST_RETRY, attemptId: ATTEMPT_2, journalLocalSeq: 1, journalEntrySha256: "d".repeat(64),
+    logicalRequestId: "request-series", requestId: REQUEST_2, physicalAttemptOrdinal: 2, scheduledFromLedgerSeq: schedule.seq });
+}
+
 describe("remaining cross-module ledger invariants", () => {
+  test("requires a live uncommitted request retry target", () => {
+    for (const state of ["cancelled", "terminal-failed"] as const) {
+      const events = requestStartReadyEvents();
+      events.add("attempt_failed", { attemptId: ATTEMPT_2, state, errorClass: "terminal", message: "safe" });
+      appendRequestStart(events);
+      expectCorruption(events.values, "reducer.request-target-state");
+    }
+
+    const committed = requestStartReadyEvents();
+    const result = committed.result(ATTEMPT_2, "tx-0000000000000002"); committed.records(ATTEMPT_2, "tx-0000000000000002", result.seq);
+    appendRequestStart(committed);
+    expectCorruption(committed.values, "reducer.request-target-state");
+
+    const nonRunning = requestStartReadyEvents();
+    nonRunning.add("task_upserted", { task: taskRecord({ revision: 3, state: "cancelled", attemptIds: [ATTEMPT_1, ATTEMPT_2] }) });
+    appendRequestStart(nonRunning);
+    expectCorruption(nonRunning.values, "reducer.request-target-task");
+
+    const superseded = requestStartReadyEvents();
+    superseded.add("attempt_failed", { attemptId: ATTEMPT_2, state: "retryable-failed", errorClass: "retry", message: "safe" });
+    superseded.add("identity_reserved", { kind: "retry-schedule", id: RETRY_2, origin: "parent-generated" });
+    const retry = superseded.add("retry_scheduled", { scheduleId: RETRY_2, logicalOperationId: "replacement-child", failedAttemptId: ATTEMPT_2,
+      nextAttemptOrdinal: 2, notBeforeAt: LATER, delayMs: 1, reasonClass: "retry" });
+    superseded.add("identity_reserved", { kind: "attempt", id: ATTEMPT_3, origin: "parent-generated" });
+    superseded.add("retry_started", { scheduleId: RETRY_2, logicalOperationId: "replacement-child", attemptId: ATTEMPT_3, attemptOrdinal: 2, scheduledFromSeq: retry.seq });
+    superseded.add("dispatch_intent", { attempt: attemptRecord({ attemptId: ATTEMPT_3, logicalOperationId: "replacement-child", attemptOrdinal: 2,
+      retryOfAttemptId: ATTEMPT_2, attemptEnvelopeSha256: "e".repeat(64) }) });
+    superseded.add("attempt_failed", { attemptId: ATTEMPT_2, state: "superseded", errorClass: "superseded", message: "safe" });
+    appendRequestStart(superseded);
+    expectCorruption(superseded.values, "reducer.request-target-state");
+
+    const wrongEpoch = requestStartReadyEvents();
+    const cancel = wrongEpoch.add("cancel_requested", { executionEpoch: 0, reason: "user-pause" });
+    wrongEpoch.resume(0, 1, cancel.seq);
+    appendRequestStart(wrongEpoch);
+    expectCorruption(wrongEpoch.values, "reducer.request-target-epoch");
+  });
+
+  test("rechecks retry target liveness between start and intent", () => {
+    const events = requestStartReadyEvents(); appendRequestStart(events);
+    events.add("attempt_failed", { attemptId: ATTEMPT_2, state: "terminal-failed", errorClass: "terminal", message: "safe" });
+    events.add("request_intent_recorded", { attemptId: ATTEMPT_2, journalLocalSeq: 2, journalEntrySha256: "e".repeat(64),
+      intent: requestIntent({ requestId: REQUEST_2, attemptId: ATTEMPT_2, physicalAttemptOrdinal: 2, retryOfRequestId: REQUEST_1 }) });
+    expectCorruption(events.values, "reducer.request-target-state");
+
+    const cancelled = requestStartReadyEvents(); appendRequestStart(cancelled);
+    cancelled.add("cancel_requested", { executionEpoch: 0, reason: "user-pause" });
+    cancelled.add("request_intent_recorded", { attemptId: ATTEMPT_2, journalLocalSeq: 2, journalEntrySha256: "e".repeat(64),
+      intent: requestIntent({ requestId: REQUEST_2, attemptId: ATTEMPT_2, physicalAttemptOrdinal: 2, retryOfRequestId: REQUEST_1 }) });
+    expectCorruption(cancelled.values, "reducer.request-target-epoch");
+  });
+
   test("rejects request scheduling after owning attempt terminal states or commit", () => {
     for (const state of ["cancelled", "terminal-failed"] as const) {
       const events = requestScheduleReadyEvents();
@@ -1129,6 +1197,7 @@ describe("cross-module ledger invariants", () => {
     const schedule = events.add("request_retry_scheduled", { scheduleId: REQUEST_RETRY, attemptId: ATTEMPT_1, journalLocalSeq: 3, journalEntrySha256: "c".repeat(64), logicalRequestId: "request-series", failedRequestId: REQUEST_1, nextPhysicalAttemptOrdinal: 2, notBeforeAt: LATER, delayMs: 1, reasonClass: "transient" });
     events.add("identity_reserved", { kind: "attempt", id: ATTEMPT_2, origin: "parent-generated" });
     events.add("dispatch_intent", { attempt: attemptRecord({ attemptId: ATTEMPT_2, logicalOperationId: "replacement-child", attemptEnvelopeSha256: "d".repeat(64) }) });
+    events.started(ATTEMPT_2);
     events.add("identity_reserved", { kind: "request", id: REQUEST_2, origin: "child-import" });
     events.add("request_retry_started", { scheduleId: REQUEST_RETRY, attemptId: ATTEMPT_2, journalLocalSeq: 1, journalEntrySha256: "d".repeat(64), logicalRequestId: "request-series", requestId: REQUEST_2, physicalAttemptOrdinal: 2, scheduledFromLedgerSeq: schedule.seq });
     const retryIntent = requestIntent({ requestId: REQUEST_2, attemptId: ATTEMPT_2, physicalAttemptOrdinal: 2, retryOfRequestId: REQUEST_1 });
