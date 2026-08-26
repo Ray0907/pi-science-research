@@ -28,7 +28,6 @@ export type SourceIdentityErrorCode =
   | "source.input-too-large"
   | "source.duplicate-revision"
   | "source.revision-gap"
-  | "source.duplicate-request"
   | "source.invalid-provenance"
   | "source.invalid-lineage"
   | "source.url-policy-invalid"
@@ -104,7 +103,8 @@ const PROVENANCE_FIELDS = new Set([
 const ACCESS_ORDER = ["metadata-only", "abstract-only", "partial-text", "full-text"] as const;
 const indexState = new WeakMap<object, ProvenanceState>();
 const validatedSourceRecordsState = new WeakMap<readonly SourceRecord[], ProvenanceState>();
-const snapshotSourceProvenanceState = new WeakMap<object, SourceProvenance>();
+const snapshotSourceProvenanceState = new WeakMap<object, Readonly<{ index: RequestProvenanceIndex; provenance: SourceProvenance }>>();
+const evidenceSnapshotDuplicateRequestErrors = new WeakSet<object>();
 /** @internal Read-only package lookup; never exported from the package root. */
 export interface ValidatedSourceRecordsInternal {
   readonly sources: readonly SourceRecord[];
@@ -196,6 +196,11 @@ export function sourceIdentityKeys(source: SourceRecord, options?: SourceIdentit
   return Object.freeze(keys);
 }
 
+/** Package-internal option-only validation for Task 4 before any record access. */
+export function validateSourceIdentityOptionsForEvidenceSnapshotInternal(options: SourceIdentityOptions): void {
+  normalizeOptions(options, 200_000, 2_000_000);
+}
+
 export function buildRequestProvenanceIndex(
   sources: readonly SourceRecord[], requests: readonly RequestRecord[], options?: SourceIdentityOptions,
   diagnostics?: RequestProvenanceDiagnostics,
@@ -215,16 +220,17 @@ export function buildRequestProvenanceIndexForEvidenceSnapshotInternal(
   diagnostics?: RequestProvenanceDiagnostics,
   beforeSemantic?: (prepared: PreparedProvenanceRecordsForEvidenceSnapshotInternal) => void,
 ): RequestProvenanceIndex {
-  return buildRequestProvenanceIndexInternal(sources, requests, options, diagnostics, "sources", 200_000, beforeSemantic);
+  return buildRequestProvenanceIndexInternal(sources, requests, options, diagnostics, "sources", 200_000, 2_000_000, beforeSemantic);
 }
 
 function buildRequestProvenanceIndexInternal(
   sources: readonly SourceRecord[], requests: readonly RequestRecord[], options: SourceIdentityOptions | undefined,
   diagnostics: RequestProvenanceDiagnostics | undefined, aggregateShape: "source" | "sources",
   maxSourcesHard = 100_000,
+  maxProvenanceStepsHard = 1_000_000,
   beforeSemantic?: (prepared: PreparedProvenanceRecordsForEvidenceSnapshotInternal) => void,
 ): RequestProvenanceIndex {
-  const normalized = normalizeOptions(options, maxSourcesHard);
+  const normalized = normalizeOptions(options, maxSourcesHard, maxProvenanceStepsHard);
   validateDiagnostics(diagnostics);
   const sourceInputs = safeArray(sources, normalized.maxSources, "source.too-many-records");
   const requestInputs = safeArray(requests, normalized.maxRequests, "source.too-many-records");
@@ -277,7 +283,10 @@ function buildRequestProvenanceIndexInternal(
 
   const requestsById = new Map<string, IndexedRequest>();
   for (const request of indexedRequests) {
-    if (requestsById.has(request.record.requestId)) fail(beforeSemantic ? "source.duplicate-request" : "source.invalid-input");
+    if (requestsById.has(request.record.requestId)) {
+      if (beforeSemantic) failEvidenceSnapshotDuplicateRequest();
+      fail("source.invalid-input");
+    }
     requestsById.set(request.record.requestId, request);
   }
   const sourceByHash = new Map<string, SourceProvenance>();
@@ -286,7 +295,6 @@ function buildRequestProvenanceIndexInternal(
     const provenance = provenanceForSource(source.record, requestsById, normalized, diagnostics);
     witnessCount = checkedAdd(witnessCount, provenance.witnesses.length);
     sourceByHash.set(source.hash, provenance);
-    snapshotSourceProvenanceState.set(source.record, provenance);
   }
   const state: ProvenanceState = Object.freeze({
     sources: Object.freeze(orderedSources.map(({ record }) => record)),
@@ -312,6 +320,10 @@ function buildRequestProvenanceIndexInternal(
   });
   indexState.set(view, state);
   validatedSourceRecordsState.set(state.sources, state);
+  for (const source of orderedSources) {
+    const provenance = sourceByHash.get(source.hash)!;
+    snapshotSourceProvenanceState.set(source.record, Object.freeze({ index: view, provenance }));
+  }
   return view;
 }
 
@@ -349,11 +361,18 @@ export function getValidatedSourceRecordsInternal(
   });
 }
 
+/** Package-internal closed translation guard for Task 4 duplicate requests. */
+export function isEvidenceSnapshotDuplicateRequestError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && evidenceSnapshotDuplicateRequestErrors.has(error);
+}
+
 /** Package-internal cached lookup for exact Task 2-issued source objects. */
 export function validateSourceCanonicalUrlProvenanceFromSnapshotInternal(source: SourceRecord, index: RequestProvenanceIndex): SourceUrlProvenance {
   if (!indexState.has(index as object)) fail("source.provenance-index-mismatch");
-  const provenance = snapshotSourceProvenanceState.get(source as object);
-  if (!provenance || provenance.witnesses.length === 0) fail(provenance?.failure ?? "source.provenance-index-mismatch");
+  const issued = snapshotSourceProvenanceState.get(source as object);
+  if (!issued || issued.index !== index) fail("source.provenance-index-mismatch");
+  const provenance = issued.provenance;
+  if (provenance.witnesses.length === 0) fail(provenance.failure ?? "source.provenance-index-mismatch");
   return provenance.witnesses[0]!.value;
 }
 
@@ -865,8 +884,8 @@ function strongKeys(identifiers: SourceRecord["identifiers"]): string[] {
   if (identifiers.pmcid !== null) keys.push(`pmcid:${identifiers.pmcid}`);
   return keys;
 }
-function normalizeOptions(input?: SourceIdentityOptions, maxSourcesHard = 100_000): NormalizedOptions {
-  if (input === undefined) return finishOptions({}, undefined, maxSourcesHard);
+function normalizeOptions(input?: SourceIdentityOptions, maxSourcesHard = 100_000, maxProvenanceStepsHard = 1_000_000): NormalizedOptions {
+  if (input === undefined) return finishOptions({}, undefined, maxSourcesHard, maxProvenanceStepsHard);
   if (utilTypes.isProxy(input)) fail("source.invalid-options");
   let snapshot: Record<string, unknown>;
   let originalPolicy: SourceUrlPolicyContext | undefined;
@@ -877,12 +896,15 @@ function normalizeOptions(input?: SourceIdentityOptions, maxSourcesHard = 100_00
     snapshot = JSON.parse(canonicalJson(input)) as Record<string, unknown>;
   } catch { return fail("source.invalid-options"); }
   if (!isPlain(snapshot) || Object.keys(snapshot).some((key) => !OPTION_KEYS.includes(key))) fail("source.invalid-options");
-  return finishOptions(snapshot, originalPolicy, maxSourcesHard);
+  return finishOptions(snapshot, originalPolicy, maxSourcesHard, maxProvenanceStepsHard);
 }
-function finishOptions(snapshot: Record<string, unknown>, originalPolicy: SourceUrlPolicyContext | undefined, maxSourcesHard = 100_000): NormalizedOptions {
+function finishOptions(
+  snapshot: Record<string, unknown>, originalPolicy: SourceUrlPolicyContext | undefined,
+  maxSourcesHard = 100_000, maxProvenanceStepsHard = 1_000_000,
+): NormalizedOptions {
   const values: Record<string, number> = {};
   for (const [key, [fallback, configuredHard]] of Object.entries(LIMITS)) {
-    const hard = key === "maxSources" ? maxSourcesHard : configuredHard;
+    const hard = key === "maxSources" ? maxSourcesHard : key === "maxProvenanceSteps" ? maxProvenanceStepsHard : configuredHard;
     const value = snapshot[key] ?? fallback;
     if (!Number.isSafeInteger(value) || (value as number) < 1 || (value as number) > hard) fail("source.invalid-options");
     values[key] = value as number;
@@ -1090,6 +1112,9 @@ function translateIdentifierError(error: ScholarlyIdentifierError): never {
   if (error.code === "identifier.record-too-large") fail("source.record-too-large");
   if (error.code.startsWith("url.")) fail("source.url-policy-invalid");
   return fail("source.invalid-input");
+}
+function failEvidenceSnapshotDuplicateRequest(): never {
+  const error = new SourceIdentityError("source.invalid-input"); evidenceSnapshotDuplicateRequestErrors.add(error); throw error;
 }
 function fail(code: SourceIdentityErrorCode): never { throw new SourceIdentityError(code); }
 

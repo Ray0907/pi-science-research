@@ -19,6 +19,8 @@ const AT = "2026-08-25T12:00:00.000Z";
 const HASH = "a".repeat(64);
 const ATTEMPT_A = "attempt-0000000000000001";
 const ATTEMPT_B = "attempt-0000000000000002";
+const ATTEMPT_C = "attempt-0000000000000003";
+const ATTEMPT_D = "attempt-0000000000000004";
 
 function source(id = "src-admission.0001", overrides: Partial<SourceRecord> = {}): SourceRecord {
   const doi = `10.1234/${id.slice(4)}`;
@@ -336,16 +338,65 @@ describe("evidence admission", () => {
     const resolved = source("src-admission.0003");
     const unverified = { ...independent, evidenceId: "ev-0000000000000003", sourceRef: refForSource(resolved), verificationStatus: "unverified" as const };
     const v2 = verification(undefined, { checkedEvidence: [refForEvidence(unverified)], independentEvidenceIds: [unverified.evidenceId] });
-    expect(evaluate({ ...set(), sources: [source(), resolved], evidence: [evidence(), unverified], verifications: [v2] }).independentVerificationCredit).toBe(0);
+    expect(evaluate({ ...set(), sources: [source(), resolved], evidence: [evidence(), unverified], verifications: [v2] }).independentVerificationCredit).toBe(1);
     const current = { ...independent, sourceRef: refForSource(resolved) }; const later = { ...current, revision: 2 };
     const stale = verification(undefined, { checkedEvidence: [refForEvidence(current)], independentEvidenceIds: [current.evidenceId] });
-    expect(evaluate({ ...set(), sources: [source(), resolved], evidence: [evidence(), current, later], verifications: [stale] }).independentVerificationCredit).toBe(0);
+    expect(evaluate({ ...set(), sources: [source(), resolved], evidence: [evidence(), current, later], verifications: [stale] }).independentVerificationCredit).toBe(1);
+    for (const verificationStatus of ["rejected", "disputed"] as const) {
+      const ineligible = { ...current, evidenceId: `ev-00000000000000${verificationStatus === "rejected" ? "04" : "05"}`, verificationStatus };
+      const rejected = verification(undefined, { checkedEvidence: [refForEvidence(ineligible)], independentEvidenceIds: [ineligible.evidenceId] });
+      expect(evaluate({ ...set(), sources: [source(), resolved], evidence: [evidence(), ineligible], verifications: [rejected] }).independentVerificationCredit).toBe(0);
+    }
   });
   test("requires a distinct conflict verifier and complete reconciled correction", () => {
-    const contradiction = evidence("ev-0000000000000002", { stance: "contradicting", verificationStatus: "rejected" });
-    const target = claim(undefined, { evidenceRefs: [refForEvidence(evidence()), refForEvidence(contradiction)] });
-    const sameAttempt = verification(undefined, { attemptId: ATTEMPT_A, checkedEvidence: target.evidenceRefs, corrections: [{ claimId: target.claimId, description: "resolved" }] });
-    expect(evaluate({ ...set(), claims: [target], evidence: [evidence(), contradiction], verifications: [sameAttempt] }).blockers).toContain("claim.unresolved-conflict");
+    const supporting = evidence(undefined, { recordedByAttemptId: ATTEMPT_C });
+    const contradiction = evidence("ev-0000000000000002", { stance: "contradicting", verificationStatus: "rejected", recordedByAttemptId: ATTEMPT_D });
+    const target = claim(undefined, { evidenceRefs: [refForEvidence(supporting), refForEvidence(contradiction)] });
+    for (const attemptId of [ATTEMPT_A, ATTEMPT_C, ATTEMPT_D]) {
+      const colliding = verification(undefined, { attemptId, checkedEvidence: target.evidenceRefs, corrections: [{ claimId: target.claimId, description: "resolved" }] });
+      expect(evaluate({ ...set(), claims: [target], evidence: [supporting, contradiction], verifications: [colliding] }).blockers).toContain("claim.unresolved-conflict");
+    }
+  });
+  test("treats a conflicting claim supporting side as contradictory and requires both exact sides", () => {
+    const targetEvidence = evidence(undefined, { recordedByAttemptId: ATTEMPT_C });
+    const otherEvidence = evidence("ev-0000000000000002", {
+      claimRef: { claimId: "claim-0000000000000002", revision: 1 }, stance: "supporting",
+      recordedByAttemptId: ATTEMPT_D, verificationStatus: "rejected",
+    });
+    const target = claim(undefined, { evidenceRefs: [refForEvidence(targetEvidence)], conflictClaimIds: ["claim-0000000000000002"] });
+    const other = claim("claim-0000000000000002", { status: "rejected", evidenceRefs: [refForEvidence(otherEvidence)], conflictClaimIds: [target.claimId], createdByAttemptId: ATTEMPT_D });
+    const unresolved = evaluate({ ...set(), claims: [target, other], evidence: [targetEvidence, otherEvidence] });
+    expect(unresolved.contradictingEvidenceRefs).toEqual([refForEvidence(otherEvidence)]);
+    expect(unresolved.blockers).toContain("claim.unresolved-conflict");
+    const accepted = verification(undefined, {
+      checkedClaims: [refFor(target), refFor(other)], checkedEvidence: [refForEvidence(targetEvidence), refForEvidence(otherEvidence)],
+      corrections: [{ claimId: target.claimId, description: "supported" }, { claimId: other.claimId, description: "rejected" }],
+    });
+    expect(evaluate({ ...set(), claims: [target, other], evidence: [targetEvidence, otherEvidence], verifications: [accepted] }).blockers).not.toContain("claim.unresolved-conflict");
+    expect(evaluate({ ...set(), claims: [target, other], evidence: [targetEvidence, otherEvidence], verifications: [{ ...accepted, checkedClaims: [refFor(target)] }] }).blockers).toContain("claim.unresolved-conflict");
+  });
+  test("deduplicates exact target evidence references deterministically", () => {
+    const first = evidence(); const second = evidence("ev-0000000000000002");
+    const a = refForEvidence(first); const b = refForEvidence(second);
+    for (const evidenceRefs of [[b, a, { ...a }], [a, b, { ...b }]]) {
+      const result = evaluate({ ...set(), claims: [claim(undefined, { evidenceRefs })], evidence: [second, first] });
+      expect(result.supportingEvidenceRefs).toEqual([a, b]);
+      expect(result.retrievedComponentCount).toBe(1);
+    }
+  });
+  test("counts metadata components from selected exact source revisions only", () => {
+    const a1 = source("src-admission.exacta", { lineage: { studyId: "study-a", cohortIds: [], datasetIds: [], relatedSourceIds: [], relationTypes: [] } });
+    const a2 = { ...a1, revision: 2, lineage: { ...a1.lineage, cohortIds: ["cohort-later"] } };
+    const b = source("src-admission.exactb", { lineage: { studyId: "study-b", cohortIds: ["cohort-later"], datasetIds: [], relatedSourceIds: [], relationTypes: [] } });
+    const ea1 = evidence("ev-0000000000000001", { sourceRef: refForSource(a1) });
+    const eb1 = evidence("ev-0000000000000002", { sourceRef: refForSource(b) });
+    const c1 = claim(undefined, { evidenceRefs: [refForEvidence(ea1), refForEvidence(eb1)] });
+    const ea2 = { ...ea1, revision: 2, claimRef: { claimId: c1.claimId, revision: 2 }, sourceRef: refForSource(a2) };
+    const eb2 = { ...eb1, revision: 2, claimRef: { claimId: c1.claimId, revision: 2 } };
+    const c2 = { ...c1, revision: 2, evidenceRefs: [refForEvidence(ea2), refForEvidence(eb2)] };
+    const records = { ...set(), sources: [a1, a2, b], claims: [c1, c2], evidence: [ea1, ea2, eb1, eb2] };
+    expect(evaluate(records, refFor(c1)).retrievedComponentCount).toBe(2);
+    expect(evaluate(records, refFor(c2)).retrievedComponentCount).toBe(1);
   });
   test("assigns deterministic lineage keys across study cohort dataset components and input permutations", () => {
     const s1 = source();
@@ -370,6 +421,10 @@ describe("evidence admission", () => {
     const fallback = derived("documented method", unsafe.calculationId, { sourceRef: refForSource(source()) });
     const target = claim(undefined, { kind: "derived-result", evidenceRefs: [refForEvidence(fallback)] });
     expect(evaluate({ ...set(), claims: [target], evidence: [fallback], calculations: [unsafe] }).derivedComponentCount).toBe(1);
+    const permissive = calculation(undefined, {
+      inputs: [{ relativePath: "in\0put", mediaType: "", decodedBytes: 0, sha256: HASH }],
+    });
+    expect(evaluateDerivedCalculation(permissive).derivedComponentCount).toBe(1);
   });
   test("validates the complete prospective limits object before touching the record", () => {
     const hard = {

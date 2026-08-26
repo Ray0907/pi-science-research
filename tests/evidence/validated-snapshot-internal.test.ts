@@ -75,8 +75,11 @@ describe("validated evidence snapshot internals", () => {
     for (const name of [
       "getValidatedSnapshotIndexes", "buildBoundedValidatedEvidenceSnapshotInternal",
       "prepareProspectiveEvidenceCanonicalInternal", "validatePreparedEvidenceSemanticsInternal",
-      "getLineageDependencyComponentKey", "buildRequestProvenanceIndexForEvidenceSnapshotInternal",
-      "validateSourceCanonicalUrlProvenanceFromSnapshotInternal", "validatePreparedSourceIdentityFieldsInternal",
+      "getLineageDependencyComponentKey", "getLineageRelationComponentKeyInternal",
+      "getLineageDependencyComponentCountInternal", "buildLineageGraphFromValidatedSourcesForEvidenceSnapshotInternal",
+      "buildRequestProvenanceIndexForEvidenceSnapshotInternal", "isEvidenceSnapshotDuplicateRequestError",
+      "validateSourceCanonicalUrlProvenanceFromSnapshotInternal", "validateSourceIdentityOptionsForEvidenceSnapshotInternal",
+      "validatePreparedSourceIdentityFieldsInternal",
     ]) expect(name in rootExports).toBe(false);
   });
   test("rejects structurally identical forged snapshot with evidence.snapshot-invalid", () => {
@@ -154,9 +157,40 @@ describe("validated evidence snapshot internals", () => {
       expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: values })))).toBe("evidence.ambiguous-source-identity");
     const bridgeA = source({ sourceId: "src-internal.bridgea", identifiers: { doi: "10.1234/bridge-a", pmid: null, pmcid: null }, canonicalUrl: "https://doi.org/10.1234/bridge-a" });
     const bridgeB = source({ sourceId: "src-internal.bridgeb", identifiers: { doi: "10.1234/bridge-a", pmid: "123456", pmcid: null }, canonicalUrl: "https://doi.org/10.1234/bridge-a" });
-    const bridgeC = source({ sourceId: "src-internal.bridgec", identifiers: { doi: "10.1234/bridge-c", pmid: "123456", pmcid: null }, canonicalUrl: "https://doi.org/10.1234/bridge-c" });
-    for (const values of [[bridgeA, bridgeB, bridgeC], [bridgeC, bridgeA, bridgeB]])
-      expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: values })))).toBe("evidence.ambiguous-source-identity");
+    const bridgeC = source({ sourceId: "src-internal.bridgec", identifiers: { doi: null, pmid: "123456", pmcid: null }, canonicalUrl: "https://pubmed.ncbi.nlm.nih.gov/123456/" });
+    for (const values of [
+      [bridgeA, bridgeB, bridgeC], [bridgeA, bridgeC, bridgeB], [bridgeB, bridgeA, bridgeC],
+      [bridgeB, bridgeC, bridgeA], [bridgeC, bridgeA, bridgeB], [bridgeC, bridgeB, bridgeA],
+    ]) expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: values })))).toBe("evidence.ambiguous-source-identity");
+  });
+  test("preflights references and lineage components before full indexes and graphs", () => {
+    expect(buildBoundedValidatedEvidenceSnapshot(records(), { limits: { maxReferences: 3 } }).referenceCount).toBe(3);
+    const referenceVisits = diagnostics();
+    expect(code(() => buildBoundedValidatedEvidenceSnapshot(records(), { limits: { maxReferences: 2 } }, referenceVisits))).toBe("evidence.too-many-references");
+    expect(referenceVisits.revisionIndexInsertions).toBe(0);
+    expect(referenceVisits.lineageVisits).toBe(0);
+    const a = source();
+    const b = source({ sourceId: "src-internal.000002", identifiers: { doi: "10.1234/preflight-b", pmid: null, pmcid: null }, canonicalUrl: "https://doi.org/10.1234/preflight-b", lineage: { ...a.lineage, studyId: "study-b" } });
+    const componentVisits = diagnostics();
+    expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: [a, b] }), { limits: { maxLineageComponents: 1 } }, componentVisits))).toBe("evidence.too-many-records");
+    expect(componentVisits.revisionIndexInsertions).toBe(0);
+    expect(componentVisits.lineageVisits).toBe(0);
+  });
+  test("validates nested source policy before touching hostile record arrays", () => {
+    const hostile = new Proxy({}, { ownKeys() { throw new Error("SECRET-RECORDS"); }, get() { throw new Error("SECRET-RECORDS"); } });
+    const accessor: Record<string, unknown> = {};
+    Object.defineProperty(accessor, "allowHttp", { enumerable: true, get() { throw new Error("SECRET-POLICY"); } });
+    const policies = [
+      { allowHttp: true, approvedHttpHosts: ["UPPER.example"], accessPolicySha256: HASH },
+      new Proxy({}, { ownKeys() { throw new Error("SECRET-POLICY"); } }), accessor,
+    ];
+    for (const sourceUrlPolicy of policies)
+      expect(code(() => buildBoundedValidatedEvidenceSnapshot(hostile as never, { sourceUrlPolicy: sourceUrlPolicy as never }))).toBe("evidence.invalid-options");
+    for (const options of [
+      { limits: { maxReferences: 0 } }, { limits: { unknown: 1 } },
+      { view: { stableIdRevisionSelection: "wrong", verificationRevisionSelection: "latest-applicable-per-target" } },
+      { unknown: true },
+    ]) expect(code(() => buildBoundedValidatedEvidenceSnapshot(hostile as never, options as never))).toBe("evidence.invalid-options");
   });
   test("keeps the Task 4 source ceiling independent from the Task 2 public ceiling", () => {
     expect(buildBoundedValidatedEvidenceSnapshot(records(), { limits: { maxPerKind: {
@@ -168,7 +202,7 @@ describe("validated evidence snapshot internals", () => {
     const b = source({ sourceId: "src-internal.000002", identifiers: { doi: "10.1234/internal-two", pmid: null, pmcid: null }, canonicalUrl: "https://doi.org/10.1234/internal-two", lineage: { ...a.lineage } });
     expect(buildBoundedValidatedEvidenceSnapshot(records({ sources: [a, b] }), { limits: { maxLineageComponents: 1 } })).toBeDefined();
     const independent = { ...b, lineage: { ...b.lineage, studyId: "study-other" } };
-    expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: [a, independent] }), { limits: { maxLineageComponents: 1 } }))).toBe("evidence.input-too-large");
+    expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: [a, independent] }), { limits: { maxLineageComponents: 1 } }))).toBe("evidence.too-many-records");
   });
   test("rejects aggregate wrapper overflow before prospective semantic traversal", () => {
     const bad = evidence(); bad.quotes = ["", "x".repeat(500)];

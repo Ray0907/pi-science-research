@@ -11,6 +11,7 @@ import {
   sourceIdentityKeys,
   validateProspectiveSourceSemantics,
   validateSourceCanonicalUrlProvenance,
+  validateSourceCanonicalUrlProvenanceFromSnapshotInternal,
   validateSourceCanonicalUrlProvenanceOnce,
   validatedProvenanceRecordsForSnapshot,
   type RequestProvenanceDiagnostics,
@@ -337,6 +338,17 @@ describe("source identity and provenance", () => {
     }))).toBe("source.too-many-provenance-steps");
     expect(errorCode(() => buildRequestProvenanceIndex([a], [req(REQUEST_A, a.sourceId), req(REQUEST_B, a.sourceId)], { maxRequests: 1 })))
       .toBe("source.too-many-records");
+  });
+
+  test("binds cached source provenance to the exact issuing index", () => {
+    const source = src("src-indexbound.0001", { identifiers: { doi: "10.1234/indexbound", pmid: null, pmcid: null }, canonicalUrl: "https://doi.org/10.1234/indexbound" });
+    const first = buildRequestProvenanceIndex([source], []);
+    const second = buildRequestProvenanceIndex([{ ...source }], []);
+    const firstSource = validatedProvenanceRecordsForSnapshot(first).sources[0]!;
+    const secondSource = validatedProvenanceRecordsForSnapshot(second).sources[0]!;
+    expect(validateSourceCanonicalUrlProvenanceFromSnapshotInternal(firstSource, first)).toEqual({ kind: "identifier-resolver", identifierKind: "doi" });
+    expect(validateSourceCanonicalUrlProvenanceFromSnapshotInternal(secondSource, second)).toEqual({ kind: "identifier-resolver", identifierKind: "doi" });
+    expect(errorCode(() => validateSourceCanonicalUrlProvenanceFromSnapshotInternal(firstSource, second))).toBe("source.provenance-index-mismatch");
   });
 
   test("builds one immutable request provenance index in linear visits", () => {

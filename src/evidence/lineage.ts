@@ -60,7 +60,6 @@ export interface LineageGraph {
   readonly stableSourceCount: number;
   readonly nodeCount: number;
   readonly edgeCount: number;
-  readonly dependencyComponentCount: number;
 }
 
 export interface LineageOptions {
@@ -114,6 +113,8 @@ interface GraphState {
   readonly recordsByRef: ReadonlyMap<string, SourceRecord>;
   readonly componentBySourceId: ReadonlyMap<string, number>;
   readonly componentKeyBySourceId: ReadonlyMap<string, string>;
+  readonly relationComponentKeyBySourceId: ReadonlyMap<string, string>;
+  readonly dependencyComponentCount: number;
   readonly relationsByPair: ReadonlyMap<string, ReadonlySet<RelationType>>;
   readonly sourceValidation: Readonly<{
     optionsSha256: string;
@@ -135,11 +136,23 @@ export function buildLineageGraph(sources: readonly SourceRecord[], options?: Li
 
 /** Package-internal snapshot seam; deliberately excluded from the package root. */
 export function buildLineageGraphFromValidatedSources(
-  sources: readonly SourceRecord[],
-  sourceCanonicalJson: readonly string[],
-  options?: LineageOptions,
+  sources: readonly SourceRecord[], sourceCanonicalJson: readonly string[], options?: LineageOptions,
 ): LineageGraph {
-  const normalized = normalizeOptions(options);
+  return buildValidatedSourcesGraph(sources, sourceCanonicalJson, options, 1_000_000);
+}
+
+/** Package-internal Task 4 path preserving the public Task 3 edge ceiling. */
+export function buildLineageGraphFromValidatedSourcesForEvidenceSnapshotInternal(
+  sources: readonly SourceRecord[], sourceCanonicalJson: readonly string[], options?: LineageOptions,
+): LineageGraph {
+  return buildValidatedSourcesGraph(sources, sourceCanonicalJson, options, 2_000_000);
+}
+
+function buildValidatedSourcesGraph(
+  sources: readonly SourceRecord[], sourceCanonicalJson: readonly string[], options: LineageOptions | undefined,
+  maxEdgesHard: number,
+): LineageGraph {
+  const normalized = normalizeOptions(options, maxEdgesHard);
   let internal: ReturnType<typeof getValidatedSourceRecordsInternal>;
   try { internal = getValidatedSourceRecordsInternal(sources, sourceCanonicalJson); }
   catch { return fail("lineage.invalid-input"); }
@@ -168,7 +181,7 @@ export function buildLineageGraphFromValidatedSources(
   }));
 }
 
-/** Package-internal exact-ref component lookup used by admission; deliberately excluded from the package root. */
+/** Package-internal exact-ref component lookup; deliberately excluded from the package root. */
 export function getLineageDependencyComponentKey(graph: LineageGraph, ref: SourceRef): string | null {
   const state = graphState.get(graph as object);
   if (!state) fail("lineage.invalid-input");
@@ -177,6 +190,23 @@ export function getLineageDependencyComponentKey(graph: LineageGraph, ref: Sourc
   if (!record) fail("lineage.unresolved-ref");
   if (resolvedStudy(record.lineage.studyId) === null) return null;
   return state.componentKeyBySourceId.get(record.sourceId) ?? null;
+}
+
+/** Package-internal relation-only component used by exact evaluation-local admission grouping. */
+export function getLineageRelationComponentKeyInternal(graph: LineageGraph, ref: SourceRef): string {
+  const state = graphState.get(graph as object);
+  if (!state) fail("lineage.invalid-input");
+  const validated = validateRef(ref);
+  const record = state.recordsByRef.get(refKey(validated));
+  if (!record) fail("lineage.unresolved-ref");
+  return state.relationComponentKeyBySourceId.get(record.sourceId)!;
+}
+
+/** Package-internal dependency count; deliberately absent from the public LineageGraph shape. */
+export function getLineageDependencyComponentCountInternal(graph: LineageGraph): number {
+  const state = graphState.get(graph as object);
+  if (!state) fail("lineage.invalid-input");
+  return state.dependencyComponentCount;
 }
 
 export function compareSourceIndependence(
@@ -345,14 +375,21 @@ function buildPreparedGraph(
     }
   }
   const componentBySourceId = new Map<string, number>();
+  const relationSmallestByRoot = new Map<number, string>();
   const smallestByRoot = new Map<number, string>();
   sourceIds.forEach((sourceId, index) => {
-    componentBySourceId.set(sourceId, relationUnion.find(index));
+    const relationRoot = relationUnion.find(index); componentBySourceId.set(sourceId, relationRoot);
+    const relationPrior = relationSmallestByRoot.get(relationRoot);
+    if (relationPrior === undefined || sourceId < relationPrior) relationSmallestByRoot.set(relationRoot, sourceId);
     const root = dependencyUnion.find(index);
     const prior = smallestByRoot.get(root); if (prior === undefined || sourceId < prior) smallestByRoot.set(root, sourceId);
   });
   const componentKeyBySourceId = new Map<string, string>();
-  sourceIds.forEach((sourceId, index) => componentKeyBySourceId.set(sourceId, `retrieved-lineage:${smallestByRoot.get(dependencyUnion.find(index))!}`));
+  const relationComponentKeyBySourceId = new Map<string, string>();
+  sourceIds.forEach((sourceId, index) => {
+    componentKeyBySourceId.set(sourceId, `retrieved-lineage:${smallestByRoot.get(dependencyUnion.find(index))!}`);
+    relationComponentKeyBySourceId.set(sourceId, `relation:${relationSmallestByRoot.get(relationUnion.find(index))!}`);
+  });
   const dependencyComponentCount = smallestByRoot.size;
 
   const recordsByRef = new Map<string, SourceRecord>();
@@ -361,14 +398,16 @@ function buildPreparedGraph(
     recordsByRef.set(refKey(record), record);
     sourceRefs.push(Object.freeze({ sourceId: record.sourceId, revision: record.revision }));
   }
-  const state: GraphState = Object.freeze({ recordsByRef, componentBySourceId, componentKeyBySourceId, relationsByPair, sourceValidation });
+  const state: GraphState = Object.freeze({
+    recordsByRef, componentBySourceId, componentKeyBySourceId, relationComponentKeyBySourceId,
+    dependencyComponentCount, relationsByPair, sourceValidation,
+  });
   const graph = Object.freeze({
     sourceRefs: Object.freeze(sourceRefs),
     revisionCount: prepared.length,
     stableSourceCount: sourceIds.length,
     nodeCount,
     edgeCount,
-    dependencyComponentCount,
   });
   graphState.set(graph, state);
   return graph;
@@ -403,8 +442,8 @@ function validateDirectedDag(sourceIds: readonly string[], edges: readonly Stabl
   if (observedDepth > maxDepth) fail("lineage.traversal-too-deep");
 }
 
-function normalizeOptions(input?: LineageOptions): NormalizedOptions {
-  if (input === undefined) return finishOptions({});
+function normalizeOptions(input?: LineageOptions, maxEdgesHard = 1_000_000): NormalizedOptions {
+  if (input === undefined) return finishOptions({}, maxEdgesHard);
   if (utilTypes.isProxy(input)) fail("lineage.invalid-options");
   let snapshot: Record<string, unknown>;
   try {
@@ -414,12 +453,13 @@ function normalizeOptions(input?: LineageOptions): NormalizedOptions {
     snapshot = JSON.parse(canonicalJson(input)) as Record<string, unknown>;
   } catch { return fail("lineage.invalid-options"); }
   if (!isPlain(snapshot) || Object.keys(snapshot).some((key) => !OPTION_KEYS.includes(key))) fail("lineage.invalid-options");
-  return finishOptions(snapshot);
+  return finishOptions(snapshot, maxEdgesHard);
 }
 
-function finishOptions(snapshot: Record<string, unknown>): NormalizedOptions {
+function finishOptions(snapshot: Record<string, unknown>, maxEdgesHard = 1_000_000): NormalizedOptions {
   const values: Record<string, number> = {};
-  for (const [key, [fallback, hard]] of Object.entries(LIMITS)) {
+  for (const [key, [fallback, configuredHard]] of Object.entries(LIMITS)) {
+    const hard = key === "maxEdges" ? maxEdgesHard : configuredHard;
     const value = snapshot[key] ?? fallback;
     if (!Number.isSafeInteger(value) || (value as number) < 1 || (value as number) > hard) fail("lineage.invalid-options");
     values[key] = value as number;

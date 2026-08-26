@@ -7,6 +7,7 @@ import {
   buildLineageGraph,
   buildLineageGraphFromValidatedSources,
   compareSourceIndependence,
+  getLineageDependencyComponentCountInternal,
   getLineageDependencyComponentKey,
   type LineageErrorCode,
 } from "../../src/evidence/lineage.js";
@@ -399,7 +400,8 @@ describe("source lineage", () => {
     const unknown = withLineage(source("src-component.z0001"), { studyId: null });
     for (const values of [[a, b, unknown], [unknown, b, a]]) {
       const graph = buildLineageGraph(values);
-      expect(graph.dependencyComponentCount).toBe(2);
+      expect(Object.keys(graph).sort()).toEqual(["edgeCount", "nodeCount", "revisionCount", "sourceRefs", "stableSourceCount"]);
+      expect(getLineageDependencyComponentCountInternal(graph)).toBe(2);
       expect(getLineageDependencyComponentKey(graph, { sourceId: a.sourceId, revision: 1 })).toBe(`retrieved-lineage:${a.sourceId}`);
       expect(getLineageDependencyComponentKey(graph, { sourceId: b.sourceId, revision: 1 })).toBe(`retrieved-lineage:${a.sourceId}`);
       expect(getLineageDependencyComponentKey(graph, { sourceId: unknown.sourceId, revision: 1 })).toBeNull();

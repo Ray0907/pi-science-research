@@ -17,7 +17,7 @@ import { parse } from "../domain/schema.js";
 import { assertBoundedStructure, StructuralLimitError } from "../storage/bounded-structure.js";
 import type { SourceUrlPolicyContext } from "../scholarly/identifiers.js";
 import type { RequestProvenanceIndex } from "../scholarly/source-identity.js";
-import { getLineageDependencyComponentKey, LineageError } from "./lineage.js";
+import { getLineageRelationComponentKeyInternal, LineageError } from "./lineage.js";
 import {
   buildBoundedValidatedEvidenceSnapshotInternal,
   getValidatedSnapshotIndexes,
@@ -214,17 +214,21 @@ export function evaluateEvidenceRule(
   const indexes = getValidatedSnapshotIndexes(snapshot);
   const target = indexes.getExactRecord({ kind: "claims", id: evaluatedRef.claimId, revision: evaluatedRef.revision }) as ClaimRecord | undefined;
   if (!target) fail("evidence.unresolved-ref");
-  if (target.evidenceRefs.length > maxEvidence) fail("evidence.too-many-records");
+  const targetEvidenceRefs = uniqueEvidenceRefs(target.evidenceRefs);
+  if (targetEvidenceRefs.length > maxEvidence) fail("evidence.too-many-records");
   enforceCurrentReferences(target, indexes);
 
   const qualifying: QualifiedEvidence[] = [];
-  const contradictions = buildConflictClosure(target, indexes, maxEvidence);
+  const baseConflictRecorderAttempts = new Set<string>();
+  const conflictClosure = buildConflictClosure(target, indexes, maxEvidence);
+  const contradictions = conflictClosure.evidence;
   let otherwiseUnknown = false;
-  for (const ref of target.evidenceRefs) {
+  for (const ref of targetEvidenceRefs) {
     const evidenceId = String(ref.evidenceId); const evidenceRevision = Number(ref.revision);
     const record = indexes.getExactRecord({ kind: "evidence", id: evidenceId, revision: evidenceRevision }) as EvidenceRecord | undefined;
     if (!record) fail("evidence.unresolved-ref");
     if (record.claimRef.claimId !== target.claimId || record.claimRef.revision !== target.revision) continue;
+    if (["supporting", "contradicting"].includes(record.stance)) baseConflictRecorderAttempts.add(record.recordedByAttemptId);
     if (record.stance === "contradicting") continue;
     if (record.stance !== "supporting" || !["unverified", "verified"].includes(record.verificationStatus)) continue;
     const qualified = qualifyEvidence(record, indexes, target);
@@ -232,6 +236,7 @@ export function evaluateEvidenceRule(
   }
 
   const retrieved = qualifying.filter((item) => item.kind === "retrieved");
+  const retrievedContext = assignEvaluationLocalComponents(retrieved, indexes);
   const baseKeys = new Set<string>();
   for (const item of qualifying) if (item.key !== null) baseKeys.add(item.key);
   const retrievedKeys = new Set(retrieved.flatMap((item) => item.key ? [item.key] : []));
@@ -241,7 +246,7 @@ export function evaluateEvidenceRule(
   const resolvedLineageCount = checkedAdd(retrievedComponentCount, derivedComponentCount);
   const selectedVerifications = selectApplicableVerifications(snapshot.records.verifications, target);
   const independentVerificationCredit = target.evidenceRule.independentVerificationAllowed
-    ? independentCredit(selectedVerifications, target, indexes, qualifying, baseKeys)
+    ? independentCredit(selectedVerifications, target, indexes, qualifying, baseKeys, retrievedContext)
     : 0;
   const effectiveIndependentCount = checkedAdd(resolvedLineageCount, independentVerificationCredit) as number;
   const effectiveMinimum = Math.max(target.kind === "externally-verifiable-fact" ? 1 : 0, target.evidenceRule.minimumLineages);
@@ -252,7 +257,8 @@ export function evaluateEvidenceRule(
   if (target.evidenceRule.primarySourceRequired && !retrieved.some(({ evidence }) => ["primary-peer-reviewed", "primary-unreviewed"].includes(evidence.quality))) blockers.push("claim.primary-source-required");
   if (target.evidenceRule.fullTextRequired && retrieved.some(({ source }) => source?.accessLevel !== "full-text")) blockers.push("claim.full-text-required");
   if (otherwiseUnknown && resolvedLineageCount < effectiveMinimum) blockers.push("claim.unresolved-lineage");
-  if (contradictions.length > 0 && !conflictsResolved(selectedVerifications, target, qualifying, contradictions)) blockers.push("claim.unresolved-conflict");
+  if ((contradictions.length > 0 || conflictClosure.claims.length > 0)
+    && !conflictsResolved(selectedVerifications, target, qualifying, contradictions, conflictClosure.claims, baseConflictRecorderAttempts)) blockers.push("claim.unresolved-conflict");
   const independentRequired = resolvedLineageCount < effectiveMinimum && target.evidenceRule.independentVerificationAllowed && independentVerificationCredit === 0;
   if (independentRequired) blockers.push("claim.independent-verification-required");
   if (effectiveIndependentCount < effectiveMinimum && !independentRequired) blockers.push("claim.insufficient-lineages");
@@ -282,10 +288,8 @@ function qualifyEvidence(record: EvidenceRecord, indexes: ReturnType<typeof getV
     if (!source) fail("evidence.unresolved-ref");
     if (record.quotes.length > 0 && source.accessLevel !== "metadata-only"
       && !record.locators.some((locator) => locator.type !== "unknown" && asciiTrim(locator.value).length > 0)) return null;
-    let key: string | null;
-    try { key = getLineageDependencyComponentKey(indexes.lineageGraph, { sourceId: source.sourceId, revision: source.revision }); }
-    catch (error) { if (error instanceof LineageError) fail("evidence.invalid-input"); return fail("evidence.invalid-input"); }
-    return { evidence: record, kind: "retrieved", source, key, unknownLineage: key === null };
+    const unknownLineage = !source.lineage.studyId || asciiTrim(source.lineage.studyId).length === 0;
+    return { evidence: record, kind: "retrieved", source, key: null, unknownLineage };
   }
   const resultContext = record.extractedValues.some((item) => asciiTrim(item.value).length > 0 && asciiTrim(item.context).length > 0)
     || (record.quotes.some((quote) => asciiTrim(quote).length > 0) && record.locators.some((locator) => locator.type !== "unknown" && asciiTrim(locator.value).length > 0));
@@ -312,59 +316,92 @@ function validCalculation(calculation: CalculationRecord, record: EvidenceRecord
   const paths = new Set<string>();
   for (const file of [...calculation.inputs, ...calculation.sourceFiles, ...calculation.outputs]) {
     if (!Number.isSafeInteger(file.decodedBytes) || file.decodedBytes < 0
-      || !/^[a-f0-9]{64}$/u.test(file.sha256) || asciiTrim(file.mediaType).length === 0
-      || !isPortableRelativePath(file.relativePath) || paths.has(file.relativePath)) return false;
+      || !/^[a-f0-9]{64}$/u.test(file.sha256) || paths.has(file.relativePath)) return false;
     paths.add(file.relativePath);
   }
   return true;
 }
+interface RetrievedComponentContext { readonly relationKeys: ReadonlySet<string>; readonly metadataTokens: ReadonlySet<string> }
+function sourceMetadataTokens(source: SourceRecord): string[] {
+  return [`study:${source.lineage.studyId!}`, ...source.lineage.cohortIds.map((id) => `cohort:${id}`), ...source.lineage.datasetIds.map((id) => `dataset:${id}`)];
+}
+function relationComponentKey(source: SourceRecord, indexes: ReturnType<typeof getValidatedSnapshotIndexes>): string {
+  try { return getLineageRelationComponentKeyInternal(indexes.lineageGraph, { sourceId: source.sourceId, revision: source.revision }); }
+  catch (error) { if (error instanceof LineageError) fail("evidence.invalid-input"); return fail("evidence.invalid-input"); }
+}
+function assignEvaluationLocalComponents(
+  items: QualifiedEvidence[], indexes: ReturnType<typeof getValidatedSnapshotIndexes>,
+): RetrievedComponentContext {
+  const selected = items.filter((item) => item.kind === "retrieved" && !item.unknownLineage && item.source !== null);
+  const parent = selected.map((_, index) => index);
+  const find = (value: number): number => { let root = value; while (parent[root] !== root) root = parent[root]!; while (parent[value] !== value) { const next = parent[value]!; parent[value] = root; value = next; } return root; };
+  const join = (left: number, right: number): void => { const a = find(left); const b = find(right); if (a !== b) parent[b] = a; };
+  const relationOwner = new Map<string, number>(); const metadataOwner = new Map<string, number>();
+  selected.forEach((item, index) => {
+    const source = item.source!; const relation = relationComponentKey(source, indexes);
+    const relationPrior = relationOwner.get(relation); if (relationPrior === undefined) relationOwner.set(relation, index); else join(relationPrior, index);
+    for (const token of sourceMetadataTokens(source)) { const prior = metadataOwner.get(token); if (prior === undefined) metadataOwner.set(token, index); else join(prior, index); }
+  });
+  const smallest = new Map<number, string>();
+  selected.forEach((item, index) => { const root = find(index); const id = item.source!.sourceId; const prior = smallest.get(root); if (prior === undefined || id < prior) smallest.set(root, id); });
+  selected.forEach((item, index) => { item.key = `retrieved-lineage:${smallest.get(find(index))!}`; });
+  return Object.freeze({ relationKeys: new Set(relationOwner.keys()), metadataTokens: new Set(metadataOwner.keys()) });
+}
+interface ConflictClosure { readonly evidence: EvidenceRecord[]; readonly claims: ClaimRecord[] }
 function buildConflictClosure(
   target: ClaimRecord, indexes: ReturnType<typeof getValidatedSnapshotIndexes>, maximum: number,
-): EvidenceRecord[] {
-  const queue: SnapshotRecordKey[] = [];
-  const visited = new Set<string>();
-  const contradictions = new Map<string, EvidenceRecord>();
+): ConflictClosure {
+  const queue: Array<{ key: SnapshotRecordKey; conflictMask: number }> = [];
+  const state = new Map<string, number>(); const expanded = new Set<string>();
+  const contradictions = new Map<string, EvidenceRecord>(); const conflictingClaims = new Map<string, ClaimRecord>();
+  const directEvidence = new Set(uniqueEvidenceRefs(target.evidenceRefs).map((ref) => `${ref.evidenceId}\0${ref.revision}`));
   let edgeCount = 0;
-  const enqueue = (key: SnapshotRecordKey): void => {
-    const encoded = `${key.kind}\0${key.id}\0${key.revision ?? 0}`;
-    if (visited.has(encoded)) return;
-    if (visited.size >= maximum) fail("evidence.too-many-records");
-    visited.add(encoded); queue.push(key);
+  const enqueue = (key: SnapshotRecordKey, conflictMask: number): void => {
+    const encoded = `${key.kind}\0${key.id}\0${key.revision ?? 0}`; const exists = state.has(encoded); const prior = state.get(encoded) ?? 0;
+    const combined = prior | conflictMask; if (exists && combined === prior) return;
+    if (!exists && state.size >= maximum) fail("evidence.too-many-records");
+    state.set(encoded, combined); queue.push({ key, conflictMask: combined });
   };
-  for (const ref of target.evidenceRefs) enqueue({ kind: "evidence", id: String(ref.evidenceId), revision: Number(ref.revision) });
+  for (const ref of uniqueEvidenceRefs(target.evidenceRefs)) enqueue({ kind: "evidence", id: ref.evidenceId, revision: ref.revision }, 0);
   for (const id of target.conflictClaimIds) {
     const revision = indexes.getLatestRevision("claims", String(id)); if (revision === undefined) fail("evidence.unresolved-ref");
-    enqueue({ kind: "claims", id: String(id), revision });
+    enqueue({ kind: "claims", id: String(id), revision }, 2);
   }
   for (let cursor = 0; cursor < queue.length; cursor += 1) {
-    const key = queue[cursor]!;
+    const { key, conflictMask } = queue[cursor]!; const encoded = `${key.kind}\0${key.id}\0${key.revision ?? 0}`;
     const record = indexes.getExactRecord(key) as ClaimRecord | EvidenceRecord | undefined;
     if (!record) fail("evidence.unresolved-ref");
     if (key.kind === "claims") {
       const claim = record as ClaimRecord;
+      if (conflictMask !== 0 && claim.claimId !== target.claimId) conflictingClaims.set(`${claim.claimId}\0${claim.revision}`, claim);
+      if (expanded.has(encoded)) continue; expanded.add(encoded);
       edgeCount = checkedAdd(edgeCount, claim.evidenceRefs.length + claim.conflictClaimIds.length);
       if (edgeCount > maximum) fail("evidence.too-many-references");
-      for (const ref of claim.evidenceRefs) enqueue({ kind: "evidence", id: String(ref.evidenceId), revision: Number(ref.revision) });
+      for (const ref of uniqueEvidenceRefs(claim.evidenceRefs)) enqueue({ kind: "evidence", id: ref.evidenceId, revision: ref.revision }, conflictMask === 0 ? 0 : 2);
       for (const id of claim.conflictClaimIds) {
         if (id === target.claimId) continue;
         const revision = indexes.getLatestRevision("claims", String(id)); if (revision === undefined) fail("evidence.unresolved-ref");
-        enqueue({ kind: "claims", id: String(id), revision });
+        enqueue({ kind: "claims", id: String(id), revision }, 2);
       }
     } else {
-      const evidence = record as EvidenceRecord;
-      if (evidence.stance === "contradicting") contradictions.set(`${evidence.evidenceId}\0${evidence.revision}`, evidence);
+      const evidence = record as EvidenceRecord; const exact = `${evidence.evidenceId}\0${evidence.revision}`;
+      const relativeConflict = (conflictMask & 1) !== 0 || ((conflictMask & 2) !== 0 && evidence.stance === "supporting");
+      if (evidence.stance === "contradicting" || (relativeConflict && !directEvidence.has(exact))) contradictions.set(exact, evidence);
+      if (expanded.has(encoded)) continue; expanded.add(encoded);
       edgeCount = checkedAdd(edgeCount, evidence.conflictsWith.length);
       if (edgeCount > maximum) fail("evidence.too-many-references");
       for (const id of evidence.conflictsWith) {
         const revision = indexes.getLatestRevision("evidence", String(id)); if (revision === undefined) fail("evidence.unresolved-ref");
-        enqueue({ kind: "evidence", id: String(id), revision });
+        enqueue({ kind: "evidence", id: String(id), revision }, 1);
       }
     }
   }
-  return [...contradictions.values()].sort((left, right) => refCompare(
-    { evidenceId: String(left.evidenceId), revision: Number(left.revision) },
-    { evidenceId: String(right.evidenceId), revision: Number(right.revision) },
-  ));
+  return {
+    evidence: [...contradictions.values()].sort((left, right) => refCompare(
+      { evidenceId: String(left.evidenceId), revision: Number(left.revision) }, { evidenceId: String(right.evidenceId), revision: Number(right.revision) },
+    )),
+    claims: [...conflictingClaims.values()].sort((left, right) => left.claimId < right.claimId ? -1 : left.claimId > right.claimId ? 1 : left.revision - right.revision),
+  };
 }
 function selectApplicableVerifications(records: readonly VerificationRecord[], target: ClaimRecord): VerificationRecord[] {
   const selected = new Map<string, VerificationRecord>();
@@ -375,7 +412,7 @@ function selectApplicableVerifications(records: readonly VerificationRecord[], t
 }
 function independentCredit(
   verifications: VerificationRecord[], target: ClaimRecord, indexes: ReturnType<typeof getValidatedSnapshotIndexes>,
-  base: QualifiedEvidence[], baseKeys: Set<string>,
+  base: QualifiedEvidence[], baseKeys: Set<string>, retrievedContext: RetrievedComponentContext,
 ): 0 | 1 {
   const baseAttempts = new Set([target.createdByAttemptId, ...base.map(({ evidence }) => evidence.recordedByAttemptId)]);
   const candidates: Array<{ verificationId: string; revision: number; key: string }> = [];
@@ -384,23 +421,35 @@ function independentCredit(
     for (const id of verification.independentEvidenceIds) {
       const checked = verification.checkedEvidence.filter((ref) => ref.evidenceId === id); if (checked.length !== 1) continue;
       const record = indexes.getExactRecord({ kind: "evidence", id: String(id), revision: Number(checked[0]!.revision) }) as EvidenceRecord | undefined;
-      if (!record || indexes.getLatestRevision("evidence", record.evidenceId) !== record.revision
-        || record.recordedByAttemptId !== verification.attemptId || record.claimRef.claimId !== target.claimId
+      if (!record || record.recordedByAttemptId !== verification.attemptId || record.claimRef.claimId !== target.claimId
         || record.claimRef.revision !== target.revision || record.stance !== "supporting"
-        || record.verificationStatus !== "verified") continue;
+        || !["unverified", "verified"].includes(record.verificationStatus)) continue;
       const qualified = qualifyEvidence(record, indexes, target); if (!qualified) continue;
+      if (qualified.kind === "retrieved") {
+        if (qualified.unknownLineage || !qualified.source) continue;
+        const relation = relationComponentKey(qualified.source, indexes);
+        const tokens = sourceMetadataTokens(qualified.source);
+        if (retrievedContext.relationKeys.has(relation) || tokens.some((token) => retrievedContext.metadataTokens.has(token))) continue;
+        qualified.key = `retrieved-lineage:${qualified.source.sourceId}`;
+      }
       if (qualified.key && !baseKeys.has(qualified.key)) candidates.push({ verificationId: verification.verificationId, revision: verification.revision, key: qualified.key });
     }
   }
   candidates.sort((a, b) => a.verificationId < b.verificationId ? -1 : a.verificationId > b.verificationId ? 1 : a.revision - b.revision || (a.key < b.key ? -1 : 1));
   return candidates.length > 0 ? 1 : 0;
 }
-function conflictsResolved(verifications: VerificationRecord[], target: ClaimRecord, supporting: QualifiedEvidence[], contradictions: EvidenceRecord[]): boolean {
+function conflictsResolved(
+  verifications: VerificationRecord[], target: ClaimRecord, supporting: QualifiedEvidence[],
+  contradictions: EvidenceRecord[], conflictingClaims: ClaimRecord[], baseRecorderAttempts: ReadonlySet<string>,
+): boolean {
   if (target.status !== "supported") return false;
   const used = [...supporting.map(({ evidence }) => evidence), ...contradictions];
-  const forbiddenAttempts = new Set([target.createdByAttemptId, ...contradictions.map((record) => record.recordedByAttemptId)]);
+  const forbiddenAttempts = new Set([target.createdByAttemptId, ...baseRecorderAttempts, ...used.map((record) => record.recordedByAttemptId)]);
   return verifications.some((verification) => verification.result === "accepted" && !forbiddenAttempts.has(verification.attemptId)
     && verification.corrections.some((correction) => correction.claimId === target.claimId && asciiTrim(correction.description).length > 0)
+    && conflictingClaims.every((claim) => claim.status === "rejected"
+      && verification.checkedClaims.some((ref) => ref.claimId === claim.claimId && ref.revision === claim.revision)
+      && verification.corrections.some((correction) => correction.claimId === claim.claimId && asciiTrim(correction.description).length > 0))
     && used.every((record) => verification.checkedEvidence.some((ref) => ref.evidenceId === record.evidenceId && ref.revision === record.revision))
     && contradictions.every((record) => record.verificationStatus === "rejected"));
 }
@@ -480,13 +529,14 @@ function validateEvaluationOptions(options?: Readonly<{ maxEvidencePerClaim?: nu
   if (descriptor && (!("value" in descriptor) || !descriptor.enumerable)) fail("evidence.invalid-options");
   const value = descriptor?.value ?? 10_000; if (!Number.isSafeInteger(value) || value < 1 || value > 100_000) fail("evidence.invalid-options"); return value;
 }
+function uniqueEvidenceRefs(refs: readonly any[]): Array<{ evidenceId: string; revision: number }> {
+  const unique = new Map<string, { evidenceId: string; revision: number }>();
+  for (const ref of refs) { const value = { evidenceId: String(ref.evidenceId), revision: Number(ref.revision) }; unique.set(`${value.evidenceId}\0${value.revision}`, value); }
+  return [...unique.values()].sort(refCompare);
+}
 function refCompare(left: { evidenceId: string; revision: number }, right: { evidenceId: string; revision: number }): number { return left.evidenceId < right.evidenceId ? -1 : left.evidenceId > right.evidenceId ? 1 : left.revision - right.revision; }
 function checkedAdd(left: number, right: number): number { const result = left + right; if (!Number.isSafeInteger(result)) fail("evidence.input-too-large"); return result; }
 function asciiTrim(value: string): string { return value.replace(/^[\t\n\v\f\r ]+|[\t\n\v\f\r ]+$/gu, ""); }
-function isPortableRelativePath(value: string): boolean {
-  if (value.length === 0 || value.startsWith("/") || value.includes("\\") || /^[A-Za-z]:/u.test(value) || value.includes("\0")) return false;
-  return value.split("/").every((part) => part.length > 0 && part !== "." && part !== "..");
-}
 function isPlain(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype; }
 function deepFreeze<T>(value: T): T { if (value && typeof value === "object" && !Object.isFrozen(value)) { for (const child of Object.values(value as any)) deepFreeze(child); Object.freeze(value); } return value; }
 function fail(code: EvidenceAdmissionErrorCode): never { throw new EvidenceAdmissionError(code); }
