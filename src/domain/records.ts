@@ -263,7 +263,7 @@ registerRefinement(RetryScheduleSchema, (input) => {
 registerRefinement(CanonicalTransactionManifestSchema, (input) => {
   const value = input as CanonicalTransactionManifest;
   const issues: ValidationIssue[] = [...timestampIssues(value, ["createdAt"])];
-  const portable = (path: string) => !path.startsWith("/") && !path.includes("\\") && path.split("/").every((part) => part !== "" && part !== "." && part !== "..");
+  const portable = (path: string) => !path.startsWith("/") && !/^[a-z]:\//i.test(path) && !path.includes("\\") && path.split("/").every((part) => part !== "" && part !== "." && part !== "..");
   value.files.forEach((file, index) => {
     if (!portable(file.relativePath)) issues.push(issue(`/files/${index}/relativePath`, "manifest.relative-path"));
   });
@@ -302,6 +302,15 @@ export function validateRetrySeries(attemptInputs: readonly unknown[], scheduleI
   for (const [index, input] of scheduleInputs.entries()) collectParsed(parse(RetryScheduleSchema, input), `/schedules/${index}`, schedules, issues);
   if (issues.length > 0) return { success: false, issues };
 
+  const attemptIds = new Set<string>();
+  const attemptEnvelopeHashes = new Set<string>();
+  attempts.forEach((attempt, index) => {
+    if (attemptIds.has(attempt.attemptId)) issues.push(issue(`/attempts/${index}/attemptId`, "retry.duplicate-attempt-id"));
+    if (attemptEnvelopeHashes.has(attempt.attemptEnvelopeSha256)) issues.push(issue(`/attempts/${index}/attemptEnvelopeSha256`, "retry.duplicate-envelope"));
+    attemptIds.add(attempt.attemptId);
+    attemptEnvelopeHashes.add(attempt.attemptEnvelopeSha256);
+  });
+
   const scheduleIds = new Set<string>();
   schedules.forEach((schedule, index) => {
     if (scheduleIds.has(schedule.scheduleId)) issues.push(issue(`/schedules/${index}/scheduleId`, "retry.duplicate-schedule-id"));
@@ -327,14 +336,8 @@ function validateGroup(logicalOperationId: string, unsorted: AttemptRecord[], sc
   const first = group[0];
   if (!first) return;
   const immutable: (keyof AttemptRecord)[] = ["runId", "taskId", "executionEpoch", "attemptKind", "providerModel", "thinkingLevel", "promptTemplateSha256", "logicalInputSha256", "toolAllowlist", "deadlineAt", "replayPolicy"];
-  const ids = new Set<string>();
-  const envelopes = new Set<string>();
   group.forEach((attempt, index) => {
     if (attempt.attemptOrdinal !== index + 1) issues.push(issue(`/attempts/${index}/attemptOrdinal`, "retry.nonconsecutive-ordinal"));
-    if (ids.has(attempt.attemptId)) issues.push(issue(`/attempts/${index}/attemptId`, "retry.duplicate-attempt-id"));
-    if (envelopes.has(attempt.attemptEnvelopeSha256)) issues.push(issue(`/attempts/${index}/attemptEnvelopeSha256`, "retry.duplicate-envelope"));
-    ids.add(attempt.attemptId);
-    envelopes.add(attempt.attemptEnvelopeSha256);
     for (const key of immutable) if (JSON.stringify(attempt[key]) !== JSON.stringify(first[key])) issues.push(issue(`/attempts/${index}/${String(key)}`, "retry.immutable-change"));
     if (index > 0) {
       const predecessor = group[index - 1]!;

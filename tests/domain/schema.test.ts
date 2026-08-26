@@ -346,7 +346,7 @@ describe("closed record schemas", () => {
   });
 
   test("enforces manifest paths, uniqueness, and numeric constraints", () => {
-    for (const path of ["/abs", "a\\b", ".", "..", "a//b", "a/./b", "a/../b", "a/", "/a"]) {
+    for (const path of ["/abs", "C:/secret", "c:/secret", "a\\b", ".", "..", "a//b", "a/./b", "a/../b", "a/", "/a"]) {
       expectInvalid(CanonicalTransactionManifestSchema, { ...manifestFixture(), files: [{ ...manifestFixture().files[0], relativePath: path }] });
     }
     expectInvalid(CanonicalTransactionManifestSchema, { ...manifestFixture(), files: [manifestFixture().files[0], { ...manifestFixture().files[0] }] });
@@ -379,6 +379,22 @@ describe("retry series", () => {
       const predecessor = attemptFixture({ state, ...(state === "result-recorded" || state === "committed" ? { resultSha256: H } : {}), ...(state === "terminal-failed" || state === "cancelled" ? { error: { class: "x", message: "x" } } : {}) });
       expect(validateRetrySeries([predecessor, retried], [scheduleFixture()]).success).toBe(false);
     }
+  });
+
+  test("rejects an attempt ID duplicated across logical-operation groups", () => {
+    const otherGroup = attemptFixture({
+      logicalOperationId: "logical-2",
+      attemptEnvelopeSha256: H2,
+    });
+    expect(validateRetrySeries([attemptFixture(), otherGroup], []).success).toBe(false);
+  });
+
+  test("rejects an envelope hash duplicated across logical-operation groups", () => {
+    const distinctIdentity = attemptFixture({
+      attemptId: "attempt-cdefghijklmnopqr",
+      logicalOperationId: "logical-2",
+    });
+    expect(validateRetrySeries([attemptFixture(), distinctIdentity], []).success).toBe(false);
   });
 
   test("rejects duplicate, orphan, non-immediate, and never schedules", () => {
