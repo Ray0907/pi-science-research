@@ -30,6 +30,16 @@ afterEach(() => {
 });
 
 describe("Pi package manifest", () => {
+  it("exports the scholarly evidence core from the package root", async () => {
+    const api = await import("../src/index.js");
+    for (const name of ["normalizeDoi", "buildRequestProvenanceIndex", "buildLineageGraph", "buildBoundedValidatedEvidenceSnapshot", "evaluateEvidenceRule", "buildEvidenceIndex", "assignCitationMappings", "ScholarlyIdentifierError", "SourceIdentityError", "LineageError", "EvidenceAdmissionError", "EvidenceQueryError", "CitationError", "EvidenceRuleSchema", "CitationMapRecordSchema"]) expect(api).toHaveProperty(name);
+  });
+
+  it("does not export validated snapshot internal accessors from the package root", async () => {
+    const api = await import("../src/index.js");
+    for (const name of ["getValidatedSnapshotIndexes", "buildBoundedValidatedEvidenceSnapshotInternal", "validatedProvenanceRecordsForSnapshot", "buildLineageGraphFromValidatedSources", "getLineageDependencyComponentKey", "getLineageRelationComponentKeyInternal", "prepareProspectiveSourceCanonicalInternal", "validatePreparedSourceSemanticsInternal", "EvidenceSnapshotDiagnostics", "EvidenceQueryDiagnostics", "buildEvidenceIndexWithDiagnosticsInternal"]) expect(api).not.toHaveProperty(name);
+  });
+
   it("advertises only the extension resource that exists", async () => {
     const manifest = JSON.parse(await readFile(new URL("package.json", projectRoot), "utf8")) as {
       keywords?: string[];
@@ -64,6 +74,12 @@ describe("Pi package manifest", () => {
       "package.json",
       "extensions/research/index.ts",
       "src/index.ts",
+      "src/scholarly/identifiers.ts",
+      "src/scholarly/source-identity.ts",
+      "src/evidence/lineage.ts",
+      "src/evidence/admission.ts",
+      "src/evidence/query.ts",
+      "src/evidence/citations.ts",
     ]));
   });
 });
