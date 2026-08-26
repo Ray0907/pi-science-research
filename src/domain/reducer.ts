@@ -6,6 +6,7 @@ export type RecoveryDecision =
   | Readonly<{ kind: "skip-committed" }>
   | Readonly<{ kind: "finish-transaction"; transactionId: TransactionId }>
   | Readonly<{ kind: "retry-safe-read"; schedule: RetrySchedule }>
+  | Readonly<{ kind: "resume-started-retry"; attemptId: AttemptId; attemptOrdinal: number; schedule: RetrySchedule }>
   | Readonly<{ kind: "needs-retry-schedule"; failedAttemptId: AttemptId; nextAttemptOrdinal: number; replayPolicy: "safe-read" }>
   | Readonly<{ kind: "block-never"; code: "uncertain-nonreplayable" }>
   | Readonly<{ kind: "quarantined"; reason: "cancelled-epoch" | "superseded" }>
@@ -25,14 +26,22 @@ export interface ReducedAttemptState {
   readonly quarantineReason: "cancelled-epoch" | "superseded" | null;
 }
 
+export interface ReducedStartedRetryState {
+  readonly attemptId: AttemptId;
+  readonly attemptOrdinal: number;
+  readonly schedule: RetrySchedule;
+}
+
 export interface ReducedOperationState {
   readonly logicalOperationId: string;
   readonly attempts: readonly ReducedAttemptState[];
   readonly schedules: readonly RetrySchedule[];
   readonly consumedScheduleIds: readonly string[];
+  readonly startedRetries: readonly ReducedStartedRetryState[];
 }
 
 export interface ReducedLedgerState {
+  readonly runState: RunSnapshot["state"] | null;
   readonly currentEpoch: number;
   readonly operations: Readonly<Record<string, ReducedOperationState>>;
   readonly cancelledEpochs: Readonly<Record<string, number>>;
@@ -78,6 +87,7 @@ interface TransactionState {
   readonly attemptId: string;
   readonly resultSeq: number;
   recordsCommitted: boolean;
+  quarantined: boolean;
 }
 
 const immutableAttemptFields: readonly (keyof AttemptRecord)[] = [
@@ -104,10 +114,15 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
   const startedRetryPredecessors = new Set<string>();
   const committedOperations = new Set<string>();
   const transactions = new Map<string, TransactionState>();
+  const committedRevisions = new Map<string, { manifestSha256: string; completionCommitId: string }>();
   const cancelledEpochs = new Map<number, number>();
   const resumedEpochs = new Set<number>();
   let runId: string | null = null;
   let runOrigin: { record: RunSnapshot; event: FoundationLedgerEvent; index: number } | null = null;
+  let runState: RunSnapshot["state"] | null = null;
+  let runDepth: RunSnapshot["depth"] | null = null;
+  let runBlocker: RunSnapshot["blocker"] = null;
+  let lastCheckpoint: RunSnapshot["checkpointStage"] = null;
   let currentEpoch = 0;
 
   const fail = (event: FoundationLedgerEvent, index: number, code: string): never => {
@@ -137,9 +152,28 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
       case "run_created": {
         if (runId !== null) fail(event, index, "reducer.duplicate-run");
         if (event.payload.run.executionEpoch !== 0) fail(event, index, "reducer.initial-epoch");
+        if (event.payload.run.state !== "created") fail(event, index, "reducer.initial-run-state");
         runId = event.payload.run.runId;
         runOrigin = { record: event.payload.run, event, index };
+        runState = event.payload.run.state;
+        runDepth = event.payload.run.depth;
+        runBlocker = event.payload.run.blocker;
+        lastCheckpoint = event.payload.run.checkpointStage;
         currentEpoch = 0;
+        break;
+      }
+      case "state_changed": {
+        if (runState === null) fail(event, index, "reducer.run-not-found");
+        const currentRunState = runState!;
+        if (currentRunState === "completed" || currentRunState === "cancelled") fail(event, index, "reducer.run-terminal");
+        if (event.payload.from !== currentRunState) fail(event, index, "reducer.run-state-from");
+        if (event.payload.to === "completed") fail(event, index, "reducer.completion-event-required");
+        if (!isAllowedRunTransition(currentRunState, event.payload.to, runDepth, lastCheckpoint, runBlocker, event.payload.blocker)) {
+          fail(event, index, "reducer.run-transition");
+        }
+        runState = event.payload.to;
+        runBlocker = event.payload.blocker;
+        if (isCheckpointStage(runState)) lastCheckpoint = runState;
         break;
       }
       case "task_upserted": {
@@ -200,22 +234,32 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
         if (attempt.result !== null || attempt.phase === "committed" || attempt.phase === "records") fail(event, index, "reducer.duplicate-result");
         const cancellationSeq = cancelledEpochs.get(attempt.record.executionEpoch);
         const retryWasStarted = startedRetryPredecessors.has(attempt.record.attemptId);
-        if (attempt.failureState === "superseded" || retryWasStarted || (cancellationSeq !== undefined && event.seq > cancellationSeq)) {
+        const quarantined = attempt.failureState === "superseded"
+          || retryWasStarted
+          || (cancellationSeq !== undefined && event.seq > cancellationSeq);
+        if (!quarantined && attempt.phase !== "started") fail(event, index, "reducer.attempt-transition");
+        attempt.result = { transactionId: event.payload.transactionId, seq: event.seq };
+        const transaction: TransactionState = {
+          attemptId: attempt.record.attemptId,
+          resultSeq: event.seq,
+          recordsCommitted: false,
+          quarantined,
+        };
+        transactions.set(event.payload.transactionId, transaction);
+        if (quarantined) {
           attempt.phase = "quarantined";
           attempt.failureState = "superseded";
           attempt.quarantineReason = cancellationSeq !== undefined && event.seq > cancellationSeq ? "cancelled-epoch" : "superseded";
           break;
         }
-        if (attempt.phase !== "started") fail(event, index, "reducer.attempt-transition");
-        attempt.result = { transactionId: event.payload.transactionId, seq: event.seq };
         attempt.phase = "result";
-        transactions.set(event.payload.transactionId, { attemptId: attempt.record.attemptId, resultSeq: event.seq, recordsCommitted: false });
         break;
       }
       case "records_committed": {
         const transaction = transactions.get(event.payload.transactionId);
         if (!transaction) fail(event, index, "reducer.transaction-not-found");
         const committedTransaction = transaction!;
+        if (committedTransaction.quarantined) fail(event, index, "reducer.transaction-quarantined");
         if (committedTransaction.resultSeq !== event.payload.sourceResultSeq) fail(event, index, "reducer.source-result-link");
         if (committedTransaction.recordsCommitted) fail(event, index, "reducer.duplicate-records-commit");
         const attempt = requireAttempt(event, index, committedTransaction.attemptId);
@@ -315,6 +359,7 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
         if (cancelSeq === undefined || event.payload.priorCancelSeq !== cancelSeq) fail(event, index, "reducer.resume-cancel-link");
         resumedEpochs.add(event.payload.executionEpoch);
         currentEpoch = event.payload.executionEpoch;
+        if (event.payload.checkpointStage !== null) lastCheckpoint = event.payload.checkpointStage;
         break;
       }
       case "request_intent_recorded":
@@ -324,14 +369,34 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
         requireAttempt(event, index, event.payload.attemptId);
         break;
       }
-      case "state_changed":
+      case "revision_committed": {
+        if (!reserved("revision", event.payload.revisionId)) fail(event, index, "reducer.revision-not-reserved");
+        if (committedRevisions.has(event.payload.revisionId)) fail(event, index, "reducer.duplicate-revision-commit");
+        committedRevisions.set(event.payload.revisionId, {
+          manifestSha256: event.payload.manifestSha256,
+          completionCommitId: event.payload.completionCommitId,
+        });
+        break;
+      }
+      case "run_completed": {
+        if (runState === "completed" || runState === "cancelled") fail(event, index, "reducer.run-terminal");
+        if (runState !== "synthesizing") fail(event, index, "reducer.run-completion-state");
+        const revision = committedRevisions.get(event.payload.revisionId);
+        if (!revision) fail(event, index, "reducer.revision-not-committed");
+        const committedRevision = revision!;
+        if (committedRevision.manifestSha256 !== event.payload.manifestSha256
+          || committedRevision.completionCommitId !== event.payload.completionCommitId) {
+          fail(event, index, "reducer.run-completion-link");
+        }
+        runState = "completed";
+        runBlocker = null;
+        break;
+      }
       case "active_time_checkpoint":
       case "budget_amended":
       case "lock_recovered":
       case "revision_prepared":
-      case "revision_committed":
       case "revision_failed":
-      case "run_completed":
         break;
       default:
         assertNever(event);
@@ -371,16 +436,26 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
     }));
     const scheduleOutput = operation.schedules.map(({ schedule }) => schedule);
     const consumed = operation.schedules.flatMap(({ schedule, consumedByAttemptId }) => consumedByAttemptId === null ? [] : [schedule.scheduleId]);
+    const startedRetries = operation.schedules.flatMap<ReducedStartedRetryState>(({ schedule, consumedByAttemptId }) => {
+      if (consumedByAttemptId === null || attempts.has(consumedByAttemptId)) return [];
+      return [Object.freeze({
+        attemptId: consumedByAttemptId as AttemptId,
+        attemptOrdinal: schedule.nextAttemptOrdinal,
+        schedule,
+      })];
+    });
     operationOutput[logicalOperationId] = Object.freeze({
       logicalOperationId,
       attempts: Object.freeze(attemptOutput),
       schedules: Object.freeze(scheduleOutput),
       consumedScheduleIds: Object.freeze(consumed),
+      startedRetries: Object.freeze(startedRetries),
     });
   }
   const cancellationOutput = Object.create(null) as Record<string, number>;
   for (const [epoch, seq] of cancelledEpochs) cancellationOutput[String(epoch)] = seq;
   return Object.freeze({
+    runState,
     currentEpoch,
     operations: Object.freeze(operationOutput),
     cancelledEpochs: Object.freeze(cancellationOutput),
@@ -393,11 +468,20 @@ export function recoveryDecisionFor(state: ReducedLedgerState, logicalOperationI
   if (operation.attempts.some((attempt) => attempt.phase === "committed")) return Object.freeze({ kind: "skip-committed" });
   const latest = operation.attempts.at(-1);
   if (!latest) return Object.freeze({ kind: "not-found" });
-  if (latest.phase === "quarantined") {
-    return Object.freeze({ kind: "quarantined", reason: latest.quarantineReason ?? "superseded" });
-  }
   if (state.currentEpoch === latest.executionEpoch && state.cancelledEpochs[String(latest.executionEpoch)] !== undefined) {
     return Object.freeze({ kind: "quarantined", reason: "cancelled-epoch" });
+  }
+  const startedRetry = operation.startedRetries.at(-1);
+  if (startedRetry) {
+    return Object.freeze({
+      kind: "resume-started-retry",
+      attemptId: startedRetry.attemptId,
+      attemptOrdinal: startedRetry.attemptOrdinal,
+      schedule: startedRetry.schedule,
+    });
+  }
+  if (latest.phase === "quarantined") {
+    return Object.freeze({ kind: "quarantined", reason: latest.quarantineReason ?? "superseded" });
   }
   if ((latest.phase === "result" || latest.phase === "records") && latest.transactionId) {
     return Object.freeze({ kind: "finish-transaction", transactionId: latest.transactionId as TransactionId });
@@ -418,6 +502,50 @@ export function recoveryDecisionFor(state: ReducedLedgerState, logicalOperationI
     nextAttemptOrdinal: latest.ordinal + 1,
     replayPolicy: "safe-read",
   });
+}
+
+function isCheckpointStage(state: RunSnapshot["state"]): state is NonNullable<RunSnapshot["checkpointStage"]> {
+  return state === "planning" || state === "researching" || state === "verifying" || state === "synthesizing";
+}
+
+function isAllowedRunTransition(
+  from: RunSnapshot["state"],
+  to: RunSnapshot["state"],
+  depth: RunSnapshot["depth"] | null,
+  lastCheckpoint: RunSnapshot["checkpointStage"],
+  currentBlocker: RunSnapshot["blocker"],
+  nextBlocker: RunSnapshot["blocker"],
+): boolean {
+  if (to === "failed" && nextBlocker === null) return false;
+  if (to !== "failed" && to !== "paused" && nextBlocker !== null) return false;
+  switch (from) {
+    case "created":
+      return to === "planning" || to === "cancelled" || to === "failed";
+    case "planning":
+      return to === "researching" || to === "paused" || to === "cancelled" || to === "failed";
+    case "researching":
+      return to === "verifying"
+        || (to === "synthesizing" && depth === "quick")
+        || to === "paused"
+        || to === "cancelled"
+        || to === "failed";
+    case "verifying":
+      return to === "researching" || to === "synthesizing" || to === "paused" || to === "cancelled" || to === "failed";
+    case "synthesizing":
+      return to === "paused" || to === "cancelled" || to === "failed";
+    case "recovering":
+      return to === lastCheckpoint || to === "paused" || to === "cancelled" || to === "failed";
+    case "paused":
+      return to === "recovering" || to === "cancelled" || to === "failed";
+    case "failed":
+      return to === "recovering"
+        && currentBlocker !== null
+        && currentBlocker.code.startsWith("retryable-")
+        && nextBlocker === null;
+    case "cancelled":
+    case "completed":
+      return false;
+  }
 }
 
 function retryEdge(logicalOperationId: string, failedAttemptId: string, nextAttemptOrdinal: number): string {

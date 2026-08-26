@@ -20,6 +20,7 @@ const ATTEMPT_3 = "attempt-0000000000000003";
 const TX_1 = "tx-0000000000000001";
 const RETRY_1 = "retry-0000000000000001";
 const RETRY_2 = "retry-0000000000000002";
+const REVISION_1 = "rev-20260825T120000000Z-000000000001";
 const LOGICAL = "operation-primary";
 
 function runSnapshot(overrides: Partial<RunSnapshot> = {}): RunSnapshot {
@@ -33,8 +34,8 @@ function runSnapshot(overrides: Partial<RunSnapshot> = {}): RunSnapshot {
     reproducible: false,
     allowCalculations: false,
     calculationPolicySha256: null,
-    state: "researching",
-    checkpointStage: "researching",
+    state: "created",
+    checkpointStage: null,
     executionEpoch: 0,
     outputRoot: "research/run",
     roleModels: { coordinator: "provider/model", researcher: "provider/model", verifier: "provider/model" },
@@ -135,6 +136,8 @@ class Events {
 
   base(attempt = attemptRecord()): void {
     this.add("run_created", { run: runSnapshot() });
+    this.add("state_changed", { from: "created", to: "planning", blocker: null });
+    this.add("state_changed", { from: "planning", to: "researching", blocker: null });
     this.add("task_upserted", { task: taskRecord() });
     this.add("identity_reserved", { kind: "attempt", id: attempt.attemptId, origin: "parent-generated" });
     this.add("dispatch_intent", { attempt });
@@ -261,6 +264,44 @@ describe("pure ledger recovery reduction", () => {
     });
   });
 
+  test("resumes the exact physical retry identity after retry_started crash prefix", () => {
+    const events = scheduledRetryEvents();
+    events.add("identity_reserved", { kind: "attempt", id: ATTEMPT_2, origin: "parent-generated" });
+    const scheduledSeq = events.values.find((event) => event.type === "retry_scheduled")!.seq;
+    events.add("retry_started", { scheduleId: RETRY_1, logicalOperationId: LOGICAL, attemptId: ATTEMPT_2, attemptOrdinal: 2, scheduledFromSeq: scheduledSeq });
+    const reparsed = JSON.parse(JSON.stringify(events.values)) as FoundationLedgerEvent[];
+
+    const decision = recoveryDecisionFor(reduceLedgerEvents(reparsed), LOGICAL);
+    expect(decision).toEqual({
+      kind: "resume-started-retry",
+      attemptId: ATTEMPT_2,
+      attemptOrdinal: 2,
+      schedule: {
+        schemaVersion: 1,
+        scheduleId: RETRY_1,
+        logicalOperationId: LOGICAL,
+        failedAttemptId: ATTEMPT_1,
+        nextAttemptOrdinal: 2,
+        notBeforeAt: LATER,
+        delayMs: 1,
+        reasonClass: "transient",
+        replayPolicy: "safe-read",
+      },
+    });
+    expect(decision.kind === "resume-started-retry" && Object.isFrozen(decision.schedule)).toBe(true);
+
+    const continuation = new Events();
+    continuation.values.push(...reparsed);
+    continuation.add("dispatch_intent", { attempt: attemptRecord({ attemptId: ATTEMPT_2, attemptOrdinal: 2, retryOfAttemptId: ATTEMPT_1, attemptEnvelopeSha256: "c".repeat(64) }) });
+    continuation.started(ATTEMPT_2);
+    expect(recoveryDecisionFor(reduceLedgerEvents(continuation.values), LOGICAL)).toEqual({
+      kind: "needs-retry-schedule",
+      failedAttemptId: ATTEMPT_2,
+      nextAttemptOrdinal: 3,
+      replayPolicy: "safe-read",
+    });
+  });
+
   test("blocks an uncertain never attempt", () => {
     const events = new Events();
     events.base(attemptRecord({ attemptKind: "calculation", replayPolicy: "never", billingStatus: "not-applicable" }));
@@ -327,6 +368,52 @@ describe("pure ledger recovery reduction", () => {
     });
   });
 
+  test("binds a quarantined transaction to its original attempt and rejects later reuse", () => {
+    const events = new Events();
+    events.base();
+    events.started();
+    const cancel = events.add("cancel_requested", { executionEpoch: 0, reason: "user-pause" });
+    events.result(ATTEMPT_1, TX_1);
+    events.add("resume_epoch_started", {
+      priorEpoch: 0,
+      executionEpoch: 1,
+      priorCancelSeq: cancel.seq,
+      checkpointStage: "researching",
+      ownerTokenSha256: HASH,
+    });
+    const next = attemptRecord({ attemptId: ATTEMPT_2, logicalOperationId: "operation-next-epoch", executionEpoch: 1, attemptEnvelopeSha256: "c".repeat(64) });
+    events.add("identity_reserved", { kind: "attempt", id: ATTEMPT_2, origin: "parent-generated" });
+    events.add("dispatch_intent", { attempt: next });
+    events.started(ATTEMPT_2);
+    events.add("result_recorded", { attemptId: ATTEMPT_2, resultSha256: HASH, manifestSha256: null, transactionId: TX_1 });
+
+    expectCorruption(events.values, "reducer.duplicate-transaction");
+
+    const originalOnly = events.values.slice(0, -4);
+    const state = reduceLedgerEvents(originalOnly);
+    expect(state.operations[LOGICAL]!.attempts[0]).toMatchObject({
+      phase: "quarantined",
+      transactionId: TX_1,
+      quarantineReason: "cancelled-epoch",
+    });
+  });
+
+  test("rejects canonical record commitment for a quarantined transaction", () => {
+    const events = new Events();
+    events.base();
+    events.started();
+    events.add("cancel_requested", { executionEpoch: 0, reason: "user-pause" });
+    const lateResult = events.result(ATTEMPT_1, TX_1);
+    events.add("records_committed", {
+      transactionId: TX_1,
+      sourceResultSeq: lateResult.seq,
+      transactionManifestPath: "transaction/manifest.json",
+      transactionManifestSha256: HASH,
+      sourceRefs: [], claimRefs: [], evidenceRefs: [], verificationRefs: [], requestIds: [], calculationIds: [],
+    });
+    expectCorruption(events.values, "reducer.transaction-quarantined");
+  });
+
   test("keeps later-epoch work eligible while old-epoch late results stay quarantined", () => {
     const events = new Events();
     events.base();
@@ -360,16 +447,18 @@ describe("pure ledger recovery reduction", () => {
     expect(state.currentEpoch).toBe(1);
   });
 
-  test("quarantines a predecessor result arriving after its retry has started", () => {
+  test("keeps the started retry resumable when its predecessor result arrives late", () => {
     const events = scheduledRetryEvents();
     events.add("identity_reserved", { kind: "attempt", id: ATTEMPT_2, origin: "parent-generated" });
     const scheduledSeq = events.values.find((event) => event.type === "retry_scheduled")!.seq;
     events.add("retry_started", { scheduleId: RETRY_1, logicalOperationId: LOGICAL, attemptId: ATTEMPT_2, attemptOrdinal: 2, scheduledFromSeq: scheduledSeq });
     events.result(ATTEMPT_1);
 
-    expect(recoveryDecisionFor(reduceLedgerEvents(events.values), LOGICAL)).toEqual({
-      kind: "quarantined",
-      reason: "superseded",
+    expect(recoveryDecisionFor(reduceLedgerEvents(events.values), LOGICAL)).toMatchObject({
+      kind: "resume-started-retry",
+      attemptId: ATTEMPT_2,
+      attemptOrdinal: 2,
+      schedule: { scheduleId: RETRY_1 },
     });
   });
 
@@ -391,6 +480,98 @@ describe("pure ledger recovery reduction", () => {
     events.add("attempt_failed", { attemptId: ATTEMPT_1, state: "superseded", errorClass: "late", message: "diagnostic" });
 
     expect(recoveryDecisionFor(reduceLedgerEvents(events.values), LOGICAL)).toEqual({ kind: "skip-committed" });
+  });
+});
+
+describe("run state reduction", () => {
+  test("accepts valid state transitions and completes only through run_completed", () => {
+    const events = new Events();
+    events.add("run_created", { run: runSnapshot({ state: "created", checkpointStage: null, depth: "quick" }) });
+    events.add("state_changed", { from: "created", to: "planning", blocker: null });
+    events.add("state_changed", { from: "planning", to: "researching", blocker: null });
+    events.add("state_changed", { from: "researching", to: "synthesizing", blocker: null });
+    events.add("identity_reserved", { kind: "revision", id: REVISION_1, origin: "parent-generated" });
+    events.add("revision_committed", { revisionId: REVISION_1, manifestSha256: HASH, completionCommitId: "completion-1" });
+    events.add("run_completed", { revisionId: REVISION_1, manifestSha256: HASH, runSnapshotSha256: HASH_B, completionCommitId: "completion-1", completedAt: LATER });
+
+    expect(reduceLedgerEvents(events.values).runState).toBe("completed");
+  });
+
+  test("accepts pause recovery and failed recovery only with represented prerequisite resolution", () => {
+    const paused = new Events();
+    paused.add("run_created", { run: runSnapshot({ state: "created", checkpointStage: null }) });
+    paused.add("state_changed", { from: "created", to: "planning", blocker: null });
+    paused.add("state_changed", { from: "planning", to: "paused", blocker: null });
+    paused.add("state_changed", { from: "paused", to: "recovering", blocker: null });
+    paused.add("state_changed", { from: "recovering", to: "planning", blocker: null });
+    expect(reduceLedgerEvents(paused.values).runState).toBe("planning");
+
+    const failed = new Events();
+    failed.add("run_created", { run: runSnapshot({ state: "created", checkpointStage: null }) });
+    failed.add("state_changed", { from: "created", to: "failed", blocker: { code: "retryable-storage", message: "blocked" } });
+    failed.add("state_changed", { from: "failed", to: "recovering", blocker: null });
+    expect(reduceLedgerEvents(failed.values).runState).toBe("recovering");
+  });
+
+  test("rejects invalid, terminal, and inconsistent completion transitions", () => {
+    const cases: { build: () => FoundationLedgerEvent[]; code: string }[] = [
+      {
+        build: () => { const e = new Events(); e.add("run_created", { run: runSnapshot({ state: "researching", checkpointStage: "researching" }) }); return e.values; },
+        code: "reducer.initial-run-state",
+      },
+      {
+        build: () => { const e = new Events(); e.add("run_created", { run: runSnapshot({ state: "created", checkpointStage: null }) }); e.add("run_created", { run: runSnapshot({ state: "created", checkpointStage: null }) }); return e.values; },
+        code: "reducer.duplicate-run",
+      },
+      {
+        build: () => { const e = createdRunEvents(); e.add("state_changed", { from: "planning", to: "researching", blocker: null }); return e.values; },
+        code: "reducer.run-state-from",
+      },
+      {
+        build: () => { const e = createdRunEvents(); e.add("state_changed", { from: "created", to: "researching", blocker: null }); return e.values; },
+        code: "reducer.run-transition",
+      },
+      {
+        build: () => { const e = createdRunEvents(); e.add("state_changed", { from: "created", to: "cancelled", blocker: null }); e.add("state_changed", { from: "cancelled", to: "failed", blocker: { code: "x", message: "x" } }); return e.values; },
+        code: "reducer.run-terminal",
+      },
+      {
+        build: () => { const e = createdRunEvents(); e.add("state_changed", { from: "created", to: "failed", blocker: { code: "fatal-corruption", message: "blocked" } }); e.add("state_changed", { from: "failed", to: "recovering", blocker: null }); return e.values; },
+        code: "reducer.run-transition",
+      },
+      {
+        build: () => { const e = createdRunEvents(); e.add("state_changed", { from: "created", to: "planning", blocker: null }); e.add("state_changed", { from: "planning", to: "researching", blocker: null }); e.add("state_changed", { from: "researching", to: "synthesizing", blocker: null }); return e.values; },
+        code: "reducer.run-transition",
+      },
+      {
+        build: () => { const e = createdRunEvents(); e.add("run_completed", { revisionId: REVISION_1, manifestSha256: HASH, runSnapshotSha256: HASH_B, completionCommitId: "completion-1", completedAt: LATER }); return e.values; },
+        code: "reducer.run-completion-state",
+      },
+      {
+        build: () => { const e = createdRunEvents(); e.add("state_changed", { from: "created", to: "planning", blocker: null }); e.add("state_changed", { from: "planning", to: "researching", blocker: null }); e.add("state_changed", { from: "researching", to: "verifying", blocker: null }); e.add("state_changed", { from: "verifying", to: "synthesizing", blocker: null }); e.add("run_completed", { revisionId: REVISION_1, manifestSha256: HASH, runSnapshotSha256: HASH_B, completionCommitId: "completion-1", completedAt: LATER }); return e.values; },
+        code: "reducer.revision-not-committed",
+      },
+      {
+        build: () => { const e = createdRunEvents(); e.add("state_changed", { from: "created", to: "planning", blocker: null }); e.add("state_changed", { from: "planning", to: "researching", blocker: null }); e.add("state_changed", { from: "researching", to: "verifying", blocker: null }); e.add("state_changed", { from: "verifying", to: "synthesizing", blocker: null }); e.add("state_changed", { from: "synthesizing", to: "completed", blocker: null }); return e.values; },
+        code: "reducer.completion-event-required",
+      },
+      {
+        build: () => {
+          const e = new Events();
+          e.add("run_created", { run: runSnapshot({ depth: "quick" }) });
+          e.add("state_changed", { from: "created", to: "planning", blocker: null });
+          e.add("state_changed", { from: "planning", to: "researching", blocker: null });
+          e.add("state_changed", { from: "researching", to: "synthesizing", blocker: null });
+          e.add("identity_reserved", { kind: "revision", id: REVISION_1, origin: "parent-generated" });
+          e.add("revision_committed", { revisionId: REVISION_1, manifestSha256: HASH, completionCommitId: "completion-1" });
+          e.add("run_completed", { revisionId: REVISION_1, manifestSha256: HASH, runSnapshotSha256: HASH_B, completionCommitId: "completion-1", completedAt: LATER });
+          e.add("state_changed", { from: "completed", to: "failed", blocker: { code: "x", message: "x" } });
+          return e.values;
+        },
+        code: "reducer.run-terminal",
+      },
+    ];
+    for (const item of cases) expectCorruption(item.build(), item.code);
   });
 });
 
@@ -534,6 +715,12 @@ function deepFreeze(value: unknown): void {
   if (value === null || typeof value !== "object" || Object.isFrozen(value)) return;
   Object.freeze(value);
   for (const child of Object.values(value)) deepFreeze(child);
+}
+
+function createdRunEvents(): Events {
+  const events = new Events();
+  events.add("run_created", { run: runSnapshot({ state: "created", checkpointStage: null }) });
+  return events;
 }
 
 function scheduledRetryEvents(): Events {
