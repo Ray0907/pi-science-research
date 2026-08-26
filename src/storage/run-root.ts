@@ -5,7 +5,6 @@ import {
   mkdir,
   open,
   realpath,
-  rename as nodeRename,
   stat,
   type FileHandle,
 } from "node:fs/promises";
@@ -40,9 +39,9 @@ const openRootInodes = new Set<string>();
 const ownedRootObjects = new WeakSet<object>();
 
 export type RunRootDurabilityStep =
-  | "research-temp-directory-synced"
+  | "research-directory-synced"
   | "research-parent-synced"
-  | "leaf-temp-directory-synced"
+  | "leaf-final-directory-synced"
   | "marker-synced"
   | "leaf-marker-directory-synced"
   | "leaf-parent-synced";
@@ -61,7 +60,6 @@ export interface CreateOwnedRunRootOptions {
   now?: () => Date;
   randomBytes?: (size: number) => Uint8Array;
   durability?: (handle: FileHandle, step: RunRootDurabilityStep) => Promise<void>;
-  rename?: (from: string, to: string) => Promise<void>;
   onCheck?: (phase: string) => void | Promise<void>;
 }
 
@@ -623,48 +621,47 @@ async function ensurePreparedResearchDirectory(
     return;
   }
   const pins = await pinExistingAncestors(parent);
-  const createdTemp = await createUnpredictableTempDirectory(parent, options);
-  const temp = createdTemp.path;
+  await options.onCheck?.("after-research-candidate-check-before-mkdir");
+  await recheckPinnedAncestors(pins);
+  try {
+    await mkdir(path, { mode: 0o700 });
+  } catch (error) {
+    if (!isNodeError(error, "EEXIST")) throw wrap(error);
+    const raced = await safeLstat(path);
+    if (raced.isSymbolicLink()) fail("run-root.symlink");
+    if (!raced.isDirectory()) fail("run-root.unsafe-root");
+    return;
+  }
+
+  // mkdir is authoritative: no prior pathname object is ever renamed over it.
+  const first = await safeLstat(path);
+  if (!first.isDirectory() || first.isSymbolicLink()) fail("run-root.replaced");
   let handle: FileHandle | undefined;
   try {
-    const first = createdTemp.firstStat;
-    await recheckPinnedAncestors(pins);
-    await options.onCheck?.("after-research-temp-mkdir");
-    await assertExpectedDirectory(temp, first);
-    handle = await openDirectoryNoFollow(temp);
+    await options.onCheck?.("after-research-final-mkdir-before-pin");
+    await assertExpectedDirectory(path, first);
+    handle = await openDirectoryNoFollow(path);
     const opened = await handle.stat();
     if (!sameInode(first, opened)) fail("run-root.replaced");
-    await durability(options, handle, "research-temp-directory-synced");
+    await options.onCheck?.("after-research-final-open");
+    await assertExpectedDirectory(path, first);
+    if (!sameInode(await handle.stat(), first)) fail("run-root.replaced");
+    await durability(options, handle, "research-directory-synced");
+    await assertExpectedDirectory(path, first);
     await recheckPinnedAncestors(pins);
-    await assertPinnedDirectory(parent, parentStat);
-    const raced = await lstatIfExists(path);
-    if (raced) {
-      if (raced.isSymbolicLink()) fail("run-root.symlink");
-      if (!raced.isDirectory()) fail("run-root.unsafe-root");
-      return;
-    }
-    await options.onCheck?.("before-research-rename");
-    await recheckPinnedAncestors(pins);
-    try {
-      await performRename(options, temp, path);
-    } catch (error) {
-      if (!isCollisionError(error)) throw error;
-    }
-    await options.onCheck?.("after-research-rename");
-    const published = await safeLstat(path);
-    if (!published.isDirectory() || published.isSymbolicLink()) fail("run-root.replaced");
     const parentHandle = await openDirectoryNoFollow(parent);
     try {
       await durability(options, parentHandle, "research-parent-synced");
     } finally {
       await parentHandle.close().catch(() => undefined);
     }
+    await assertExpectedDirectory(path, first);
     await recheckPinnedAncestors(pins);
     await assertPinnedDirectory(parent, parentStat);
   } catch (error) {
     throw wrap(error);
   } finally {
-    await handle?.close().catch(() => undefined);
+    if (handle) await handle.close().catch(() => undefined);
   }
 }
 
@@ -676,15 +673,49 @@ async function prepareAndPublishLeaf(
   options: CreateOwnedRunRootOptions,
 ): Promise<PublishedLeaf> {
   const parent = dirname(base);
-  const createdTemp = await createUnpredictableTempDirectory(parent, options);
-  const temp = createdTemp.path;
-  let tempHandle: FileHandle | undefined;
-  let finalHandle: FileHandle | undefined;
+  let publishedPath: string | undefined;
+  for (let suffix = 1; suffix <= 10_000; suffix += 1) {
+    const candidate = suffix === 1 ? base : `${base}-${suffix}`;
+    if (!useSuffix && suffix > 1) fail("run-root.conflict");
+    const existing = await lstatIfExists(candidate);
+    if (existing) {
+      if (!useSuffix) fail(existing.isSymbolicLink() ? "run-root.symlink" : "run-root.conflict");
+      continue;
+    }
+    await options.onCheck?.("after-leaf-candidate-check-before-mkdir");
+    await recheckPinnedAncestors(ancestorPins);
+    try {
+      await mkdir(candidate, { mode: 0o700 });
+      publishedPath = candidate;
+      break;
+    } catch (error) {
+      if (!isNodeError(error, "EEXIST")) throw wrap(error);
+      if (!useSuffix) {
+        const racer = await safeLstat(candidate);
+        fail(racer.isSymbolicLink() ? "run-root.symlink" : "run-root.conflict");
+      }
+    }
+  }
+  if (!publishedPath) fail("run-root.conflict");
+
+  // mkdir(O_EXCL semantics) is the publication primitive. No rename or unlink
+  // ever targets this authoritative final pathname.
+  const first = await safeLstat(publishedPath);
+  if (!first.isDirectory() || first.isSymbolicLink()) fail("run-root.replaced");
+  let leafHandle: FileHandle | undefined;
   try {
-    // The temp name contains 128 bits of fresh entropy. createUnpredictableTempDirectory
-    // performs the first lstat immediately after mkdir, before it resolves and
-    // before any callback or other package-controlled operation can run.
-    const first = createdTemp.firstStat;
+    await options.onCheck?.("after-final-leaf-mkdir-before-pin");
+    await assertExpectedDirectory(publishedPath, first);
+    await options.onCheck?.("after-final-leaf-pin-before-open");
+    leafHandle = await openDirectoryNoFollow(publishedPath);
+    const opened = await leafHandle.stat();
+    if (!sameInode(first, opened)) fail("run-root.replaced");
+    await options.onCheck?.("after-final-leaf-open-before-marker");
+    await assertExpectedDirectory(publishedPath, first);
+    if (!sameInode(await leafHandle.stat(), first)) fail("run-root.replaced");
+    await recheckPinnedAncestors(ancestorPins);
+    await durability(options, leafHandle, "leaf-final-directory-synced");
+
     const marker: OwnerMarker = {
       schemaVersion: 1,
       ...markerSeed,
@@ -694,71 +725,34 @@ async function prepareAndPublishLeaf(
     const markerBytes = Buffer.from(`${canonicalJson(marker)}\n`, "utf8");
     if (markerBytes.byteLength > MAX_MARKER_BYTES) fail("run-root.marker-invalid");
     const markerSha256 = sha256Hex(markerBytes);
-    await recheckPinnedAncestors(ancestorPins);
-    await options.onCheck?.("after-leaf-temp-mkdir-before-pin");
-    await assertExpectedDirectory(temp, first);
-    await options.onCheck?.("after-leaf-temp-pin-before-open");
-    tempHandle = await openDirectoryNoFollow(temp);
-    const opened = await tempHandle.stat();
-    if (!sameInode(first, opened)) fail("run-root.replaced");
-    await recheckPinnedAncestors(ancestorPins);
-    await durability(options, tempHandle, "leaf-temp-directory-synced");
 
     await options.onCheck?.("before-marker-create");
-    await assertExpectedDirectory(temp, first);
+    await assertExpectedDirectory(publishedPath, first);
     await recheckPinnedAncestors(ancestorPins);
-    const markerHandle = await openExclusiveFile(join(temp, RUN_ROOT_OWNER_FILE));
+    const markerHandle = await openExclusiveFile(join(publishedPath, RUN_ROOT_OWNER_FILE));
     let markerStat: Awaited<ReturnType<FileHandle["stat"]>>;
     try {
       await options.onCheck?.("after-marker-create-before-write");
-      await assertExpectedDirectory(temp, first);
+      await assertExpectedDirectory(publishedPath, first);
       await recheckPinnedAncestors(ancestorPins);
       await writeFully(markerHandle, markerBytes);
       await options.onCheck?.("after-marker-write-before-fsync");
-      await assertExpectedDirectory(temp, first);
+      await assertExpectedDirectory(publishedPath, first);
       await recheckPinnedAncestors(ancestorPins);
       markerStat = await markerHandle.stat();
       if (!markerStat.isFile() || markerStat.nlink !== 1) fail("run-root.unsafe-link");
       await durability(options, markerHandle, "marker-synced");
-      await assertExpectedDirectory(temp, first);
+      await assertExpectedDirectory(publishedPath, first);
       await recheckPinnedAncestors(ancestorPins);
     } finally {
       await markerHandle.close().catch(() => undefined);
     }
-    await options.onCheck?.("after-marker-fsync-before-rename");
-    await assertExpectedDirectory(temp, first);
-    if (!sameInode(await tempHandle.stat(), first)) fail("run-root.replaced");
-    await durability(options, tempHandle, "leaf-marker-directory-synced");
+    await options.onCheck?.("after-marker-fsync-before-finalization");
+    await assertExpectedDirectory(publishedPath, first);
+    if (!sameInode(await leafHandle.stat(), first)) fail("run-root.replaced");
+    await durability(options, leafHandle, "leaf-marker-directory-synced");
     await recheckPinnedAncestors(ancestorPins);
 
-    let publishedPath: string | undefined;
-    for (let suffix = 1; suffix <= 10_000; suffix += 1) {
-      const candidate = suffix === 1 ? base : `${base}-${suffix}`;
-      if (!useSuffix && suffix > 1) fail("run-root.conflict");
-      const existing = await lstatIfExists(candidate);
-      if (existing) {
-        if (!useSuffix) fail(existing.isSymbolicLink() ? "run-root.symlink" : "run-root.conflict");
-        continue;
-      }
-      await options.onCheck?.("before-leaf-rename");
-      await recheckPinnedAncestors(ancestorPins);
-      try {
-        await performRename(options, temp, candidate);
-      } catch (error) {
-        if (useSuffix && isCollisionError(error)) continue;
-        throw error;
-      }
-      publishedPath = candidate;
-      break;
-    }
-    if (!publishedPath) fail("run-root.conflict");
-
-    await options.onCheck?.("after-leaf-rename-before-final-open");
-    const published = await safeLstat(publishedPath);
-    if (!published.isDirectory() || published.isSymbolicLink() || !sameInode(first, published)) fail("run-root.replaced");
-    finalHandle = await openDirectoryNoFollow(publishedPath);
-    const finalStat = await finalHandle.stat();
-    if (!sameInode(first, finalStat)) fail("run-root.replaced");
     const markerRead = await readOwnerMarker(publishedPath, options.onCheck);
     if (!sameStableFileObservation(markerRead.stat, markerStat!) || markerRead.sha256 !== markerSha256) fail("run-root.replaced");
     assertMarkerSeed(markerRead.marker, markerSeed);
@@ -766,7 +760,7 @@ async function prepareAndPublishLeaf(
     await options.onCheck?.("after-final-marker-read-before-return");
     await options.onCheck?.("after-final-open-before-return");
     await assertExpectedDirectory(publishedPath, first);
-    if (!sameInode(await finalHandle.stat(), first)) fail("run-root.replaced");
+    if (!sameInode(await leafHandle.stat(), first)) fail("run-root.replaced");
     await recheckPinnedAncestors(ancestorPins);
     const parentHandle = await openDirectoryNoFollow(parent);
     try {
@@ -776,10 +770,8 @@ async function prepareAndPublishLeaf(
     }
     await options.onCheck?.("after-leaf-parent-synced-before-return");
     await recheckPinnedAncestors(ancestorPins);
-    await finalHandle.close();
-    finalHandle = undefined;
-    await tempHandle.close();
-    tempHandle = undefined;
+    await leafHandle.close();
+    leafHandle = undefined;
     const verified = await verifyPublishedOwnership(
       publishedPath,
       first,
@@ -789,10 +781,8 @@ async function prepareAndPublishLeaf(
     );
     return { path: publishedPath, handle: verified.handle, rootStat: verified.rootStat, markerStat: verified.markerStat, markerSha256 };
   } catch (error) {
-    await finalHandle?.close().catch(() => undefined);
+    await leafHandle?.close().catch(() => undefined);
     throw wrap(error);
-  } finally {
-    if (tempHandle) await tempHandle.close().catch(() => undefined);
   }
 }
 
@@ -847,27 +837,6 @@ function assertMarkerSeed(marker: OwnerMarker, seed: OwnerMarkerSeed): void {
   ) fail("run-root.replaced");
 }
 
-async function createUnpredictableTempDirectory(
-  parent: string,
-  options: CreateOwnedRunRootOptions,
-): Promise<{ path: string; firstStat: Awaited<ReturnType<typeof lstat>> }> {
-  const random = options.randomBytes ?? nodeRandomBytes;
-  for (let attempt = 0; attempt < 32; attempt += 1) {
-    const entropy = Buffer.from(random(16)).toString("hex");
-    if (!/^[a-f0-9]{32}$/.test(entropy)) fail("run-root.invalid-options");
-    const candidate = join(parent, `.tmp-run-root-${entropy}-${attempt}`);
-    try {
-      await mkdir(candidate, { mode: 0o700 });
-      const firstStat = await safeLstat(candidate);
-      if (!firstStat.isDirectory() || firstStat.isSymbolicLink()) fail("run-root.replaced");
-      return { path: candidate, firstStat };
-    } catch (error) {
-      if (!isNodeError(error, "EEXIST")) throw wrap(error);
-    }
-  }
-  fail("run-root.conflict");
-}
-
 async function pinExistingAncestors(path: string): Promise<PinnedAncestor[]> {
   const absolute = resolve(path);
   const root = parsePath(absolute).root;
@@ -903,15 +872,6 @@ async function assertExpectedDirectory(
   if (info.isSymbolicLink() || !info.isDirectory() || !sameInode(info, expected)) fail("run-root.replaced");
 }
 
-async function performRename(options: CreateOwnedRunRootOptions, from: string, to: string): Promise<void> {
-  try {
-    await (options.rename ?? nodeRename)(from, to);
-  } catch (error) {
-    if (isNodeError(error, "EEXIST") || isNodeError(error, "ENOTEMPTY")) throw error;
-    throw wrap(error);
-  }
-}
-
 async function lstatIfExists(path: string): Promise<Awaited<ReturnType<typeof lstat>> | null> {
   try {
     return await lstat(path);
@@ -919,10 +879,6 @@ async function lstatIfExists(path: string): Promise<Awaited<ReturnType<typeof ls
     if (isNodeError(error, "ENOENT")) return null;
     throw wrap(error);
   }
-}
-
-function isCollisionError(error: unknown): boolean {
-  return isNodeError(error, "EEXIST") || isNodeError(error, "ENOTEMPTY");
 }
 
 async function authorizeLocation(
@@ -1128,7 +1084,7 @@ function assertClosedOptions(options: CreateOwnedRunRootOptions): void {
   assertSimpleOptions(options, new Set([
     "trustedProject", "repositoryRoot", "topic", "runId", "ownershipToken", "requestedPath",
     "allowAbsoluteRequestedPath", "approveOutside", "approvedOutsideRoots", "forbiddenRoots", "now", "randomBytes",
-    "durability", "rename", "onCheck",
+    "durability", "onCheck",
   ]));
   if (options.approvedOutsideRoots !== undefined) validatePathArray(options.approvedOutsideRoots);
   if (options.forbiddenRoots !== undefined) validatePathArray(options.forbiddenRoots);

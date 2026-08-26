@@ -118,6 +118,86 @@ describe("createOwnedRunRoot", () => {
     await second.close();
   });
 
+  test.each(["symlink", "directory", "file"] as const)(
+    "default creation never clobbers a %s raced into the final candidate",
+    async (kind) => {
+      const { base, project } = await fixture();
+      const canonicalProject = await realpath(project);
+      const candidate = join(canonicalProject, "research", "2026-08-25-raced-final");
+      const outside = join(base, "outside-racer");
+      await mkdir(outside);
+      let raced = false;
+      const owned = await createOwnedRunRoot(options(project, {
+        topic: "raced-final",
+        onCheck: async (phase: string) => {
+          if (phase !== "after-leaf-candidate-check-before-mkdir" || raced) return;
+          raced = true;
+          if (kind === "symlink") await symlink(outside, candidate);
+          else if (kind === "directory") await mkdir(candidate);
+          else await writeFile(candidate, "racer-content");
+        },
+      }));
+
+      expect(raced).toBe(true);
+      expect(owned.path).toBe(`${candidate}-2`);
+      const racer = await lstat(candidate);
+      expect(kind === "symlink" ? racer.isSymbolicLink() : kind === "directory" ? racer.isDirectory() : racer.isFile()).toBe(true);
+      if (kind === "file") expect(await readFile(candidate, "utf8")).toBe("racer-content");
+      await owned.close();
+    },
+  );
+
+  test.each(["symlink", "directory", "file"] as const)(
+    "explicit creation rejects and preserves a %s final-path racer",
+    async (kind) => {
+      const { base, project } = await fixture();
+      const canonicalProject = await realpath(project);
+      const candidate = join(canonicalProject, "explicit-raced-final");
+      const outside = join(base, "outside-explicit-racer");
+      await mkdir(outside);
+      let raced = false;
+      await expect(createOwnedRunRoot(options(project, {
+        requestedPath: "explicit-raced-final",
+        onCheck: async (phase: string) => {
+          if (phase !== "after-leaf-candidate-check-before-mkdir" || raced) return;
+          raced = true;
+          if (kind === "symlink") await symlink(outside, candidate);
+          else if (kind === "directory") await mkdir(candidate);
+          else await writeFile(candidate, "explicit-racer-content");
+        },
+      }))).rejects.toBeInstanceOf(RunRootError);
+
+      expect(raced).toBe(true);
+      const racer = await lstat(candidate);
+      expect(kind === "symlink" ? racer.isSymbolicLink() : kind === "directory" ? racer.isDirectory() : racer.isFile()).toBe(true);
+      if (kind === "file") expect(await readFile(candidate, "utf8")).toBe("explicit-racer-content");
+    },
+  );
+
+  test("a crash before marker creation leaves an unowned final leaf that is never adopted", async () => {
+    const { project } = await fixture();
+    let crashed = false;
+    await expect(createOwnedRunRoot(options(project, {
+      topic: "pre-marker-crash",
+      onCheck: async (phase: string) => {
+        if (phase === "after-final-leaf-open-before-marker" && !crashed) {
+          crashed = true;
+          throw new Error("crash");
+        }
+      },
+    }))).rejects.toBeInstanceOf(RunRootError);
+    expect(crashed).toBe(true);
+    const canonicalProject = await realpath(project);
+    const abandoned = join(canonicalProject, "research", "2026-08-25-pre-marker-crash");
+    expect((await lstat(abandoned)).isDirectory()).toBe(true);
+    await expect(lstat(join(abandoned, ".pi-science-research-owner.json"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(openOwnedRunRoot(abandoned, RUN_ID, TOKEN)).rejects.toBeInstanceOf(RunRootError);
+
+    const recovered = await createOwnedRunRoot(options(project, { topic: "pre-marker-crash", ownershipToken: OTHER_TOKEN }));
+    expect(recovered.path).toBe(`${abandoned}-2`);
+    await recovered.close();
+  });
+
   test("concurrent creators receive distinct exclusive roots", async () => {
     const { project } = await fixture();
 
@@ -390,33 +470,30 @@ test("cross-process create", async () => {
     }
   });
 
-  test("never adopts a replacement research parent temp directory", async () => {
+  test("never adopts a replacement research parent directory", async () => {
     const { base, project } = await fixture();
     let injected = false;
+    const research = join(await realpath(project), "research");
     await expect(createOwnedRunRoot(options(project, {
       topic: "research-parent-swap",
       onCheck: async (phase: string) => {
-        if (phase !== "after-research-temp-mkdir" || injected) return;
+        if (phase !== "after-research-final-open" || injected) return;
         injected = true;
-        const canonicalProject = await realpath(project);
-        const temp = (await readdir(canonicalProject)).find((entry) => entry.startsWith(".tmp-run-root-"));
-        if (!temp) throw new Error("temp absent");
-        const original = join(canonicalProject, temp);
-        await rename(original, join(base, "moved-research-temp"));
-        await mkdir(original);
+        await rename(research, join(base, "moved-research-parent"));
+        await mkdir(research);
       },
     }))).rejects.toEqual(expectCode("run-root.replaced"));
     expect(injected).toBe(true);
-    await expect(lstat(join(await realpath(project), "research"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await lstat(research)).isDirectory()).toBe(true);
   });
 
   test.each([
-    "after-leaf-temp-mkdir-before-pin",
-    "after-leaf-temp-pin-before-open",
+    "after-final-leaf-mkdir-before-pin",
+    "after-final-leaf-pin-before-open",
+    "after-final-leaf-open-before-marker",
     "after-marker-create-before-write",
     "after-marker-write-before-fsync",
-    "after-marker-fsync-before-rename",
-    "after-leaf-rename-before-final-open",
+    "after-marker-fsync-before-finalization",
     "after-final-open-before-return",
     "after-leaf-parent-synced-before-return",
   ])("never adopts a replacement directory injected at %s", async (phase) => {
@@ -429,9 +506,7 @@ test("cross-process create", async () => {
         injected = true;
         const research = join(await realpath(project), "research");
         const entries = await readdir(research);
-        const selected = phase === "after-leaf-rename-before-final-open" || phase === "after-final-open-before-return" || phase === "after-leaf-parent-synced-before-return"
-          ? entries.find((entry) => entry.includes(`swap-${phase}`) && !entry.startsWith(".tmp-"))
-          : entries.find((entry) => entry.startsWith(".tmp-run-root-"));
+        const selected = entries.find((entry) => entry.includes(`swap-${phase}`));
         if (!selected) throw new Error("injection target absent");
         const original = join(research, selected);
         const moved = join(base, `moved-${phase}`);
@@ -442,7 +517,7 @@ test("cross-process create", async () => {
     expect(injected).toBe(true);
     const research = join(await realpath(project), "research");
     for (const entry of await readdir(research)) {
-      if (!entry.includes(`swap-${phase}`) || entry.startsWith(".tmp-")) continue;
+      if (!entry.includes(`swap-${phase}`)) continue;
       await expect(readFile(join(research, entry, ".pi-science-research-owner.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     }
   });
@@ -490,22 +565,20 @@ test("cross-process create", async () => {
   });
 
   test.each([
-    { kind: "hook", boundary: "after-research-temp-mkdir" },
-    { kind: "durability", boundary: "research-temp-directory-synced" },
-    { kind: "rename", boundary: "research" },
+    { kind: "hook", boundary: "after-research-candidate-check-before-mkdir" },
+    { kind: "durability", boundary: "research-directory-synced" },
     { kind: "durability", boundary: "research-parent-synced" },
-    { kind: "hook", boundary: "after-leaf-temp-mkdir-before-pin" },
-    { kind: "durability", boundary: "leaf-temp-directory-synced" },
+    { kind: "hook", boundary: "after-leaf-candidate-check-before-mkdir" },
+    { kind: "hook", boundary: "after-final-leaf-open-before-marker" },
+    { kind: "durability", boundary: "leaf-final-directory-synced" },
     { kind: "hook", boundary: "before-marker-create" },
     { kind: "hook", boundary: "after-marker-create-before-write" },
     { kind: "hook", boundary: "after-marker-write-before-fsync" },
     { kind: "durability", boundary: "marker-synced" },
     { kind: "durability", boundary: "leaf-marker-directory-synced" },
-    { kind: "rename", boundary: "leaf" },
     { kind: "durability", boundary: "leaf-parent-synced" },
   ])("recovers safely after $kind failure at $boundary", async ({ kind, boundary }) => {
     const { project } = await fixture();
-    let renameCount = 0;
     await expect(createOwnedRunRoot(options(project, {
       topic: "durability",
       onCheck: async (phase: string) => {
@@ -515,16 +588,7 @@ test("cross-process create", async () => {
         if (kind === "durability" && step === boundary) throw new Error("injected");
         await handle.sync();
       },
-      rename: async (from: string, to: string) => {
-        renameCount += 1;
-        const isResearch = basename(to) === "research";
-        if (kind === "rename" && ((boundary === "research" && isResearch) || (boundary === "leaf" && !isResearch))) {
-          throw new Error("injected");
-        }
-        await rename(from, to);
-      },
     }))).rejects.toBeInstanceOf(RunRootError);
-    if (kind === "rename") expect(renameCount).toBeGreaterThan(0);
 
     const recovered = await createOwnedRunRoot(options(project, { topic: "durability", ownershipToken: OTHER_TOKEN }));
     const marker = JSON.parse(await readFile(join(recovered.path, ".pi-science-research-owner.json"), "utf8"));
@@ -532,10 +596,22 @@ test("cross-process create", async () => {
     expect(marker.ownershipTokenSha256).toBe(sha256Hex(OTHER_TOKEN));
     const research = join(await realpath(project), "research");
     for (const entry of await readdir(research)) {
-      if (entry.startsWith(".tmp-run-root-")) continue;
       const info = await lstat(join(research, entry));
       if (!info.isDirectory()) continue;
-      const visibleMarker = JSON.parse(await readFile(join(research, entry, ".pi-science-research-owner.json"), "utf8"));
+      let text: string;
+      try {
+        text = await readFile(join(research, entry, ".pi-science-research-owner.json"), "utf8");
+      } catch (error) {
+        if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") continue;
+        throw error;
+      }
+      let visibleMarker: Record<string, unknown>;
+      try {
+        visibleMarker = JSON.parse(text);
+      } catch {
+        expect(join(research, entry)).not.toBe(recovered.path);
+        continue;
+      }
       expect(visibleMarker.runId).toBe(RUN_ID);
       expect([sha256Hex(TOKEN), sha256Hex(OTHER_TOKEN)]).toContain(visibleMarker.ownershipTokenSha256);
     }
@@ -586,7 +662,7 @@ test("cross-process create", async () => {
     }))).rejects.toEqual(expectCode("run-root.io-failed"));
 
     const recovered = await createOwnedRunRoot(options(project));
-    expect(recovered.path.endsWith("2026-08-25-crispr-rna-review")).toBe(true);
+    expect(recovered.path.endsWith("2026-08-25-crispr-rna-review-2")).toBe(true);
     await recovered.close();
   });
 });
