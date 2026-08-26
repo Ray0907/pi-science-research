@@ -1,0 +1,488 @@
+import { randomUUID } from "node:crypto";
+import type { FileHandle } from "node:fs/promises";
+import { resolve } from "node:path";
+
+import { canonicalJson } from "../crypto/canonical-json.js";
+import { hashLedgerEvent } from "../crypto/hash.js";
+import {
+  FOUNDATION_EVENT_TYPES,
+  FoundationLedgerEventSchema,
+  type FoundationEventOfType,
+  type FoundationEventPayload,
+  type FoundationEventType,
+  type FoundationLedgerEvent,
+  type ReservedIdentityKind,
+  type ReservedIdentityOrigin,
+} from "../domain/events.js";
+import { ID_PATTERNS, isTimestamp } from "../domain/ids.js";
+import { parse } from "../domain/schema.js";
+import {
+  appendFully,
+  AtomicFileError,
+  defaultDurability,
+  openAppendOnlyLeaf,
+  truncateDurably,
+  type DurabilityHook,
+  type DurabilityReason,
+} from "./atomic.js";
+
+export { FOUNDATION_EVENT_TYPES } from "../domain/events.js";
+export type { DurabilityReason } from "./atomic.js";
+
+const ZERO_HASH = "0".repeat(64);
+export const DEFAULT_MAX_LEDGER_LINE_BYTES = 4 * 1024 * 1024;
+const READ_CHUNK_BYTES = 64 * 1024;
+const openPaths = new Set<string>();
+
+export interface EventLedgerOptions {
+  now?: () => Date;
+  eventId?: () => string;
+  durability?: DurabilityHook;
+  maxLineBytes?: number;
+}
+
+export interface EventLedger {
+  append<T extends FoundationEventType>(type: T, payload: FoundationEventPayload<T>): Promise<FoundationEventOfType<T>>;
+  reserveIdentity(kind: ReservedIdentityKind, id: string, origin: ReservedIdentityOrigin): Promise<FoundationEventOfType<"identity_reserved">>;
+  readAll(): Promise<FoundationLedgerEvent[]>;
+  verify(): Promise<void>;
+  close(): Promise<void>;
+}
+
+export type EventLedgerErrorCode =
+  | "ledger.already-open"
+  | "ledger.closed"
+  | "ledger.unavailable"
+  | "ledger.symlink"
+  | "ledger.open-failed"
+  | "ledger.read-failed"
+  | "ledger.write-failed"
+  | "ledger.durability-failed"
+  | "ledger.line-too-large"
+  | "ledger.empty-line"
+  | "ledger.torn-tail"
+  | "ledger.invalid-json"
+  | "ledger.noncanonical-line"
+  | "ledger.schema-invalid"
+  | "ledger.sequence-mismatch"
+  | "ledger.previous-hash-mismatch"
+  | "ledger.hash-mismatch"
+  | "ledger.duplicate-event-id"
+  | "event.schema-invalid"
+  | "event.duplicate-id"
+  | "identity.kind-mismatch"
+  | "identity.already-reserved"
+  | "identity.not-reserved";
+
+export class EventLedgerError extends Error {
+  readonly code: EventLedgerErrorCode;
+
+  constructor(code: EventLedgerErrorCode) {
+    super(`Event ledger operation failed (${code})`);
+    this.name = "EventLedgerError";
+    this.code = code;
+  }
+}
+
+export async function openEventLedger(path: string, options: EventLedgerOptions = {}): Promise<EventLedger> {
+  const canonicalPath = resolve(path);
+  if (openPaths.has(canonicalPath)) throw new EventLedgerError("ledger.already-open");
+  openPaths.add(canonicalPath);
+
+  let handle: FileHandle | undefined;
+  try {
+    const maxLineBytes = validateMaxLineBytes(options.maxLineBytes ?? DEFAULT_MAX_LEDGER_LINE_BYTES);
+    const durability = options.durability ?? defaultDurability;
+    handle = await openLeaf(canonicalPath);
+    const events = await scanLedger(handle, maxLineBytes, true, durability);
+    return createLedger(canonicalPath, handle, events, {
+      now: options.now ?? (() => new Date()),
+      eventId: options.eventId ?? (() => `event-${randomUUID()}`),
+      durability,
+      maxLineBytes,
+    });
+  } catch (error) {
+    await handle?.close().catch(() => undefined);
+    openPaths.delete(canonicalPath);
+    throw normalizeOpenError(error);
+  }
+}
+
+interface ResolvedOptions {
+  now: () => Date;
+  eventId: () => string;
+  durability: DurabilityHook;
+  maxLineBytes: number;
+}
+
+function createLedger(
+  canonicalPath: string,
+  handle: FileHandle,
+  initialEvents: FoundationLedgerEvent[],
+  options: ResolvedOptions,
+): EventLedger {
+  const events = initialEvents.map(cloneEvent);
+  const eventIds = new Set(events.map((event) => event.eventId));
+  const reservations = new Set(
+    events
+      .filter((event): event is FoundationEventOfType<"identity_reserved"> => event.type === "identity_reserved")
+      .map((event) => reservationKey(event.payload.kind, event.payload.id)),
+  );
+  let queue: Promise<void> = Promise.resolve();
+  let closeRequested = false;
+  let closePromise: Promise<void> | undefined;
+  let fatal = false;
+
+  function enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const result = queue.then(operation);
+    queue = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  function assertWritable(): void {
+    if (closeRequested) throw new EventLedgerError("ledger.closed");
+    if (fatal) throw new EventLedgerError("ledger.unavailable");
+  }
+
+  async function appendInternal<T extends FoundationEventType>(
+    type: T,
+    payload: FoundationEventPayload<T>,
+  ): Promise<FoundationEventOfType<T>> {
+    if (fatal) throw new EventLedgerError("ledger.unavailable");
+    const previous = events.at(-1);
+    const eventWithoutHash = {
+      schemaVersion: 1,
+      seq: (previous?.seq ?? 0) + 1,
+      occurredAt: safeTimestamp(options.now),
+      eventId: safeEventId(options.eventId),
+      type,
+      payload,
+      prevSha256: previous?.entrySha256 ?? ZERO_HASH,
+    };
+    const candidate = {
+      ...eventWithoutHash,
+      entrySha256: hashLedgerEvent(eventWithoutHash),
+    };
+    const parsed = parse(FoundationLedgerEventSchema, candidate);
+    if (!parsed.success) throw new EventLedgerError("event.schema-invalid");
+    const event = parsed.value as FoundationEventOfType<T>;
+    if (eventIds.has(event.eventId)) throw new EventLedgerError("event.duplicate-id");
+    validateReservationEvent(event, reservations, "append");
+    validateReservedReferences(event, reservations);
+
+    const encoded = Buffer.from(`${canonicalJson(event)}\n`, "utf8");
+    if (encoded.byteLength - 1 > options.maxLineBytes) throw new EventLedgerError("ledger.line-too-large");
+    try {
+      await appendFully(handle, encoded);
+    } catch {
+      fatal = true;
+      throw new EventLedgerError("ledger.write-failed");
+    }
+    try {
+      await options.durability(handle, "append");
+    } catch {
+      fatal = true;
+      throw new EventLedgerError("ledger.durability-failed");
+    }
+
+    events.push(cloneEvent(event));
+    eventIds.add(event.eventId);
+    if (event.type === "identity_reserved") {
+      const reservation = event as FoundationEventOfType<"identity_reserved">;
+      reservations.add(reservationKey(reservation.payload.kind, reservation.payload.id));
+    }
+    return cloneEvent(event) as FoundationEventOfType<T>;
+  }
+
+  return {
+    append(type, payload) {
+      try {
+        assertWritable();
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      return enqueue(() => appendInternal(type, payload));
+    },
+    reserveIdentity(kind, id, origin) {
+      try {
+        assertWritable();
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      return enqueue(async () => {
+        validateIdentity(kind, id);
+        return appendInternal("identity_reserved", { kind, id, origin });
+      });
+    },
+    readAll() {
+      return enqueue(async () => events.map(cloneEvent));
+    },
+    verify() {
+      return enqueue(async () => {
+        let scanned: FoundationLedgerEvent[];
+        try {
+          scanned = await scanLedger(handle, options.maxLineBytes, false, options.durability);
+        } catch (error) {
+          throw normalizeReadError(error);
+        }
+        if (scanned.length !== events.length || scanned.some((event, index) => event.entrySha256 !== events[index]?.entrySha256)) {
+          throw new EventLedgerError("ledger.hash-mismatch");
+        }
+      });
+    },
+    close() {
+      if (closePromise) return closePromise;
+      closeRequested = true;
+      closePromise = enqueue(async () => {
+        try {
+          await handle.close();
+        } finally {
+          openPaths.delete(canonicalPath);
+        }
+      });
+      return closePromise;
+    },
+  };
+}
+
+async function scanLedger(
+  handle: FileHandle,
+  maxLineBytes: number,
+  recoverTornTail: boolean,
+  durability: DurabilityHook,
+): Promise<FoundationLedgerEvent[]> {
+  const events: FoundationLedgerEvent[] = [];
+  const eventIds = new Set<string>();
+  const reservations = new Set<string>();
+  const parts: Buffer[] = [];
+  let partsLength = 0;
+  let lineOverflow = false;
+  let position = 0;
+  let committedBoundary = 0;
+  const chunk = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+
+  for (;;) {
+    let bytesRead: number;
+    try {
+      ({ bytesRead } = await handle.read(chunk, 0, chunk.byteLength, position));
+    } catch {
+      throw new EventLedgerError("ledger.read-failed");
+    }
+    if (bytesRead === 0) break;
+    let cursor = 0;
+    while (cursor < bytesRead) {
+      const newline = chunk.indexOf(0x0a, cursor);
+      if (newline < 0 || newline >= bytesRead) {
+        addLinePart(chunk.subarray(cursor, bytesRead));
+        break;
+      }
+      addLinePart(chunk.subarray(cursor, newline));
+      if (lineOverflow) throw new EventLedgerError("ledger.line-too-large");
+      if (partsLength === 0) throw new EventLedgerError("ledger.empty-line");
+      const line = Buffer.concat(parts, partsLength);
+      const event = parseLedgerLine(line, events.at(-1), eventIds, reservations);
+      events.push(event);
+      eventIds.add(event.eventId);
+      if (event.type === "identity_reserved") reservations.add(reservationKey(event.payload.kind, event.payload.id));
+      parts.length = 0;
+      partsLength = 0;
+      committedBoundary = position + newline + 1;
+      cursor = newline + 1;
+    }
+    position += bytesRead;
+  }
+
+  if (partsLength > 0 || lineOverflow) {
+    if (!recoverTornTail) throw new EventLedgerError("ledger.torn-tail");
+    try {
+      await truncateDurably(handle, committedBoundary, durability);
+    } catch {
+      throw new EventLedgerError("ledger.durability-failed");
+    }
+  }
+  return events;
+
+  function addLinePart(part: Buffer): void {
+    if (part.byteLength === 0) return;
+    if (lineOverflow || partsLength + part.byteLength > maxLineBytes) {
+      lineOverflow = true;
+      parts.length = 0;
+      partsLength = 0;
+      return;
+    }
+    parts.push(Buffer.from(part));
+    partsLength += part.byteLength;
+  }
+}
+
+function parseLedgerLine(
+  line: Buffer,
+  previous: FoundationLedgerEvent | undefined,
+  eventIds: Set<string>,
+  reservations: Set<string>,
+): FoundationLedgerEvent {
+  let input: unknown;
+  try {
+    input = JSON.parse(line.toString("utf8"));
+  } catch {
+    throw new EventLedgerError("ledger.invalid-json");
+  }
+
+  let canonical: string;
+  try {
+    canonical = canonicalJson(input);
+  } catch {
+    throw new EventLedgerError("ledger.schema-invalid");
+  }
+  if (canonical !== line.toString("utf8")) throw new EventLedgerError("ledger.noncanonical-line");
+  const parsed = parse(FoundationLedgerEventSchema, input);
+  if (!parsed.success) throw new EventLedgerError("ledger.schema-invalid");
+  const event = parsed.value as unknown as FoundationLedgerEvent;
+  if (event.seq !== (previous?.seq ?? 0) + 1) throw new EventLedgerError("ledger.sequence-mismatch");
+  if (event.prevSha256 !== (previous?.entrySha256 ?? ZERO_HASH)) throw new EventLedgerError("ledger.previous-hash-mismatch");
+  if (event.entrySha256 !== hashLedgerEvent(event)) throw new EventLedgerError("ledger.hash-mismatch");
+  if (eventIds.has(event.eventId)) throw new EventLedgerError("ledger.duplicate-event-id");
+  validateReservationEvent(event, reservations, "replay");
+  validateReservedReferences(event, reservations);
+  return cloneEvent(event);
+}
+
+function validateReservationEvent(
+  event: FoundationLedgerEvent,
+  reservations: Set<string>,
+  mode: "append" | "replay",
+): void {
+  if (event.type !== "identity_reserved") return;
+  validateIdentity(event.payload.kind, event.payload.id);
+  if (reservations.has(reservationKey(event.payload.kind, event.payload.id))) {
+    throw new EventLedgerError(mode === "append" ? "identity.already-reserved" : "ledger.schema-invalid");
+  }
+}
+
+function validateReservedReferences(event: FoundationLedgerEvent, reservations: Set<string>): void {
+  const references: { kind: ReservedIdentityKind; id: string }[] = [];
+  const add = (kind: ReservedIdentityKind, id: string | null) => {
+    if (id !== null) references.push({ kind, id });
+  };
+
+  switch (event.type) {
+    case "identity_reserved":
+    case "state_changed":
+    case "resume_epoch_started":
+    case "active_time_checkpoint":
+    case "budget_amended":
+    case "cancel_requested":
+    case "lock_recovered":
+      break;
+    case "run_created":
+      event.payload.run.attemptRefs.forEach((ref) => add("attempt", ref.attemptId));
+      add("revision", event.payload.run.currentRevisionId);
+      break;
+    case "task_upserted":
+      event.payload.task.attemptIds.forEach((id) => add("attempt", id));
+      break;
+    case "dispatch_intent":
+      add("attempt", event.payload.attempt.attemptId);
+      if (event.payload.attempt.retryOfAttemptId !== null) add("attempt", event.payload.attempt.retryOfAttemptId);
+      break;
+    case "dispatch_started":
+    case "attempt_usage_recorded":
+    case "attempt_failed":
+      add("attempt", event.payload.attemptId);
+      break;
+    case "result_recorded":
+      add("attempt", event.payload.attemptId);
+      add("transaction", event.payload.transactionId);
+      break;
+    case "records_committed":
+      add("transaction", event.payload.transactionId);
+      event.payload.requestIds.forEach((id) => add("request", id));
+      break;
+    case "attempt_committed":
+      add("attempt", event.payload.attemptId);
+      add("transaction", event.payload.transactionId);
+      break;
+    case "retry_scheduled":
+      add("retry-schedule", event.payload.scheduleId);
+      add("attempt", event.payload.failedAttemptId);
+      break;
+    case "retry_started":
+      add("retry-schedule", event.payload.scheduleId);
+      add("attempt", event.payload.attemptId);
+      break;
+    case "revision_prepared":
+    case "revision_committed":
+    case "revision_failed":
+    case "run_completed":
+      add("revision", event.payload.revisionId);
+      break;
+  }
+
+  if (references.some(({ kind, id }) => !reservations.has(reservationKey(kind, id)))) {
+    throw new EventLedgerError("identity.not-reserved");
+  }
+}
+
+const identityPatterns: Record<ReservedIdentityKind, RegExp> = {
+  attempt: ID_PATTERNS.attempt,
+  request: ID_PATTERNS.request,
+  "retry-schedule": ID_PATTERNS.retry,
+  transaction: ID_PATTERNS.transaction,
+  revision: ID_PATTERNS.revision,
+};
+
+function validateIdentity(kind: ReservedIdentityKind, id: string): void {
+  if (!identityPatterns[kind]?.test(id)) throw new EventLedgerError("identity.kind-mismatch");
+}
+
+function reservationKey(kind: ReservedIdentityKind, id: string): string {
+  return `${kind}\u0000${id}`;
+}
+
+function safeTimestamp(now: () => Date): string {
+  try {
+    const timestamp = now().toISOString();
+    if (!isTimestamp(timestamp)) throw new Error("invalid");
+    return timestamp;
+  } catch {
+    throw new EventLedgerError("event.schema-invalid");
+  }
+}
+
+function safeEventId(generator: () => string): string {
+  try {
+    const id = generator();
+    if (typeof id !== "string") throw new Error("invalid");
+    return id;
+  } catch {
+    throw new EventLedgerError("event.schema-invalid");
+  }
+}
+
+async function openLeaf(path: string): Promise<FileHandle> {
+  try {
+    return await openAppendOnlyLeaf(path);
+  } catch (error) {
+    if (error instanceof AtomicFileError && error.code === "symlink") throw new EventLedgerError("ledger.symlink");
+    throw new EventLedgerError("ledger.open-failed");
+  }
+}
+
+function validateMaxLineBytes(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 1) throw new EventLedgerError("ledger.open-failed");
+  return value;
+}
+
+function normalizeOpenError(error: unknown): Error {
+  if (error instanceof EventLedgerError) return error;
+  return new EventLedgerError("ledger.open-failed");
+}
+
+function normalizeReadError(error: unknown): Error {
+  if (error instanceof EventLedgerError) return error;
+  return new EventLedgerError("ledger.read-failed");
+}
+
+function cloneEvent<T extends FoundationLedgerEvent>(event: T): T {
+  return structuredClone(event);
+}
