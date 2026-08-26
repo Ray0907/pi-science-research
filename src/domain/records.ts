@@ -264,7 +264,7 @@ registerRefinement(RetryScheduleSchema, (input) => {
 registerRefinement(CanonicalTransactionManifestSchema, (input) => {
   const value = input as CanonicalTransactionManifest;
   const issues: ValidationIssue[] = [...timestampIssues(value, ["createdAt"])];
-  const portable = (path: string) => !path.startsWith("/") && !/^[a-z]:\//i.test(path) && !path.includes("\\") && path.split("/").every((part) => part !== "" && part !== "." && part !== "..");
+  const portable = (path: string) => !path.startsWith("/") && !/^[a-z]:/i.test(path) && !path.includes("\\") && path.split("/").every((part) => part !== "" && part !== "." && part !== "..");
   value.files.forEach((file, index) => {
     if (!portable(file.relativePath)) issues.push(issue(`/files/${index}/relativePath`, "manifest.relative-path"));
   });

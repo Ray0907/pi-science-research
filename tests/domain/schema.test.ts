@@ -369,6 +369,13 @@ describe("closed record schemas", () => {
     expectInvalid(RunSnapshotSchema, runFixture({ allowCalculations: true }));
   });
 
+  test.each(["C:secret", "z:folder/file"])("rejects Windows drive-qualified relative manifest path %s", (relativePath) => {
+    expectInvalid(CanonicalTransactionManifestSchema, {
+      ...manifestFixture(),
+      files: [{ ...manifestFixture().files[0], relativePath }],
+    }, "/files/0/relativePath");
+  });
+
   test("enforces manifest paths, uniqueness, and numeric constraints", () => {
     for (const path of ["/abs", "C:/secret", "c:/secret", "a\\b", ".", "..", "a//b", "a/./b", "a/../b", "a/", "/a"]) {
       expectInvalid(CanonicalTransactionManifestSchema, { ...manifestFixture(), files: [{ ...manifestFixture().files[0], relativePath: path }] });
