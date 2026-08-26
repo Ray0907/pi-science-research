@@ -90,6 +90,19 @@ describe("scholarly identifiers", () => {
       expect(normalizeDoi(resolver)).toBe(expected);
     }
     expect(canonicalDoiUrl("10.1234/a%255Cb")).toBe("https://doi.org/10.1234/a%25255cb");
+
+    const exactCanonicalDoi = `10.1234/${"%25".repeat(167)}a`;
+    const overCanonicalDoi = `10.1234/${"%25".repeat(167)}aa`;
+    expect(Buffer.byteLength(canonicalJson(exactCanonicalDoi), "utf8")).toBe(512);
+    expect(Buffer.byteLength(canonicalJson(overCanonicalDoi), "utf8")).toBe(513);
+    expect(Buffer.byteLength(decodeURIComponent(exactCanonicalDoi), "utf8")).toBeLessThan(512);
+    expect(Buffer.byteLength(decodeURIComponent(overCanonicalDoi), "utf8")).toBeLessThan(512);
+    expect(normalizeDoi(exactCanonicalDoi)).toBe(exactCanonicalDoi);
+    expect(normalizeDoi(normalizeDoi(exactCanonicalDoi))).toBe(exactCanonicalDoi);
+    expect(normalizeDoi(canonicalDoiUrl(exactCanonicalDoi))).toBe(exactCanonicalDoi);
+    expect(code(() => normalizeDoi(overCanonicalDoi))).toBe("identifier.invalid-doi");
+    expect(code(() => canonicalDoiUrl(overCanonicalDoi))).toBe("identifier.invalid-doi");
+
     expect(normalizeDoi("10.1234/a%2Eb")).toBe("10.1234/a.b");
     expect(normalizeDoi("10.1234/a.")).toBe("10.1234/a.");
   });

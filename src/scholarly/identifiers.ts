@@ -172,10 +172,12 @@ function normalizeDoiWithLimit(input: unknown, limit: number): string {
   catch { return fail("identifier.invalid-doi"); }
   if (CONTROL_OR_BIDI.test(candidate) || candidate.includes("\\") || /[^\x21-\x7e]/u.test(candidate)) fail("identifier.invalid-doi");
   const match = /^(10\.[0-9]{4,9})\/(.+)$/u.exec(candidate);
-  if (!match || Buffer.byteLength(candidate, "utf8") > 512) fail("identifier.invalid-doi");
+  if (!match) fail("identifier.invalid-doi");
   const canonicalPrefix = match[1]!.toLowerCase();
   const canonicalSuffix = match[2]!.replaceAll("%", "%25").toLowerCase();
-  return `${canonicalPrefix}/${canonicalSuffix}`;
+  const canonicalDoi = `${canonicalPrefix}/${canonicalSuffix}`;
+  if (Buffer.byteLength(canonicalJson(canonicalDoi), "utf8") > 512) fail("identifier.invalid-doi");
+  return canonicalDoi;
 }
 
 function normalizePmidWithLimit(input: unknown, limit: number): string {
