@@ -5,9 +5,6 @@ import { sha256Hex } from "../crypto/hash.js";
 import { type RequestRecord } from "../domain/events.js";
 import {
   CalculationRecordSchema,
-  ClaimRecordSchema,
-  EvidenceRecordSchema,
-  VerificationRecordSchema,
   type CalculationRecord,
   type ClaimRecord,
   type EvidenceRecord,
@@ -19,9 +16,9 @@ import { parse } from "../domain/schema.js";
 import { buildLineageGraphFromValidatedSources, LineageError, type LineageGraph } from "./lineage.js";
 import {
   SourceIdentityError,
-  buildRequestProvenanceIndex,
+  buildRequestProvenanceIndexForEvidenceSnapshotInternal,
   getValidatedSourceRecordsInternal,
-  validateSourceCanonicalUrlProvenance,
+  validateSourceCanonicalUrlProvenanceFromSnapshotInternal,
   validatedProvenanceRecordsForSnapshot,
   type RequestProvenanceDiagnostics,
   type RequestProvenanceIndex,
@@ -29,7 +26,9 @@ import {
 import { assertBoundedStructure, StructuralLimitError } from "../storage/bounded-structure.js";
 import {
   EvidenceAdmissionError,
-  validateProspectiveEvidenceSemantics,
+  prepareProspectiveEvidenceCanonicalInternal,
+  validatePreparedEvidenceSemanticsInternal,
+  type PreparedProspectiveEvidenceSemanticsInternal,
   type BoundedValidatedEvidenceSnapshot,
   type CanonicalEvidenceSet,
   type EvidenceSetLimits,
@@ -72,7 +71,7 @@ interface NormalizedOptions {
   readonly policySha256: string;
   readonly optionsSha256: string;
 }
-interface Prepared<T> { readonly record: T; readonly json: string; readonly bytes: number }
+interface Prepared<T> { readonly record: T; readonly json: string; readonly bytes: number; readonly prospective?: PreparedProspectiveEvidenceSemanticsInternal }
 interface InternalSnapshotState {
   readonly open: true;
   readonly snapshotSha256: string;
@@ -113,15 +112,21 @@ export function buildBoundedValidatedEvidenceSnapshotInternal(
   const totalRecords = sumCounts(Object.values(arrays).map((value) => value.length), "evidence.too-many-records");
   if (totalRecords > normalized.limits.maxTotalRecords) fail("evidence.too-many-records");
 
+  let claims = prepareEvidenceKind(arrays.claims, "claim", normalized.limits.maxClaimRecordCanonicalBytes, diagnostics) as Prepared<ClaimRecord>[];
+  let evidence = prepareEvidenceKind(arrays.evidence, "evidence", normalized.limits.maxEvidenceRecordCanonicalBytes, diagnostics) as Prepared<EvidenceRecord>[];
+  let verifications = prepareEvidenceKind(arrays.verifications, "verification", normalized.limits.maxVerificationRecordCanonicalBytes, diagnostics) as Prepared<VerificationRecord>[];
+  let calculations = prepareKind(arrays.calculations, CalculationRecordSchema, normalized.limits.maxCalculationRecordCanonicalBytes, diagnostics) as Prepared<CalculationRecord>[];
+  let canonicalBytes: number | undefined;
+
   const provenanceDiagnostics: RequestProvenanceDiagnostics = {
     sourceVisits: 0, requestVisits: 0, requestUrlVisits: 0, metadataStepVisits: 0, witnessInsertions: 0,
   };
   let requestProvenanceIndex: RequestProvenanceIndex;
   try {
-    requestProvenanceIndex = buildRequestProvenanceIndex(
+    requestProvenanceIndex = buildRequestProvenanceIndexForEvidenceSnapshotInternal(
       arrays.sources as readonly SourceRecord[], arrays.requests as readonly RequestRecord[],
       {
-        maxSources: Math.min(normalized.limits.maxPerKind.sources, 100_000),
+        maxSources: normalized.limits.maxPerKind.sources,
         maxRequests: normalized.limits.maxPerKind.requests,
         maxProvenanceSteps: Math.min(normalized.limits.maxReferences, 1_000_000),
         maxCanonicalScalarBytes: normalized.limits.maxCanonicalScalarBytes,
@@ -131,8 +136,18 @@ export function buildBoundedValidatedEvidenceSnapshotInternal(
         ...(normalized.sourceUrlPolicy === undefined ? {} : { sourceUrlPolicy: normalized.sourceUrlPolicy }),
       },
       provenanceDiagnostics,
+      (prepared) => {
+        canonicalBytes = measureCanonicalSet({
+          sources: prepared.sources.map((record, index) => Object.freeze({ record, json: prepared.sourceCanonicalJson[index]!, bytes: Buffer.byteLength(prepared.sourceCanonicalJson[index]!, "utf8") })),
+          requests: prepared.requests.map((record, index) => Object.freeze({ record, json: prepared.requestCanonicalJson[index]!, bytes: Buffer.byteLength(prepared.requestCanonicalJson[index]!, "utf8") })),
+          claims, evidence, verifications, calculations,
+        }, normalized.limits.maxCanonicalEvidenceSetBytes);
+      },
     );
-  } catch (error) { return translateSourceError(error); }
+  } catch (error) {
+    if (error instanceof EvidenceAdmissionError) throw error;
+    return translateSourceError(error);
+  }
   bump(diagnostics, "requestRecordsIndexed", provenanceDiagnostics.requestVisits);
   bump(diagnostics, "requestUrlVisits", provenanceDiagnostics.requestUrlVisits);
   bump(diagnostics, "metadataStepVisits", provenanceDiagnostics.metadataStepVisits);
@@ -147,19 +162,21 @@ export function buildBoundedValidatedEvidenceSnapshotInternal(
   const task2Internal = getValidatedSourceRecordsInternal(task2Records.sources, task2Records.sourceCanonicalJson);
   bump(diagnostics, "canonicalRecordVisits", task2Records.sources.length + task2Records.requests.length);
 
-  const claims = orderPrepared("claims", prepareKind(arrays.claims, ClaimRecordSchema, normalized.limits.maxClaimRecordCanonicalBytes, diagnostics) as Prepared<ClaimRecord>[]);
-  const evidence = orderPrepared("evidence", prepareKind(arrays.evidence, EvidenceRecordSchema, normalized.limits.maxEvidenceRecordCanonicalBytes, diagnostics) as Prepared<EvidenceRecord>[]);
-  const verifications = orderPrepared("verifications", prepareKind(arrays.verifications, VerificationRecordSchema, normalized.limits.maxVerificationRecordCanonicalBytes, diagnostics) as Prepared<VerificationRecord>[]);
-  const calculations = orderPrepared("calculations", prepareKind(arrays.calculations, CalculationRecordSchema, normalized.limits.maxCalculationRecordCanonicalBytes, diagnostics) as Prepared<CalculationRecord>[]);
+  if (canonicalBytes === undefined) fail("evidence.invalid-input");
   const preparedByKind: Record<SnapshotRecordKind, readonly Prepared<unknown>[]> = {
     sources: task2Records.sources.map((record, index) => Object.freeze({ record, json: task2Records.sourceCanonicalJson[index]!, bytes: Buffer.byteLength(task2Records.sourceCanonicalJson[index]!, "utf8") })),
     requests: task2Records.requests.map((record, index) => Object.freeze({ record, json: task2Records.requestCanonicalJson[index]!, bytes: Buffer.byteLength(task2Records.requestCanonicalJson[index]!, "utf8") })),
     claims, evidence, verifications, calculations,
   };
+  claims = orderPrepared("claims", claims); evidence = orderPrepared("evidence", evidence);
+  verifications = orderPrepared("verifications", verifications); calculations = orderPrepared("calculations", calculations);
+  preparedByKind.claims = claims; preparedByKind.evidence = evidence;
+  preparedByKind.verifications = verifications; preparedByKind.calculations = calculations;
   const canonicalSetString = assembleCanonicalSet(preparedByKind);
-  const canonicalBytes = Buffer.byteLength(canonicalSetString, "utf8");
-  if (canonicalBytes > normalized.limits.maxCanonicalEvidenceSetBytes) fail("evidence.input-too-large");
-  for (const item of [...claims, ...evidence, ...verifications]) validateProspectiveEvidenceSemantics(item.record);
+  for (const item of [...claims, ...evidence, ...verifications]) {
+    if (!item.prospective) fail("evidence.invalid-input");
+    validatePreparedEvidenceSemanticsInternal(item.prospective);
+  }
 
   const orderedRecords = Object.freeze({
     sources: task2Records.sources,
@@ -172,15 +189,15 @@ export function buildBoundedValidatedEvidenceSnapshotInternal(
 
   auditSourceIdentities(orderedRecords.sources, diagnostics);
   for (const source of orderedRecords.sources) {
-    try { validateSourceCanonicalUrlProvenance(source, requestProvenanceIndex); }
+    try { validateSourceCanonicalUrlProvenanceFromSnapshotInternal(source, requestProvenanceIndex); }
     catch (error) { return translateSourceError(error); }
   }
   let lineageGraph: LineageGraph;
   try {
     lineageGraph = buildLineageGraphFromValidatedSources(task2Records.sources, task2Records.sourceCanonicalJson, {
       maxRevisions: Math.min(normalized.limits.maxPerKind.sources, 500_000),
-      maxStableSources: Math.min(normalized.limits.maxLineageComponents, 200_000),
-      maxGraphNodes: Math.min(normalized.limits.maxPerKind.sources + normalized.limits.maxLineageComponents, 500_000),
+      maxStableSources: Math.min(normalized.limits.maxPerKind.sources, 200_000),
+      maxGraphNodes: Math.min(normalized.limits.maxPerKind.sources * 2, 500_000),
       maxEdges: Math.min(normalized.limits.maxReferences, 1_000_000),
       maxTraversalDepth: 250_000,
       maxSourceRecordCanonicalBytes: normalized.limits.maxSourceRecordCanonicalBytes,
@@ -188,6 +205,7 @@ export function buildBoundedValidatedEvidenceSnapshotInternal(
     });
   } catch (error) { return translateLineageError(error); }
   bump(diagnostics, "lineageVisits", orderedRecords.sources.length);
+  if (lineageGraph.dependencyComponentCount > normalized.limits.maxLineageComponents) fail("evidence.input-too-large");
 
   const indexes = buildIndexes(orderedRecords, preparedByKind, requestProvenanceIndex, lineageGraph, normalized, diagnostics);
   const snapshotSha256 = sha256Hex(canonicalSetString);
@@ -298,6 +316,20 @@ function orderPrepared<T>(kind: SnapshotRecordKind, values: readonly Prepared<T>
     return `${id}\0${revision === undefined ? "" : String(revision).padStart(16, "0")}`;
   });
 }
+function prepareEvidenceKind(
+  inputs: readonly unknown[], expected: "claim" | "evidence" | "verification", maxBytes: number,
+  diagnostics?: EvidenceSnapshotDiagnostics,
+): Prepared<unknown>[] {
+  const output: Prepared<unknown>[] = [];
+  for (const input of inputs) {
+    const prospective = prepareProspectiveEvidenceCanonicalInternal(input, maxBytes, expected);
+    output.push(Object.freeze({
+      record: prospective.record, json: prospective.canonicalJson, bytes: prospective.canonicalBytes, prospective,
+    }));
+    bump(diagnostics, "canonicalRecordVisits");
+  }
+  return output;
+}
 function prepareKind(inputs: readonly unknown[], schema: any, maxBytes: number, diagnostics?: EvidenceSnapshotDiagnostics): Prepared<unknown>[] {
   const output: Prepared<unknown>[] = [];
   for (const input of inputs) {
@@ -355,6 +387,7 @@ function normalizeOptions(input?: EvidenceSnapshotOptions): NormalizedOptions {
   const values: any = { maxPerKind: Object.freeze(per) };
   for (const key of Object.keys(LIMIT_DEFAULTS) as Array<keyof typeof LIMIT_DEFAULTS>) values[key] = limit(rawLimits[key], LIMIT_DEFAULTS[key], LIMIT_HARDS[key]);
   if (Object.values(per).some((value) => value > values.maxTotalRecords)
+    || values.maxLineageComponents > values.maxTotalRecords
     || values.maxCanonicalScalarBytes > values.maxSourceRecordCanonicalBytes
     || values.maxCanonicalScalarBytes > values.maxRequestRecordCanonicalBytes
     || values.maxSourceRecordCanonicalBytes > values.maxCanonicalEvidenceSetBytes || values.maxRequestRecordCanonicalBytes > values.maxCanonicalEvidenceSetBytes
@@ -370,44 +403,68 @@ function normalizeOptions(input?: EvidenceSnapshotOptions): NormalizedOptions {
     optionsSha256: sha256Hex(canonicalJson({ limits: frozenLimits, view: frozenView, policySha256 })) });
 }
 function limit(value: unknown, fallback: number, hard: number): number { const result = value ?? fallback; if (!Number.isSafeInteger(result) || (result as number) < 1 || (result as number) > hard) fail("evidence.invalid-options"); return result as number; }
+function measureCanonicalSet(prepared: Record<SnapshotRecordKind, readonly Prepared<unknown>[]>, maximum: number): number {
+  let bytes = 2; // outer braces
+  for (let kindIndex = 0; kindIndex < KIND_ORDER.length; kindIndex += 1) {
+    const kind = KIND_ORDER[kindIndex]!;
+    bytes = checkedAdd(bytes, Buffer.byteLength(canonicalJson(kind), "utf8") + 3, "evidence.input-too-large"); // key, colon, brackets
+    if (kindIndex > 0) bytes = checkedAdd(bytes, 1, "evidence.input-too-large");
+    const values = prepared[kind];
+    for (let index = 0; index < values.length; index += 1) {
+      bytes = checkedAdd(bytes, values[index]!.bytes, "evidence.input-too-large");
+      if (index > 0) bytes = checkedAdd(bytes, 1, "evidence.input-too-large");
+      if (bytes > maximum) fail("evidence.input-too-large");
+    }
+  }
+  if (bytes > maximum) fail("evidence.input-too-large");
+  return bytes;
+}
 function assembleCanonicalSet(prepared: Record<SnapshotRecordKind, readonly Prepared<unknown>[]>): string {
   return `{${KIND_ORDER.map((kind) => `${canonicalJson(kind)}:[${prepared[kind].map(({ json }) => json).join(",")}]`).join(",")}}`;
 }
 function auditSourceIdentities(sources: readonly SourceRecord[], diagnostics?: EvidenceSnapshotDiagnostics): void {
-  const latest = new Map<string, SourceRecord>();
-  for (const source of sources) if (!latest.has(source.sourceId) || latest.get(source.sourceId)!.revision < source.revision) latest.set(source.sourceId, source);
-  const strong = new Map<string, Set<string>>();
-  const keysBySource = new Map<string, string[]>();
-  const urls = new Map<string, SourceRecord>();
-  for (const source of latest.values()) {
+  const sourceIds = radixSortByUtf8Key([...new Set(sources.map(({ sourceId }) => sourceId))], (value) => value);
+  const indexById = new Map(sourceIds.map((id, index) => [id, index] as const));
+  const parent = sourceIds.map((_, index) => index);
+  const find = (value: number): number => { let root = value; while (parent[root] !== root) root = parent[root]!; while (parent[value] !== value) { const next = parent[value]!; parent[value] = root; value = next; } return root; };
+  const join = (left: number, right: number): void => { const a = find(left); const b = find(right); if (a !== b) parent[b] = a; };
+  const owner = new Map<string, number>();
+  for (const source of sources) {
     bump(diagnostics, "sourceIdentityVisits");
-    const keys: string[] = [];
-    for (const field of ["doi", "pmid", "pmcid"] as const) if (source.identifiers[field] !== null) {
-      const key = `${field}:${source.identifiers[field]}`; keys.push(key);
-      const ids = strong.get(key) ?? new Set<string>(); ids.add(source.sourceId); strong.set(key, ids);
+    const index = indexById.get(source.sourceId)!;
+    const keys = [`url:${source.canonicalUrl}`];
+    for (const field of ["doi", "pmid", "pmcid"] as const) if (source.identifiers[field] !== null) keys.push(`${field}:${source.identifiers[field]}`);
+    for (const key of keys) { const prior = owner.get(key); if (prior === undefined) owner.set(key, index); else join(prior, index); }
+  }
+  const recordsByRoot = new Map<number, SourceRecord[]>();
+  const idsByRoot = new Map<number, Set<string>>();
+  for (const source of sources) {
+    const root = find(indexById.get(source.sourceId)!);
+    const records = recordsByRoot.get(root) ?? []; records.push(source); recordsByRoot.set(root, records);
+    const ids = idsByRoot.get(root) ?? new Set<string>(); ids.add(source.sourceId); idsByRoot.set(root, ids);
+  }
+  for (const [root, component] of recordsByRoot) if (idsByRoot.get(root)!.size > 1) {
+    for (const field of ["doi", "pmid", "pmcid"] as const) {
+      const values = new Set(component.flatMap((source) => source.identifiers[field] === null ? [] : [source.identifiers[field]]));
+      if (values.size > 1) fail("evidence.ambiguous-source-identity");
     }
-    keysBySource.set(source.sourceId, keys);
-    const prior = urls.get(source.canonicalUrl); if (prior && prior.sourceId !== source.sourceId) {
-      const conflict = (["doi", "pmid", "pmcid"] as const).some((field) => prior.identifiers[field] !== null && source.identifiers[field] !== null && prior.identifiers[field] !== source.identifiers[field]);
-      if (conflict) fail("evidence.ambiguous-source-identity");
-    } urls.set(source.canonicalUrl, source);
-  }
-  for (const [sourceId, keys] of keysBySource) {
-    const linked = new Set<string>();
-    for (const key of keys) for (const id of strong.get(key) ?? []) if (id !== sourceId) linked.add(id);
-    if (linked.size > 1) fail("evidence.ambiguous-source-identity");
-  }
-  if ([...strong.values()].some((ids) => ids.size > 1)) fail("evidence.duplicate-source-identity");
-  const seenUrls = new Set<string>();
-  for (const source of latest.values()) {
-    if (seenUrls.has(source.canonicalUrl)) fail("evidence.duplicate-source-identity");
-    seenUrls.add(source.canonicalUrl);
+    fail("evidence.duplicate-source-identity");
   }
 }
 function validateClaimIdentity(records: ClaimRecord[]): void {
-  const base = canonicalJson(identityClaim(records[0]!)); for (const record of records.slice(1)) if (canonicalJson(identityClaim(record)) !== base) fail("evidence.invalid-prospective-record");
+  const base = records[0]!;
+  for (const record of records.slice(1)) if (record.statement !== base.statement || record.kind !== base.kind
+    || record.materiality !== base.materiality || record.createdByAttemptId !== base.createdByAttemptId
+    || record.scopeQualifiers.population !== base.scopeQualifiers.population
+    || record.scopeQualifiers.intervention !== base.scopeQualifiers.intervention
+    || record.scopeQualifiers.comparator !== base.scopeQualifiers.comparator
+    || record.scopeQualifiers.outcome !== base.scopeQualifiers.outcome
+    || record.scopeQualifiers.timeRange !== base.scopeQualifiers.timeRange
+    || record.evidenceRule.minimumLineages !== base.evidenceRule.minimumLineages
+    || record.evidenceRule.independentVerificationAllowed !== base.evidenceRule.independentVerificationAllowed
+    || record.evidenceRule.primarySourceRequired !== base.evidenceRule.primarySourceRequired
+    || record.evidenceRule.fullTextRequired !== base.evidenceRule.fullTextRequired) fail("evidence.invalid-prospective-record");
 }
-function identityClaim(record: ClaimRecord) { return { statement: record.statement, kind: record.kind, materiality: record.materiality, scopeQualifiers: record.scopeQualifiers, evidenceRule: record.evidenceRule, createdByAttemptId: record.createdByAttemptId }; }
 function referencesFor(kind: SnapshotRecordKind, record: any, latest: Map<string, number>): SnapshotRecordKey[] {
   const refs: SnapshotRecordKey[] = [];
   const latestRef = (targetKind: "sources" | "claims" | "evidence" | "verifications", id: string) => ({ kind: targetKind, id, revision: latest.get(latestKey(targetKind, id)) ?? -1 });
@@ -440,8 +497,8 @@ function validateDiagnostics(value?: EvidenceSnapshotDiagnostics): void {
   }
 }
 function bump(value: EvidenceSnapshotDiagnostics | undefined, key: keyof EvidenceSnapshotDiagnostics, amount = 1) { if (value) value[key] = checkedAdd(value[key], amount, "evidence.input-too-large"); }
-function translateSourceError(error: unknown): never { if (error instanceof SourceIdentityError) { const map: Partial<Record<string, any>> = { "source.record-too-large": "evidence.record-too-large", "source.input-too-large": "evidence.input-too-large", "source.url-policy-invalid": "evidence.source-url-policy-invalid", "source.url-unattributed": "evidence.source-url-unattributed", "source.url-request-mismatch": "evidence.source-url-request-mismatch", "source.url-metadata-mismatch": "evidence.source-url-metadata-mismatch" }; fail(map[error.code] ?? (error.code === "source.invalid-options" ? "evidence.invalid-options" : "evidence.invalid-input")); } return fail("evidence.invalid-input"); }
-function translateLineageError(error: unknown): never { if (error instanceof LineageError) { if (error.code === "lineage.record-too-large") fail("evidence.record-too-large"); if (error.code === "lineage.input-too-large" || error.code === "lineage.too-many-edges" || error.code === "lineage.too-many-sources") fail("evidence.input-too-large"); if (error.code === "lineage.unresolved-ref") fail("evidence.unresolved-ref"); if (error.code === "lineage.invalid-options") fail("evidence.invalid-options"); } return fail("evidence.invalid-input"); }
+function translateSourceError(error: unknown): never { if (error instanceof SourceIdentityError) { const map: Partial<Record<string, any>> = { "source.record-too-large": "evidence.record-too-large", "source.input-too-large": "evidence.input-too-large", "source.duplicate-revision": "evidence.duplicate-revision", "source.revision-gap": "evidence.revision-gap", "source.duplicate-request": "evidence.duplicate-request", "source.url-policy-invalid": "evidence.source-url-policy-invalid", "source.url-unattributed": "evidence.source-url-unattributed", "source.url-request-mismatch": "evidence.source-url-request-mismatch", "source.url-metadata-mismatch": "evidence.source-url-metadata-mismatch" }; fail(map[error.code] ?? (error.code === "source.invalid-options" ? "evidence.invalid-options" : "evidence.invalid-input")); } return fail("evidence.invalid-input"); }
+function translateLineageError(error: unknown): never { if (error instanceof LineageError) { if (error.code === "lineage.record-too-large") fail("evidence.record-too-large"); if (error.code === "lineage.input-too-large" || error.code === "lineage.too-many-edges" || error.code === "lineage.too-many-sources") fail("evidence.input-too-large"); if (error.code === "lineage.duplicate-revision") fail("evidence.duplicate-revision"); if (error.code === "lineage.revision-gap") fail("evidence.revision-gap"); if (error.code === "lineage.unresolved-ref") fail("evidence.unresolved-ref"); if (error.code === "lineage.invalid-options") fail("evidence.invalid-options"); } return fail("evidence.invalid-input"); }
 function sumCounts(values: number[], code: any): number { let total = 0; for (const value of values) total = checkedAdd(total, value, code); return total; }
 function checkedAdd(left: number, right: number, code: any): number { const result = left + right; if (!Number.isSafeInteger(result)) fail(code); return result; }
 function isPlain(value: unknown): value is Record<string, any> { return value !== null && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype; }

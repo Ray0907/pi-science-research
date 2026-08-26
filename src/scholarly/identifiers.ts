@@ -135,7 +135,7 @@ export function prepareProspectiveSourceIdentityFields(
   const normalizedOptions = closedOptions(options, ["maxCanonicalScalarBytes", "maxSourceRecordCanonicalBytes"]);
   const scalarBytes = positiveLimit(normalizedOptions.maxCanonicalScalarBytes, DEFAULT_SCALAR_BYTES, HARD_SCALAR_BYTES);
   const recordBytes = positiveLimit(normalizedOptions.maxSourceRecordCanonicalBytes, DEFAULT_SOURCE_BYTES, HARD_SOURCE_BYTES);
-  const normalizedPolicy = validatePolicy(policy);
+  validatePolicy(policy);
 
   let encoded: string;
   try {
@@ -154,15 +154,22 @@ export function prepareProspectiveSourceIdentityFields(
   const parsed = parse(SourceRecordSchema, snapshot);
   if (!parsed.success) fail("identifier.invalid-type");
   const record = parsed.value;
-  const scalarOptions = { maxCanonicalScalarBytes: scalarBytes };
+  validatePreparedSourceIdentityFieldsInternal(record, policy, scalarBytes);
+  return Object.freeze({ record: deepFreeze(record), canonicalJson: encoded, canonicalBytes });
+}
 
+/** Package-internal semantic validation for an already bounded/canonical SourceRecord snapshot. */
+export function validatePreparedSourceIdentityFieldsInternal(
+  record: SourceRecord, policy: SourceUrlPolicyContext | undefined, scalarBytes: number,
+): void {
+  const normalizedPolicy = validatePolicy(policy);
+  const scalarOptions = { maxCanonicalScalarBytes: scalarBytes };
   if (record.identifiers.doi !== null && normalizeDoi(record.identifiers.doi, scalarOptions) !== record.identifiers.doi)
     fail("identifier.invalid-doi");
   if (record.identifiers.pmid !== null && normalizePmid(record.identifiers.pmid, scalarOptions) !== record.identifiers.pmid)
     fail("identifier.invalid-pmid");
   if (record.identifiers.pmcid !== null && normalizePmcid(record.identifiers.pmcid, scalarOptions) !== record.identifiers.pmcid)
     fail("identifier.invalid-pmcid");
-
   const canonicalUrl = normalizeCanonicalUrl(record.canonicalUrl, {
     allowHttp: normalizedPolicy.allowHttp,
     maxCanonicalScalarBytes: scalarBytes,
@@ -172,7 +179,6 @@ export function prepareProspectiveSourceIdentityFields(
     const url = new URL(canonicalUrl);
     if (url.port !== "" || !normalizedPolicy.approvedHttpHosts.includes(url.hostname)) fail("url.http-host-not-approved");
   }
-  return Object.freeze({ record: deepFreeze(record), canonicalJson: encoded, canonicalBytes });
 }
 
 function normalizeDoiWithLimit(input: unknown, limit: number): string {

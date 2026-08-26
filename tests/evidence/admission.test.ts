@@ -118,7 +118,8 @@ describe("evidence admission", () => {
   });
   test("keeps historical evidence eligible after a later evidence revision exists", () => {
     const e1 = evidence(); const e2 = { ...e1, revision: 2, verificationStatus: "rejected" as const };
-    const result = evaluate({ ...set(), evidence: [e2, e1] });
+    const c1 = claim(); const c2 = { ...c1, revision: 2, evidenceRefs: [{ evidenceId: e2.evidenceId, revision: 2 }] };
+    const result = evaluate({ ...set(), claims: [c1, c2], evidence: [e2, e1] });
     expect(result.supportingEvidenceRefs).toEqual([{ evidenceId: e1.evidenceId, revision: 1 }]);
   });
   test("keeps retained historical exact refs valid while new latest refs must be current", () => {
@@ -254,7 +255,7 @@ describe("evidence admission", () => {
     expect(errorCode(() => validateProspectiveEvidenceSemantics(badValue))).toBe("evidence.invalid-prospective-record");
   });
   test("separately bounds every evidence kind total refs components and per-claim evidence", () => {
-    expect(errorCode(() => buildBoundedValidatedEvidenceSnapshot(set(), { limits: { maxPerKind: { sources: 1, claims: 1, evidence: 1, verifications: 1, requests: 1, calculations: 1 }, maxTotalRecords: 1 } }))).toBe("evidence.too-many-records");
+    expect(errorCode(() => buildBoundedValidatedEvidenceSnapshot(set(), { limits: { maxPerKind: { sources: 1, claims: 1, evidence: 1, verifications: 1, requests: 1, calculations: 1 }, maxTotalRecords: 1, maxLineageComponents: 1 } }))).toBe("evidence.too-many-records");
     expect(errorCode(() => evaluateEvidenceRule(buildBoundedValidatedEvidenceSnapshot(set()), refFor(claim()), { maxEvidencePerClaim: 0 }))).toBe("evidence.invalid-options");
   });
   test("rejects invalid evidence limits with evidence.invalid-options", () => {
@@ -307,6 +308,92 @@ describe("evidence admission", () => {
     const legacy = evidence(undefined, { quotes: [""] });
     expect(errorCode(() => validateProspectiveEvidenceSemantics(legacy))).toBe("evidence.invalid-prospective-record");
     expect(validateCanonicalEvidenceSet(set()).evidence).toHaveLength(1);
+  });
+  test("builds transitive evidence and claim conflict closure instead of direct-only admission", () => {
+    const a = evidence(undefined, { conflictsWith: ["ev-0000000000000002"] });
+    const b = evidence("ev-0000000000000002", { stance: "neutral", conflictsWith: [a.evidenceId, "ev-0000000000000003"] });
+    const c = evidence("ev-0000000000000003", { stance: "contradicting", conflictsWith: [b.evidenceId] });
+    const target = claim(undefined, { evidenceRefs: [refForEvidence(a)] });
+    expect(evaluate({ ...set(), claims: [target], evidence: [a, b, c] }).blockers).toContain("claim.unresolved-conflict");
+
+    const otherEvidence = evidence("ev-0000000000000004", { claimRef: { claimId: "claim-0000000000000002", revision: 1 }, stance: "contradicting" });
+    const first = claim(undefined, { conflictClaimIds: ["claim-0000000000000002"] });
+    const second = claim("claim-0000000000000002", { evidenceRefs: [refForEvidence(otherEvidence)], conflictClaimIds: [first.claimId] });
+    expect(evaluate({ ...set(), claims: [first, second], evidence: [evidence(), otherEvidence] }).contradictingEvidenceRefs).toContainEqual(refForEvidence(otherEvidence));
+  });
+  test("bounds cyclic conflict closure before expansion", () => {
+    const a = evidence(undefined, { conflictsWith: ["ev-0000000000000002"] });
+    const b = evidence("ev-0000000000000002", { conflictsWith: [a.evidenceId] });
+    const target = claim(undefined, { evidenceRefs: [refForEvidence(a)] });
+    const snapshot = buildBoundedValidatedEvidenceSnapshot({ ...set(), claims: [target], evidence: [a, b] });
+    expect(errorCode(() => evaluateEvidenceRule(snapshot, refFor(target), { maxEvidencePerClaim: 1 }))).toBe("evidence.too-many-records");
+  });
+  test("requires current verified resolved independent evidence distinct from every base component", () => {
+    const unknown = source("src-admission.0002", { lineage: { studyId: null, cohortIds: [], datasetIds: [], relatedSourceIds: [], relationTypes: [] } });
+    const independent = evidence("ev-0000000000000002", { sourceRef: refForSource(unknown), recordedByAttemptId: ATTEMPT_B, verificationStatus: "verified" });
+    const v = verification(undefined, { checkedEvidence: [refForEvidence(independent)], independentEvidenceIds: [independent.evidenceId] });
+    expect(evaluate({ ...set(), sources: [source(), unknown], evidence: [evidence(), independent], verifications: [v] }).independentVerificationCredit).toBe(0);
+    const resolved = source("src-admission.0003");
+    const unverified = { ...independent, evidenceId: "ev-0000000000000003", sourceRef: refForSource(resolved), verificationStatus: "unverified" as const };
+    const v2 = verification(undefined, { checkedEvidence: [refForEvidence(unverified)], independentEvidenceIds: [unverified.evidenceId] });
+    expect(evaluate({ ...set(), sources: [source(), resolved], evidence: [evidence(), unverified], verifications: [v2] }).independentVerificationCredit).toBe(0);
+    const current = { ...independent, sourceRef: refForSource(resolved) }; const later = { ...current, revision: 2 };
+    const stale = verification(undefined, { checkedEvidence: [refForEvidence(current)], independentEvidenceIds: [current.evidenceId] });
+    expect(evaluate({ ...set(), sources: [source(), resolved], evidence: [evidence(), current, later], verifications: [stale] }).independentVerificationCredit).toBe(0);
+  });
+  test("requires a distinct conflict verifier and complete reconciled correction", () => {
+    const contradiction = evidence("ev-0000000000000002", { stance: "contradicting", verificationStatus: "rejected" });
+    const target = claim(undefined, { evidenceRefs: [refForEvidence(evidence()), refForEvidence(contradiction)] });
+    const sameAttempt = verification(undefined, { attemptId: ATTEMPT_A, checkedEvidence: target.evidenceRefs, corrections: [{ claimId: target.claimId, description: "resolved" }] });
+    expect(evaluate({ ...set(), claims: [target], evidence: [evidence(), contradiction], verifications: [sameAttempt] }).blockers).toContain("claim.unresolved-conflict");
+  });
+  test("assigns deterministic lineage keys across study cohort dataset components and input permutations", () => {
+    const s1 = source();
+    const s2 = source("src-admission.0002", { lineage: { studyId: "study-two", cohortIds: s1.lineage.cohortIds, datasetIds: ["dataset-shared"], relatedSourceIds: [], relationTypes: [] } });
+    const s3 = source("src-admission.0003", { lineage: { studyId: "study-three", cohortIds: [], datasetIds: ["dataset-shared"], relatedSourceIds: [], relationTypes: [] } });
+    const items = [evidence(), evidence("ev-0000000000000002", { sourceRef: refForSource(s2) }), evidence("ev-0000000000000003", { sourceRef: refForSource(s3) })];
+    const target = claim(undefined, { evidenceRefs: items.map(refForEvidence) });
+    const forward = evaluate({ ...set(), sources: [s1, s2, s3], claims: [target], evidence: items });
+    const reversed = evaluate({ ...set(), sources: [s3, s2, s1], claims: [target], evidence: [...items].reverse() });
+    expect(forward.retrievedComponentCount).toBe(2);
+    expect(reversed).toEqual(forward);
+  });
+  test("requires latest evidence revisions for refs introduced by latest revision-one claim", () => {
+    const e1 = evidence(); const e2 = { ...e1, revision: 2 };
+    expect(errorCode(() => evaluate({ ...set(), evidence: [e1, e2] }))).toBe("evidence.stale-latest-ref");
+  });
+  test("rejects unsafe calculation descriptors from derived credit", () => {
+    const unsafe = calculation(undefined, { inputs: [{ relativePath: "input.json", mediaType: "application/json", decodedBytes: Number.MAX_SAFE_INTEGER + 1, sha256: HASH }] });
+    const result = evaluateDerivedCalculation(unsafe);
+    expect(result.derivedComponentCount).toBe(0);
+    expect(result.blockers).toContain("claim.invalid-derived-evidence");
+    const fallback = derived("documented method", unsafe.calculationId, { sourceRef: refForSource(source()) });
+    const target = claim(undefined, { kind: "derived-result", evidenceRefs: [refForEvidence(fallback)] });
+    expect(evaluate({ ...set(), claims: [target], evidence: [fallback], calculations: [unsafe] }).derivedComponentCount).toBe(1);
+  });
+  test("validates the complete prospective limits object before touching the record", () => {
+    const hard = {
+      maxTotalRecords: 1_000_000, maxReferences: 2_000_000, maxLineageComponents: 500_000,
+      maxCanonicalScalarBytes: 16_384, maxSourceRecordCanonicalBytes: 1_048_576, maxRequestRecordCanonicalBytes: 1_048_576,
+      maxClaimRecordCanonicalBytes: 1_048_576, maxEvidenceRecordCanonicalBytes: 1_048_576,
+      maxVerificationRecordCanonicalBytes: 1_048_576, maxCalculationRecordCanonicalBytes: 1_048_576,
+      maxCanonicalEvidenceSetBytes: 134_217_728,
+    } as const;
+    const everyInvalid = [
+      { maxPerKind: { sources: 1, claims: 1, evidence: 1, verifications: 1, requests: 1, calculations: 0 } },
+      ...Object.entries(hard).map(([key, maximum]) => ({ [key]: maximum + 1 })),
+      { maxTotalRecords: Number.MAX_SAFE_INTEGER + 1 }, { maxReferences: 0 }, { maxLineageComponents: -1 },
+      { maxCanonicalScalarBytes: 0 }, { maxSourceRecordCanonicalBytes: 0 }, { maxRequestRecordCanonicalBytes: 0 },
+      { maxClaimRecordCanonicalBytes: 0 }, { maxEvidenceRecordCanonicalBytes: 0 }, { maxVerificationRecordCanonicalBytes: 0 },
+      { maxCalculationRecordCanonicalBytes: 0 }, { maxCanonicalEvidenceSetBytes: 0 },
+      { maxTotalRecords: 10, maxLineageComponents: 11 },
+      { maxCanonicalScalarBytes: 100, maxSourceRecordCanonicalBytes: 99 },
+      { maxEvidenceRecordCanonicalBytes: 2_000, maxCanonicalEvidenceSetBytes: 1_999 },
+      { unknown: 1 },
+    ];
+    const trapped = new Proxy({}, { get() { throw new Error("SECRET-RECORD"); }, ownKeys() { throw new Error("SECRET-RECORD"); } });
+    for (const limits of everyInvalid)
+      expect(errorCode(() => validateProspectiveEvidenceSemantics(trapped as never, limits as never))).toBe("evidence.invalid-options");
   });
 });
 

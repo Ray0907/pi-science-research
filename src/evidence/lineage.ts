@@ -60,6 +60,7 @@ export interface LineageGraph {
   readonly stableSourceCount: number;
   readonly nodeCount: number;
   readonly edgeCount: number;
+  readonly dependencyComponentCount: number;
 }
 
 export interface LineageOptions {
@@ -112,6 +113,7 @@ interface StableEdge {
 interface GraphState {
   readonly recordsByRef: ReadonlyMap<string, SourceRecord>;
   readonly componentBySourceId: ReadonlyMap<string, number>;
+  readonly componentKeyBySourceId: ReadonlyMap<string, string>;
   readonly relationsByPair: ReadonlyMap<string, ReadonlySet<RelationType>>;
   readonly sourceValidation: Readonly<{
     optionsSha256: string;
@@ -166,6 +168,17 @@ export function buildLineageGraphFromValidatedSources(
   }));
 }
 
+/** Package-internal exact-ref component lookup used by admission; deliberately excluded from the package root. */
+export function getLineageDependencyComponentKey(graph: LineageGraph, ref: SourceRef): string | null {
+  const state = graphState.get(graph as object);
+  if (!state) fail("lineage.invalid-input");
+  const validated = validateRef(ref);
+  const record = state.recordsByRef.get(refKey(validated));
+  if (!record) fail("lineage.unresolved-ref");
+  if (resolvedStudy(record.lineage.studyId) === null) return null;
+  return state.componentKeyBySourceId.get(record.sourceId) ?? null;
+}
+
 export function compareSourceIndependence(
   graph: LineageGraph,
   left: SourceRef,
@@ -198,7 +211,7 @@ export function compareSourceIndependence(
   if (pairRelations.has("reports")) reasons.push("report-relation");
   const sameComponent = !sameSource
     && state.componentBySourceId.get(leftRecord.sourceId) === state.componentBySourceId.get(rightRecord.sourceId);
-  if (sameComponent) reasons.push("dependency-component");
+  if (sameComponent && (pairRelations.size > 0 || !reasons.some((reason) => ["same-study", "shared-cohort", "shared-dataset"].includes(reason)))) reasons.push("dependency-component");
 
   if (reasons.length > 0) return freezeDecision("dependent", reasons);
   if (leftStudy === null || rightStudy === null) return freezeDecision("unknown", ["unknown-lineage"]);
@@ -311,10 +324,36 @@ function buildPreparedGraph(
 
   validateDirectedDag(sourceIds, directedEdges, options.maxTraversalDepth);
   const sourceIndex = new Map(sourceIds.map((sourceId, index) => [sourceId, index] as const));
-  const union = new UnionFind(sourceIds.length);
-  for (const edge of stableEdges.values()) union.join(sourceIndex.get(edge.from)!, sourceIndex.get(edge.target)!);
+  const relationUnion = new UnionFind(sourceIds.length);
+  const dependencyUnion = new UnionFind(sourceIds.length);
+  for (const edge of stableEdges.values()) {
+    relationUnion.join(sourceIndex.get(edge.from)!, sourceIndex.get(edge.target)!);
+    dependencyUnion.join(sourceIndex.get(edge.from)!, sourceIndex.get(edge.target)!);
+  }
+  const metadataOwner = new Map<string, number>();
+  for (const { record } of ordered) {
+    const sourceId = record.sourceId;
+    const tokens = [
+      ...(resolvedStudy(record.lineage.studyId) === null ? [] : [`study:${record.lineage.studyId}`]),
+      ...record.lineage.cohortIds.map((id) => `cohort:${id}`),
+      ...record.lineage.datasetIds.map((id) => `dataset:${id}`),
+    ];
+    const index = sourceIndex.get(sourceId)!;
+    for (const token of tokens) {
+      const owner = metadataOwner.get(token);
+      if (owner === undefined) metadataOwner.set(token, index); else dependencyUnion.join(owner, index);
+    }
+  }
   const componentBySourceId = new Map<string, number>();
-  sourceIds.forEach((sourceId, index) => componentBySourceId.set(sourceId, union.find(index)));
+  const smallestByRoot = new Map<number, string>();
+  sourceIds.forEach((sourceId, index) => {
+    componentBySourceId.set(sourceId, relationUnion.find(index));
+    const root = dependencyUnion.find(index);
+    const prior = smallestByRoot.get(root); if (prior === undefined || sourceId < prior) smallestByRoot.set(root, sourceId);
+  });
+  const componentKeyBySourceId = new Map<string, string>();
+  sourceIds.forEach((sourceId, index) => componentKeyBySourceId.set(sourceId, `retrieved-lineage:${smallestByRoot.get(dependencyUnion.find(index))!}`));
+  const dependencyComponentCount = smallestByRoot.size;
 
   const recordsByRef = new Map<string, SourceRecord>();
   const sourceRefs: SourceRef[] = [];
@@ -322,13 +361,14 @@ function buildPreparedGraph(
     recordsByRef.set(refKey(record), record);
     sourceRefs.push(Object.freeze({ sourceId: record.sourceId, revision: record.revision }));
   }
-  const state: GraphState = Object.freeze({ recordsByRef, componentBySourceId, relationsByPair, sourceValidation });
+  const state: GraphState = Object.freeze({ recordsByRef, componentBySourceId, componentKeyBySourceId, relationsByPair, sourceValidation });
   const graph = Object.freeze({
     sourceRefs: Object.freeze(sourceRefs),
     revisionCount: prepared.length,
     stableSourceCount: sourceIds.length,
     nodeCount,
     edgeCount,
+    dependencyComponentCount,
   });
   graphState.set(graph, state);
   return graph;

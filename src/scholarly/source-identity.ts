@@ -14,6 +14,7 @@ import {
   canonicalPmidUrl,
   normalizeCanonicalUrl,
   prepareProspectiveSourceIdentityFields,
+  validatePreparedSourceIdentityFieldsInternal,
   type ScholarlyIdentifierKind,
   type SourceUrlPolicyContext,
 } from "./identifiers.js";
@@ -27,6 +28,7 @@ export type SourceIdentityErrorCode =
   | "source.input-too-large"
   | "source.duplicate-revision"
   | "source.revision-gap"
+  | "source.duplicate-request"
   | "source.invalid-provenance"
   | "source.invalid-lineage"
   | "source.url-policy-invalid"
@@ -102,6 +104,7 @@ const PROVENANCE_FIELDS = new Set([
 const ACCESS_ORDER = ["metadata-only", "abstract-only", "partial-text", "full-text"] as const;
 const indexState = new WeakMap<object, ProvenanceState>();
 const validatedSourceRecordsState = new WeakMap<readonly SourceRecord[], ProvenanceState>();
+const snapshotSourceProvenanceState = new WeakMap<object, SourceProvenance>();
 /** @internal Read-only package lookup; never exported from the package root. */
 export interface ValidatedSourceRecordsInternal {
   readonly sources: readonly SourceRecord[];
@@ -200,11 +203,28 @@ export function buildRequestProvenanceIndex(
   return buildRequestProvenanceIndexInternal(sources, requests, options, diagnostics, "sources");
 }
 
+export interface PreparedProvenanceRecordsForEvidenceSnapshotInternal {
+  readonly sources: readonly SourceRecord[];
+  readonly requests: readonly RequestRecord[];
+  readonly sourceCanonicalJson: readonly string[];
+  readonly requestCanonicalJson: readonly string[];
+}
+/** Package-internal Task 4 seam; retains the public Task 2 100,000-source hard cap. */
+export function buildRequestProvenanceIndexForEvidenceSnapshotInternal(
+  sources: readonly SourceRecord[], requests: readonly RequestRecord[], options: SourceIdentityOptions,
+  diagnostics?: RequestProvenanceDiagnostics,
+  beforeSemantic?: (prepared: PreparedProvenanceRecordsForEvidenceSnapshotInternal) => void,
+): RequestProvenanceIndex {
+  return buildRequestProvenanceIndexInternal(sources, requests, options, diagnostics, "sources", 200_000, beforeSemantic);
+}
+
 function buildRequestProvenanceIndexInternal(
   sources: readonly SourceRecord[], requests: readonly RequestRecord[], options: SourceIdentityOptions | undefined,
   diagnostics: RequestProvenanceDiagnostics | undefined, aggregateShape: "source" | "sources",
+  maxSourcesHard = 100_000,
+  beforeSemantic?: (prepared: PreparedProvenanceRecordsForEvidenceSnapshotInternal) => void,
 ): RequestProvenanceIndex {
-  const normalized = normalizeOptions(options);
+  const normalized = normalizeOptions(options, maxSourcesHard);
   validateDiagnostics(diagnostics);
   const sourceInputs = safeArray(sources, normalized.maxSources, "source.too-many-records");
   const requestInputs = safeArray(requests, normalized.maxRequests, "source.too-many-records");
@@ -212,7 +232,9 @@ function buildRequestProvenanceIndexInternal(
   let cumulativeRecordBytes = 0;
   for (const source of sourceInputs) {
     bumpDiagnostics(diagnostics, "sourceVisits");
-    const validated = validateSource(source as SourceRecord, normalized);
+    const validated = beforeSemantic
+      ? validateSourceStructureForEvidenceSnapshot(source as SourceRecord, normalized)
+      : validateSource(source as SourceRecord, normalized);
     cumulativeRecordBytes = accumulateRecordBytes(cumulativeRecordBytes, validated.bytes, normalized);
     validatedSources.push(validated);
   }
@@ -227,6 +249,12 @@ function buildRequestProvenanceIndexInternal(
     if (validatedSources.length !== 1) fail("source.invalid-input");
     assertSingleSourceAggregate(validatedSources[0]!, validatedRequests, normalized);
   } else assertAggregateWrapper(["requests", "sources"], [validatedRequests, validatedSources], normalized);
+  if (beforeSemantic) beforeSemantic(Object.freeze({
+    sources: Object.freeze(validatedSources.map(({ record }) => record)),
+    requests: Object.freeze(validatedRequests.map(({ record }) => record)),
+    sourceCanonicalJson: Object.freeze(validatedSources.map(({ json }) => json)),
+    requestCanonicalJson: Object.freeze(validatedRequests.map(({ json }) => json)),
+  }));
   let steps = 0;
   for (const { record } of validatedSources) {
     steps = checkedAdd(steps, record.retrievalRequestIds.length);
@@ -237,6 +265,10 @@ function buildRequestProvenanceIndexInternal(
     steps = checkedAdd(steps, (record.requestedUrl === null ? 0 : 1) + (record.finalUrl === null ? 0 : 1) + record.redirectUrls.length);
   }
   if (steps > normalized.maxProvenanceSteps) fail("source.too-many-provenance-steps");
+  if (beforeSemantic) for (const { record } of validatedSources) {
+    try { validatePreparedSourceIdentityFieldsInternal(record, normalized.sourceUrlPolicy, normalized.maxCanonicalScalarBytes); }
+    catch (error) { if (error instanceof ScholarlyIdentifierError) translateIdentifierError(error); return fail("source.invalid-input"); }
+  }
   for (const { record } of validatedSources) validateSourceSemantics(record);
   const sourceChains = revisionChains(validatedSources, true);
   const orderedSources = [...sourceChains.values()].flat();
@@ -245,7 +277,7 @@ function buildRequestProvenanceIndexInternal(
 
   const requestsById = new Map<string, IndexedRequest>();
   for (const request of indexedRequests) {
-    if (requestsById.has(request.record.requestId)) fail("source.invalid-input");
+    if (requestsById.has(request.record.requestId)) fail(beforeSemantic ? "source.duplicate-request" : "source.invalid-input");
     requestsById.set(request.record.requestId, request);
   }
   const sourceByHash = new Map<string, SourceProvenance>();
@@ -254,6 +286,7 @@ function buildRequestProvenanceIndexInternal(
     const provenance = provenanceForSource(source.record, requestsById, normalized, diagnostics);
     witnessCount = checkedAdd(witnessCount, provenance.witnesses.length);
     sourceByHash.set(source.hash, provenance);
+    snapshotSourceProvenanceState.set(source.record, provenance);
   }
   const state: ProvenanceState = Object.freeze({
     sources: Object.freeze(orderedSources.map(({ record }) => record)),
@@ -316,6 +349,14 @@ export function getValidatedSourceRecordsInternal(
   });
 }
 
+/** Package-internal cached lookup for exact Task 2-issued source objects. */
+export function validateSourceCanonicalUrlProvenanceFromSnapshotInternal(source: SourceRecord, index: RequestProvenanceIndex): SourceUrlProvenance {
+  if (!indexState.has(index as object)) fail("source.provenance-index-mismatch");
+  const provenance = snapshotSourceProvenanceState.get(source as object);
+  if (!provenance || provenance.witnesses.length === 0) fail(provenance?.failure ?? "source.provenance-index-mismatch");
+  return provenance.witnesses[0]!.value;
+}
+
 export function validateSourceCanonicalUrlProvenance(source: SourceRecord, index: RequestProvenanceIndex): SourceUrlProvenance {
   const state = indexState.get(index as object);
   if (!state) fail("source.provenance-index-mismatch");
@@ -371,6 +412,27 @@ export function mergeSourceRecords(
   return mergeValidated(existingRecords, incomingRecords);
 }
 
+function validateSourceStructureForEvidenceSnapshot(source: SourceRecord, options: NormalizedOptions): ValidatedSource {
+  if (utilTypes.isProxy(source)) fail("source.invalid-input");
+  let json: string;
+  try {
+    assertBoundedStructure(source, {
+      maxDepth: 64, maxNodes: 100_000, maxKeys: 100_000, maxArrayLength: 100_000,
+      maxStringBytes: options.maxSourceRecordCanonicalBytes, maxScalarBytes: options.maxSourceRecordCanonicalBytes,
+    });
+    json = canonicalJson(source);
+  } catch (error) {
+    if (error instanceof StructuralLimitError && error.reason === "limit") fail("source.record-too-large");
+    return fail("source.invalid-input");
+  }
+  const bytes = Buffer.byteLength(json, "utf8");
+  if (bytes > options.maxSourceRecordCanonicalBytes) fail("source.record-too-large");
+  const parsed = parse(SourceRecordSchema, JSON.parse(json));
+  if (!parsed.success) fail("source.invalid-input");
+  const record = deepFreeze(parsed.value);
+  return Object.freeze({ record, json, bytes, hash: sha256Hex(json) });
+}
+
 function validateSource(source: SourceRecord, options: NormalizedOptions): ValidatedSource {
   if (utilTypes.isProxy(source)) fail("source.invalid-input");
   try {
@@ -404,12 +466,13 @@ function validateSourceSemantics(record: SourceRecord, deferRelationDuplicates =
   if (record.lineage.relatedSourceIds.length !== record.lineage.relationTypes.length) fail("source.invalid-lineage");
   assertUnique(record.retrievalRequestIds, "source.invalid-provenance");
   const retrieval = new Set(record.retrievalRequestIds);
-  const provenanceKeys = record.metadataProvenance.map((step) => canonicalJson(step));
+  const provenanceKeys = record.metadataProvenance.map((step) => `${step.field}\0${step.provider}\0${step.requestId}`);
   assertUnique(provenanceKeys, "source.invalid-provenance");
   for (const step of record.metadataProvenance) {
     if (!PROVENANCE_FIELDS.has(step.field) || !retrieval.has(step.requestId)) fail("source.invalid-provenance");
   }
-  assertUnique(record.authors.map((value) => canonicalJson(value)), "source.invalid-provenance");
+  assertUnique(record.authors.map((value) => [value.family, value.given, value.literal, value.orcid]
+    .map((part) => part === null ? "N" : `S${part.length}:${part}`).join("\0")), "source.invalid-provenance");
   assertUnique(record.lineage.cohortIds, "source.invalid-lineage");
   assertUnique(record.lineage.datasetIds, "source.invalid-lineage");
   if (!deferRelationDuplicates) {
@@ -802,8 +865,8 @@ function strongKeys(identifiers: SourceRecord["identifiers"]): string[] {
   if (identifiers.pmcid !== null) keys.push(`pmcid:${identifiers.pmcid}`);
   return keys;
 }
-function normalizeOptions(input?: SourceIdentityOptions): NormalizedOptions {
-  if (input === undefined) return finishOptions({}, undefined);
+function normalizeOptions(input?: SourceIdentityOptions, maxSourcesHard = 100_000): NormalizedOptions {
+  if (input === undefined) return finishOptions({}, undefined, maxSourcesHard);
   if (utilTypes.isProxy(input)) fail("source.invalid-options");
   let snapshot: Record<string, unknown>;
   let originalPolicy: SourceUrlPolicyContext | undefined;
@@ -814,11 +877,12 @@ function normalizeOptions(input?: SourceIdentityOptions): NormalizedOptions {
     snapshot = JSON.parse(canonicalJson(input)) as Record<string, unknown>;
   } catch { return fail("source.invalid-options"); }
   if (!isPlain(snapshot) || Object.keys(snapshot).some((key) => !OPTION_KEYS.includes(key))) fail("source.invalid-options");
-  return finishOptions(snapshot, originalPolicy);
+  return finishOptions(snapshot, originalPolicy, maxSourcesHard);
 }
-function finishOptions(snapshot: Record<string, unknown>, originalPolicy: SourceUrlPolicyContext | undefined): NormalizedOptions {
+function finishOptions(snapshot: Record<string, unknown>, originalPolicy: SourceUrlPolicyContext | undefined, maxSourcesHard = 100_000): NormalizedOptions {
   const values: Record<string, number> = {};
-  for (const [key, [fallback, hard]] of Object.entries(LIMITS)) {
+  for (const [key, [fallback, configuredHard]] of Object.entries(LIMITS)) {
+    const hard = key === "maxSources" ? maxSourcesHard : configuredHard;
     const value = snapshot[key] ?? fallback;
     if (!Number.isSafeInteger(value) || (value as number) < 1 || (value as number) > hard) fail("source.invalid-options");
     values[key] = value as number;

@@ -7,6 +7,7 @@ import {
   buildLineageGraph,
   buildLineageGraphFromValidatedSources,
   compareSourceIndependence,
+  getLineageDependencyComponentKey,
   type LineageErrorCode,
 } from "../../src/evidence/lineage.js";
 import {
@@ -390,6 +391,19 @@ describe("source lineage", () => {
     const accessor = { ...a, get lineage() { touched = true; return a.lineage; } };
     expect(code(() => buildLineageGraph([accessor]))).toBe("lineage.invalid-input");
     expect(touched).toBe(false);
+  });
+
+  test("exposes authentic deterministic exact-ref dependency component keys", () => {
+    const a = withLineage(source("src-component.a0001"), { studyId: "study-a", datasetIds: ["dataset-shared"] });
+    const b = withLineage(source("src-component.b0001"), { studyId: "study-b", datasetIds: ["dataset-shared"] });
+    const unknown = withLineage(source("src-component.z0001"), { studyId: null });
+    for (const values of [[a, b, unknown], [unknown, b, a]]) {
+      const graph = buildLineageGraph(values);
+      expect(graph.dependencyComponentCount).toBe(2);
+      expect(getLineageDependencyComponentKey(graph, { sourceId: a.sourceId, revision: 1 })).toBe(`retrieved-lineage:${a.sourceId}`);
+      expect(getLineageDependencyComponentKey(graph, { sourceId: b.sourceId, revision: 1 })).toBe(`retrieved-lineage:${a.sourceId}`);
+      expect(getLineageDependencyComponentKey(graph, { sourceId: unknown.sourceId, revision: 1 })).toBeNull();
+    }
   });
 
   test("handles bounded deep graphs iteratively and returns immutable decisions", () => {

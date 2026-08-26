@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 
 import * as rootExports from "../../src/index.js";
+import { canonicalJson } from "../../src/crypto/canonical-json.js";
 import type { RequestRecord } from "../../src/domain/events.js";
 import type { ClaimRecord, EvidenceRecord, SourceRecord } from "../../src/domain/research-records.js";
 import {
@@ -55,6 +56,7 @@ describe("validated evidence snapshot internals", () => {
     expect(visits.revisionIndexInsertions).toBe(3);
     expect(Object.isFrozen(snapshot)).toBe(true);
     expect(Object.isFrozen(snapshot.records.sources)).toBe(true);
+    expect(snapshot.canonicalBytes).toBe(Buffer.byteLength(canonicalJson(snapshot.records), "utf8"));
   });
   test("binds snapshot option policy and view hashes without leaking indexes", () => {
     const snapshot = buildBoundedValidatedEvidenceSnapshot(records());
@@ -70,8 +72,12 @@ describe("validated evidence snapshot internals", () => {
     expect(indexes.getExactRecord({ kind: "claims", id: claim().claimId, revision: 1 })).toEqual(claim());
     expect(indexes.getCanonicalRecordString({ kind: "claims", id: claim().claimId, revision: 1 })).toContain("Internal claim");
     expect(Object.values(indexes).some((value) => value instanceof Map || value instanceof Set)).toBe(false);
-    expect("getValidatedSnapshotIndexes" in rootExports).toBe(false);
-    expect("buildBoundedValidatedEvidenceSnapshotInternal" in rootExports).toBe(false);
+    for (const name of [
+      "getValidatedSnapshotIndexes", "buildBoundedValidatedEvidenceSnapshotInternal",
+      "prepareProspectiveEvidenceCanonicalInternal", "validatePreparedEvidenceSemanticsInternal",
+      "getLineageDependencyComponentKey", "buildRequestProvenanceIndexForEvidenceSnapshotInternal",
+      "validateSourceCanonicalUrlProvenanceFromSnapshotInternal", "validatePreparedSourceIdentityFieldsInternal",
+    ]) expect(name in rootExports).toBe(false);
   });
   test("rejects structurally identical forged snapshot with evidence.snapshot-invalid", () => {
     const snapshot = buildBoundedValidatedEvidenceSnapshot(records());
@@ -102,8 +108,11 @@ describe("validated evidence snapshot internals", () => {
       startedAt: AT, endedAt: AT, status: "success", httpStatus: 200, requestedUrl: s.canonicalUrl, finalUrl: s.canonicalUrl,
       redirectUrls: [], responseSha256: null, responseFile: null, encodedBytes: 0, decodedBytes: 0, resultSourceIds: [s.sourceId], errorClass: null,
     };
-    const snapshot = buildBoundedValidatedEvidenceSnapshot(records({ sources: [s], requests: [request] }));
+    const visits = diagnostics();
+    const snapshot = buildBoundedValidatedEvidenceSnapshot(records({ sources: [s], requests: [request] }), undefined, visits);
     expect(getValidatedSnapshotIndexes(snapshot).requestProvenanceIndex).toBe(snapshot.requestProvenanceIndex);
+    expect(visits.canonicalRecordVisits).toBe(snapshot.recordCount);
+    expect(visits.requestRecordsIndexed).toBe(1);
   });
   test("bounds every canonical record kind and aggregate set bytes before indexes", () => {
     expect(code(() => buildBoundedValidatedEvidenceSnapshot(records(), { limits: { maxClaimRecordCanonicalBytes: 10 } }))).toBe("evidence.record-too-large");
@@ -118,5 +127,58 @@ describe("validated evidence snapshot internals", () => {
   test("rejects oversized quotes metadata request queries calculation strings and nested values", () => {
     const huge = evidence(); huge.quotes = ["x".repeat(2_000)];
     expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ evidence: [huge] }), { limits: { maxEvidenceRecordCanonicalBytes: 1_000 } }))).toBe("evidence.record-too-large");
+  });
+  test("reports exact duplicate and gap codes from source and request histories", () => {
+    const first = source();
+    expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: [first, { ...first }] })))).toBe("evidence.duplicate-revision");
+    expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: [{ ...first, revision: 2 }] })))).toBe("evidence.revision-gap");
+    const id = "request-0000000000000001";
+    const request: RequestRecord = {
+      schemaVersion: 1, requestId: id, attemptId: ATTEMPT, executionEpoch: 0, logicalRequestId: "logical-0000000000000001",
+      physicalAttemptOrdinal: 1, retryOfRequestId: null, replayPolicy: "safe-read", provider: "openalex", operation: "fetch",
+      normalizedInput: { query: null, identifier: null, url: "https://api.example/a", parameters: [] }, accessPolicySha256: HASH,
+      startedAt: AT, endedAt: AT, status: "success", httpStatus: 200, requestedUrl: "https://api.example/a", finalUrl: null,
+      redirectUrls: [], responseSha256: null, responseFile: null, encodedBytes: 0, decodedBytes: 0, resultSourceIds: [], errorClass: null,
+    };
+    expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ requests: [request, { ...request }] })))).toBe("evidence.duplicate-request");
+  });
+  test("audits complete strong identity and URL components deterministically", () => {
+    const first = source();
+    const same = (id: string) => source({ sourceId: id });
+    expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: [first, same("src-internal.000002"), same("src-internal.000003")] })))).toBe("evidence.duplicate-source-identity");
+    const shared = "https://example.org/shared";
+    const a = source({ canonicalUrl: shared });
+    const middle = source({ sourceId: "src-internal.000002", identifiers: { doi: null, pmid: null, pmcid: null }, canonicalUrl: shared });
+    const conflicting = source({ sourceId: "src-internal.000003", identifiers: { doi: "10.1234/other", pmid: null, pmcid: null }, canonicalUrl: shared });
+    for (const values of [[a, middle, conflicting], [middle, conflicting, a], [conflicting, a, middle]])
+      expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: values })))).toBe("evidence.ambiguous-source-identity");
+    const bridgeA = source({ sourceId: "src-internal.bridgea", identifiers: { doi: "10.1234/bridge-a", pmid: null, pmcid: null }, canonicalUrl: "https://doi.org/10.1234/bridge-a" });
+    const bridgeB = source({ sourceId: "src-internal.bridgeb", identifiers: { doi: "10.1234/bridge-a", pmid: "123456", pmcid: null }, canonicalUrl: "https://doi.org/10.1234/bridge-a" });
+    const bridgeC = source({ sourceId: "src-internal.bridgec", identifiers: { doi: "10.1234/bridge-c", pmid: "123456", pmcid: null }, canonicalUrl: "https://doi.org/10.1234/bridge-c" });
+    for (const values of [[bridgeA, bridgeB, bridgeC], [bridgeC, bridgeA, bridgeB]])
+      expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: values })))).toBe("evidence.ambiguous-source-identity");
+  });
+  test("keeps the Task 4 source ceiling independent from the Task 2 public ceiling", () => {
+    expect(buildBoundedValidatedEvidenceSnapshot(records(), { limits: { maxPerKind: {
+      sources: 100_001, claims: 50_000, evidence: 100_000, verifications: 25_000, requests: 100_000, calculations: 25_000,
+    } } })).toBeDefined();
+  });
+  test("enforces maxLineageComponents on resulting components rather than source count", () => {
+    const a = source();
+    const b = source({ sourceId: "src-internal.000002", identifiers: { doi: "10.1234/internal-two", pmid: null, pmcid: null }, canonicalUrl: "https://doi.org/10.1234/internal-two", lineage: { ...a.lineage } });
+    expect(buildBoundedValidatedEvidenceSnapshot(records({ sources: [a, b] }), { limits: { maxLineageComponents: 1 } })).toBeDefined();
+    const independent = { ...b, lineage: { ...b.lineage, studyId: "study-other" } };
+    expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: [a, independent] }), { limits: { maxLineageComponents: 1 } }))).toBe("evidence.input-too-large");
+  });
+  test("rejects aggregate wrapper overflow before prospective semantic traversal", () => {
+    const bad = evidence(); bad.quotes = ["", "x".repeat(500)];
+    const baseline = buildBoundedValidatedEvidenceSnapshot(records());
+    expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ evidence: [bad] }), { limits: {
+      maxCanonicalScalarBytes: 128,
+      maxSourceRecordCanonicalBytes: 1_500, maxRequestRecordCanonicalBytes: 1_500,
+      maxClaimRecordCanonicalBytes: 1_500, maxEvidenceRecordCanonicalBytes: 1_500,
+      maxVerificationRecordCanonicalBytes: 1_500, maxCalculationRecordCanonicalBytes: 1_500,
+      maxCanonicalEvidenceSetBytes: baseline.canonicalBytes - 1,
+    } }))).toBe("evidence.input-too-large");
   });
 });

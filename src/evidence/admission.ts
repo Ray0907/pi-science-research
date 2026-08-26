@@ -14,9 +14,10 @@ import {
   type VerificationRecord,
 } from "../domain/research-records.js";
 import { parse } from "../domain/schema.js";
+import { assertBoundedStructure, StructuralLimitError } from "../storage/bounded-structure.js";
 import type { SourceUrlPolicyContext } from "../scholarly/identifiers.js";
 import type { RequestProvenanceIndex } from "../scholarly/source-identity.js";
-import { compareSourceIndependence } from "./lineage.js";
+import { getLineageDependencyComponentKey, LineageError } from "./lineage.js";
 import {
   buildBoundedValidatedEvidenceSnapshotInternal,
   getValidatedSnapshotIndexes,
@@ -141,32 +142,66 @@ export function evaluateEvidenceRuleFromRecords(
   return evaluateEvidenceRule(snapshot, claimRef, maxEvidencePerClaim === undefined ? undefined : { maxEvidencePerClaim });
 }
 
+export interface PreparedProspectiveEvidenceSemanticsInternal {
+  readonly record: ClaimRecord | EvidenceRecord | VerificationRecord;
+  readonly canonicalJson: string;
+  readonly canonicalBytes: number;
+}
+const preparedEvidenceState = new WeakSet<object>();
+
+/** Package-internal one-pass preparation seam; deliberately excluded from the package root. */
+export function prepareProspectiveEvidenceCanonicalInternal(
+  input: unknown, maximum: number, expected?: "claim" | "evidence" | "verification",
+): PreparedProspectiveEvidenceSemanticsInternal {
+  if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 1_048_576) fail("evidence.invalid-options");
+  if (utilTypes.isProxy(input)) fail("evidence.invalid-input");
+  let json: string;
+  try {
+    assertBoundedStructure(input, {
+      maxDepth: 64, maxNodes: 1_000_000, maxKeys: 1_000_000, maxArrayLength: 1_000_000,
+      maxStringBytes: maximum, maxScalarBytes: maximum,
+    });
+    json = canonicalJson(input);
+  } catch (error) {
+    if (error instanceof StructuralLimitError && error.reason === "limit") fail("evidence.record-too-large");
+    return fail("evidence.invalid-input");
+  }
+  const canonicalBytes = Buffer.byteLength(json, "utf8");
+  if (canonicalBytes > maximum) fail("evidence.record-too-large");
+  const snapshot = JSON.parse(json);
+  const choices = expected === "claim" ? [ClaimRecordSchema] : expected === "evidence" ? [EvidenceRecordSchema]
+    : expected === "verification" ? [VerificationRecordSchema] : [ClaimRecordSchema, EvidenceRecordSchema, VerificationRecordSchema];
+  let parsed: ReturnType<typeof parse> | undefined;
+  for (const schema of choices) { const result = parse(schema, snapshot); if (result.success) { parsed = result; break; } }
+  if (!parsed?.success) fail(expected === undefined ? "evidence.invalid-prospective-record" : "evidence.invalid-input");
+  const prepared = Object.freeze({ record: deepFreeze(parsed.value), canonicalJson: json, canonicalBytes }) as PreparedProspectiveEvidenceSemanticsInternal;
+  preparedEvidenceState.add(prepared);
+  return prepared;
+}
+
+/** Package-internal semantic seam consuming only an authentic prepared record. */
+export function validatePreparedEvidenceSemanticsInternal(
+  prepared: PreparedProspectiveEvidenceSemanticsInternal,
+): ClaimRecord | EvidenceRecord | VerificationRecord {
+  if (!preparedEvidenceState.has(prepared as object)) fail("evidence.invalid-input");
+  const value = prepared.record;
+  if ("evidenceId" in value && (value.quotes.some((quote) => asciiTrim(quote).length === 0)
+    || value.locators.some((locator) => asciiTrim(locator.value).length === 0)
+    || value.extractedValues.some((item) => item.numericValue !== null && asciiTrim(item.context).length === 0)))
+    fail("evidence.invalid-prospective-record");
+  return value;
+}
+
 export function validateProspectiveEvidenceSemantics(
   record: ClaimRecord | EvidenceRecord | VerificationRecord,
   limits?: EvidenceSetLimits,
 ): ClaimRecord | EvidenceRecord | VerificationRecord {
   const prospectiveLimits = validateProspectiveLimits(limits);
-  if (utilTypes.isProxy(record)) fail("evidence.invalid-input");
-  let json: string;
-  try { json = canonicalJson(record); } catch { return fail("evidence.invalid-input"); }
-  const snapshot = JSON.parse(json);
-  const bytes = Buffer.byteLength(json, "utf8");
-  let parsed: ReturnType<typeof parse> | undefined;
-  for (const schema of [ClaimRecordSchema, EvidenceRecordSchema, VerificationRecordSchema]) {
-    const result = parse(schema, snapshot); if (result.success) { parsed = result; break; }
-  }
-  if (!parsed?.success) fail("evidence.invalid-prospective-record");
-  const value = parsed.value as ClaimRecord | EvidenceRecord | VerificationRecord;
-  const maximum = "claimId" in value ? prospectiveLimits.claim
-    : "evidenceId" in value ? prospectiveLimits.evidence : prospectiveLimits.verification;
-  if (bytes > maximum) fail("evidence.record-too-large");
-  if ("evidenceId" in value) {
-    if (value.quotes.some((quote) => asciiTrim(quote).length === 0)
-      || value.locators.some((locator) => asciiTrim(locator.value).length === 0)
-      || value.extractedValues.some((item) => item.numericValue !== null && asciiTrim(item.context).length === 0))
-      fail("evidence.invalid-prospective-record");
-  }
-  return deepFreeze(value);
+  const prepared = prepareProspectiveEvidenceCanonicalInternal(record, prospectiveLimits.maximum);
+  const maximum = "claimId" in prepared.record ? prospectiveLimits.claim
+    : "evidenceId" in prepared.record ? prospectiveLimits.evidence : prospectiveLimits.verification;
+  if (prepared.canonicalBytes > maximum) fail("evidence.record-too-large");
+  return validatePreparedEvidenceSemanticsInternal(prepared);
 }
 
 export function evaluateEvidenceRule(
@@ -183,21 +218,20 @@ export function evaluateEvidenceRule(
   enforceCurrentReferences(target, indexes);
 
   const qualifying: QualifiedEvidence[] = [];
-  const contradictions: EvidenceRecord[] = [];
+  const contradictions = buildConflictClosure(target, indexes, maxEvidence);
   let otherwiseUnknown = false;
   for (const ref of target.evidenceRefs) {
     const evidenceId = String(ref.evidenceId); const evidenceRevision = Number(ref.revision);
     const record = indexes.getExactRecord({ kind: "evidence", id: evidenceId, revision: evidenceRevision }) as EvidenceRecord | undefined;
     if (!record) fail("evidence.unresolved-ref");
     if (record.claimRef.claimId !== target.claimId || record.claimRef.revision !== target.revision) continue;
-    if (record.stance === "contradicting") { contradictions.push(record); continue; }
+    if (record.stance === "contradicting") continue;
     if (record.stance !== "supporting" || !["unverified", "verified"].includes(record.verificationStatus)) continue;
     const qualified = qualifyEvidence(record, indexes, target);
     if (qualified) { qualifying.push(qualified); if (qualified.unknownLineage) otherwiseUnknown = true; }
   }
 
   const retrieved = qualifying.filter((item) => item.kind === "retrieved");
-  assignRetrievedComponents(retrieved, indexes);
   const baseKeys = new Set<string>();
   for (const item of qualifying) if (item.key !== null) baseKeys.add(item.key);
   const retrievedKeys = new Set(retrieved.flatMap((item) => item.key ? [item.key] : []));
@@ -248,7 +282,10 @@ function qualifyEvidence(record: EvidenceRecord, indexes: ReturnType<typeof getV
     if (!source) fail("evidence.unresolved-ref");
     if (record.quotes.length > 0 && source.accessLevel !== "metadata-only"
       && !record.locators.some((locator) => locator.type !== "unknown" && asciiTrim(locator.value).length > 0)) return null;
-    return { evidence: record, kind: "retrieved", source, key: null, unknownLineage: !source.lineage.studyId || asciiTrim(source.lineage.studyId).length === 0 };
+    let key: string | null;
+    try { key = getLineageDependencyComponentKey(indexes.lineageGraph, { sourceId: source.sourceId, revision: source.revision }); }
+    catch (error) { if (error instanceof LineageError) fail("evidence.invalid-input"); return fail("evidence.invalid-input"); }
+    return { evidence: record, kind: "retrieved", source, key, unknownLineage: key === null };
   }
   const resultContext = record.extractedValues.some((item) => asciiTrim(item.value).length > 0 && asciiTrim(item.context).length > 0)
     || (record.quotes.some((quote) => asciiTrim(quote).length > 0) && record.locators.some((locator) => locator.type !== "unknown" && asciiTrim(locator.value).length > 0));
@@ -274,24 +311,60 @@ function validCalculation(calculation: CalculationRecord, record: EvidenceRecord
     || calculation.inputs.length + calculation.sourceFiles.length === 0 || calculation.outputs.length === 0) return false;
   const paths = new Set<string>();
   for (const file of [...calculation.inputs, ...calculation.sourceFiles, ...calculation.outputs]) {
-    if (paths.has(file.relativePath)) return false; paths.add(file.relativePath);
+    if (!Number.isSafeInteger(file.decodedBytes) || file.decodedBytes < 0
+      || !/^[a-f0-9]{64}$/u.test(file.sha256) || asciiTrim(file.mediaType).length === 0
+      || !isPortableRelativePath(file.relativePath) || paths.has(file.relativePath)) return false;
+    paths.add(file.relativePath);
   }
   return true;
 }
-function assignRetrievedComponents(items: QualifiedEvidence[], indexes: ReturnType<typeof getValidatedSnapshotIndexes>): void {
-  const representatives: QualifiedEvidence[] = [];
-  for (const item of items) {
-    if (item.unknownLineage || !item.source) continue;
-    let match: QualifiedEvidence | undefined;
-    for (const candidate of representatives) {
-      const result = compareSourceIndependence(indexes.lineageGraph,
-        { sourceId: item.source.sourceId, revision: item.source.revision },
-        { sourceId: candidate.source!.sourceId, revision: candidate.source!.revision });
-      if (result.status === "dependent") { match = candidate; break; }
-    }
-    if (!match) { item.key = `retrieved-lineage:${item.source.sourceId}`; representatives.push(item); }
-    else item.key = match.key;
+function buildConflictClosure(
+  target: ClaimRecord, indexes: ReturnType<typeof getValidatedSnapshotIndexes>, maximum: number,
+): EvidenceRecord[] {
+  const queue: SnapshotRecordKey[] = [];
+  const visited = new Set<string>();
+  const contradictions = new Map<string, EvidenceRecord>();
+  let edgeCount = 0;
+  const enqueue = (key: SnapshotRecordKey): void => {
+    const encoded = `${key.kind}\0${key.id}\0${key.revision ?? 0}`;
+    if (visited.has(encoded)) return;
+    if (visited.size >= maximum) fail("evidence.too-many-records");
+    visited.add(encoded); queue.push(key);
+  };
+  for (const ref of target.evidenceRefs) enqueue({ kind: "evidence", id: String(ref.evidenceId), revision: Number(ref.revision) });
+  for (const id of target.conflictClaimIds) {
+    const revision = indexes.getLatestRevision("claims", String(id)); if (revision === undefined) fail("evidence.unresolved-ref");
+    enqueue({ kind: "claims", id: String(id), revision });
   }
+  for (let cursor = 0; cursor < queue.length; cursor += 1) {
+    const key = queue[cursor]!;
+    const record = indexes.getExactRecord(key) as ClaimRecord | EvidenceRecord | undefined;
+    if (!record) fail("evidence.unresolved-ref");
+    if (key.kind === "claims") {
+      const claim = record as ClaimRecord;
+      edgeCount = checkedAdd(edgeCount, claim.evidenceRefs.length + claim.conflictClaimIds.length);
+      if (edgeCount > maximum) fail("evidence.too-many-references");
+      for (const ref of claim.evidenceRefs) enqueue({ kind: "evidence", id: String(ref.evidenceId), revision: Number(ref.revision) });
+      for (const id of claim.conflictClaimIds) {
+        if (id === target.claimId) continue;
+        const revision = indexes.getLatestRevision("claims", String(id)); if (revision === undefined) fail("evidence.unresolved-ref");
+        enqueue({ kind: "claims", id: String(id), revision });
+      }
+    } else {
+      const evidence = record as EvidenceRecord;
+      if (evidence.stance === "contradicting") contradictions.set(`${evidence.evidenceId}\0${evidence.revision}`, evidence);
+      edgeCount = checkedAdd(edgeCount, evidence.conflictsWith.length);
+      if (edgeCount > maximum) fail("evidence.too-many-references");
+      for (const id of evidence.conflictsWith) {
+        const revision = indexes.getLatestRevision("evidence", String(id)); if (revision === undefined) fail("evidence.unresolved-ref");
+        enqueue({ kind: "evidence", id: String(id), revision });
+      }
+    }
+  }
+  return [...contradictions.values()].sort((left, right) => refCompare(
+    { evidenceId: String(left.evidenceId), revision: Number(left.revision) },
+    { evidenceId: String(right.evidenceId), revision: Number(right.revision) },
+  ));
 }
 function selectApplicableVerifications(records: readonly VerificationRecord[], target: ClaimRecord): VerificationRecord[] {
   const selected = new Map<string, VerificationRecord>();
@@ -311,15 +384,11 @@ function independentCredit(
     for (const id of verification.independentEvidenceIds) {
       const checked = verification.checkedEvidence.filter((ref) => ref.evidenceId === id); if (checked.length !== 1) continue;
       const record = indexes.getExactRecord({ kind: "evidence", id: String(id), revision: Number(checked[0]!.revision) }) as EvidenceRecord | undefined;
-      if (!record || record.recordedByAttemptId !== verification.attemptId || record.claimRef.claimId !== target.claimId || record.claimRef.revision !== target.revision || record.stance !== "supporting") continue;
+      if (!record || indexes.getLatestRevision("evidence", record.evidenceId) !== record.revision
+        || record.recordedByAttemptId !== verification.attemptId || record.claimRef.claimId !== target.claimId
+        || record.claimRef.revision !== target.revision || record.stance !== "supporting"
+        || record.verificationStatus !== "verified") continue;
       const qualified = qualifyEvidence(record, indexes, target); if (!qualified) continue;
-      if (qualified.kind === "retrieved") {
-        const dependentBase = base.find((item) => item.kind === "retrieved" && item.source && qualified.source
-          && compareSourceIndependence(indexes.lineageGraph,
-            { sourceId: qualified.source.sourceId, revision: qualified.source.revision },
-            { sourceId: item.source.sourceId, revision: item.source.revision }).status !== "independent");
-        qualified.key = dependentBase?.key ?? (qualified.source ? `retrieved-lineage:${qualified.source.sourceId}` : null);
-      }
       if (qualified.key && !baseKeys.has(qualified.key)) candidates.push({ verificationId: verification.verificationId, revision: verification.revision, key: qualified.key });
     }
   }
@@ -329,36 +398,71 @@ function independentCredit(
 function conflictsResolved(verifications: VerificationRecord[], target: ClaimRecord, supporting: QualifiedEvidence[], contradictions: EvidenceRecord[]): boolean {
   if (target.status !== "supported") return false;
   const used = [...supporting.map(({ evidence }) => evidence), ...contradictions];
-  return verifications.some((verification) => verification.result === "accepted"
-    && verification.corrections.some((correction) => correction.claimId === target.claimId)
+  const forbiddenAttempts = new Set([target.createdByAttemptId, ...contradictions.map((record) => record.recordedByAttemptId)]);
+  return verifications.some((verification) => verification.result === "accepted" && !forbiddenAttempts.has(verification.attemptId)
+    && verification.corrections.some((correction) => correction.claimId === target.claimId && asciiTrim(correction.description).length > 0)
     && used.every((record) => verification.checkedEvidence.some((ref) => ref.evidenceId === record.evidenceId && ref.revision === record.revision))
     && contradictions.every((record) => record.verificationStatus === "rejected"));
 }
 function enforceCurrentReferences(target: ClaimRecord, indexes: ReturnType<typeof getValidatedSnapshotIndexes>): void {
   const latestClaim = indexes.getLatestRevision("claims", target.claimId);
-  if (latestClaim !== target.revision || target.revision === 1) return;
+  if (latestClaim !== target.revision) return;
   const prior = indexes.getExactRecord({ kind: "claims", id: target.claimId, revision: target.revision - 1 }) as ClaimRecord | undefined;
   const retained = new Set((prior?.evidenceRefs ?? []).map((ref) => `${ref.evidenceId}\0${ref.revision}`));
   for (const ref of target.evidenceRefs) if (!retained.has(`${ref.evidenceId}\0${ref.revision}`)
     && indexes.getLatestRevision("evidence", String(ref.evidenceId)) !== Number(ref.revision)) fail("evidence.stale-latest-ref");
 }
-function validateProspectiveLimits(input?: EvidenceSetLimits): { claim: number; evidence: number; verification: number } {
-  if (input === undefined) return { claim: 524_288, evidence: 524_288, verification: 524_288 };
-  if (utilTypes.isProxy(input) || !isPlain(input)) fail("evidence.invalid-options");
-  let snapshot: Record<string, unknown>;
-  try { snapshot = JSON.parse(canonicalJson(input)); } catch { return fail("evidence.invalid-options"); }
-  const allowed = new Set([
-    "maxPerKind", "maxTotalRecords", "maxReferences", "maxLineageComponents", "maxCanonicalScalarBytes",
-    "maxSourceRecordCanonicalBytes", "maxRequestRecordCanonicalBytes", "maxClaimRecordCanonicalBytes",
-    "maxEvidenceRecordCanonicalBytes", "maxVerificationRecordCanonicalBytes", "maxCalculationRecordCanonicalBytes",
-    "maxCanonicalEvidenceSetBytes",
-  ]);
-  if (Object.keys(snapshot).some((key) => !allowed.has(key))) fail("evidence.invalid-options");
-  const read = (key: "maxClaimRecordCanonicalBytes" | "maxEvidenceRecordCanonicalBytes" | "maxVerificationRecordCanonicalBytes") => {
-    const candidate = snapshot[key]; const value = candidate === undefined ? 524_288 : candidate;
-    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > 1_048_576) fail("evidence.invalid-options"); return value;
+function validateProspectiveLimits(input?: EvidenceSetLimits): { claim: number; evidence: number; verification: number; maximum: number } {
+  const defaults = {
+    maxTotalRecords: 300_000, maxReferences: 500_000, maxLineageComponents: 100_000,
+    maxCanonicalScalarBytes: 4_096, maxSourceRecordCanonicalBytes: 262_144, maxRequestRecordCanonicalBytes: 262_144,
+    maxClaimRecordCanonicalBytes: 524_288, maxEvidenceRecordCanonicalBytes: 524_288,
+    maxVerificationRecordCanonicalBytes: 524_288, maxCalculationRecordCanonicalBytes: 524_288,
+    maxCanonicalEvidenceSetBytes: 33_554_432,
+  } as const;
+  const hards = {
+    maxTotalRecords: 1_000_000, maxReferences: 2_000_000, maxLineageComponents: 500_000,
+    maxCanonicalScalarBytes: 16_384, maxSourceRecordCanonicalBytes: 1_048_576, maxRequestRecordCanonicalBytes: 1_048_576,
+    maxClaimRecordCanonicalBytes: 1_048_576, maxEvidenceRecordCanonicalBytes: 1_048_576,
+    maxVerificationRecordCanonicalBytes: 1_048_576, maxCalculationRecordCanonicalBytes: 1_048_576,
+    maxCanonicalEvidenceSetBytes: 134_217_728,
+  } as const;
+  const perDefaults = { sources: 50_000, claims: 50_000, evidence: 100_000, verifications: 25_000, requests: 100_000, calculations: 25_000 } as const;
+  const perHards = { sources: 200_000, claims: 200_000, evidence: 500_000, verifications: 100_000, requests: 500_000, calculations: 100_000 } as const;
+  let snapshot: Record<string, unknown> = {};
+  if (input !== undefined) {
+    if (utilTypes.isProxy(input) || !isPlain(input)) fail("evidence.invalid-options");
+    try {
+      assertBoundedStructure(input, { maxDepth: 4, maxNodes: 100, maxKeys: 100, maxArrayLength: 0, maxStringBytes: 128, maxScalarBytes: 1_000_000 });
+      snapshot = JSON.parse(canonicalJson(input));
+    } catch { return fail("evidence.invalid-options"); }
+  }
+  const allowed = new Set(["maxPerKind", ...Object.keys(defaults)]);
+  if (!isPlain(snapshot) || Object.keys(snapshot).some((key) => !allowed.has(key))) fail("evidence.invalid-options");
+  const values: Record<string, number> = {};
+  for (const key of Object.keys(defaults) as Array<keyof typeof defaults>) {
+    const candidate = snapshot[key] ?? defaults[key];
+    if (typeof candidate !== "number" || !Number.isSafeInteger(candidate) || candidate < 1 || candidate > hards[key]) fail("evidence.invalid-options");
+    values[key] = candidate;
+  }
+  const rawPer = snapshot.maxPerKind ?? {};
+  if (!isPlain(rawPer) || (snapshot.maxPerKind !== undefined && Reflect.ownKeys(rawPer).length !== 6)
+    || Object.keys(rawPer).some((key) => !(key in perDefaults))) fail("evidence.invalid-options");
+  for (const key of Object.keys(perDefaults) as Array<keyof typeof perDefaults>) {
+    const candidate = rawPer[key] ?? perDefaults[key];
+    if (typeof candidate !== "number" || !Number.isSafeInteger(candidate) || candidate < 1 || candidate > perHards[key]
+      || candidate > values.maxTotalRecords!) fail("evidence.invalid-options");
+  }
+  if (values.maxLineageComponents! > values.maxTotalRecords!
+    || values.maxCanonicalScalarBytes! > values.maxSourceRecordCanonicalBytes!
+    || values.maxCanonicalScalarBytes! > values.maxRequestRecordCanonicalBytes!
+    || ["maxSourceRecordCanonicalBytes", "maxRequestRecordCanonicalBytes", "maxClaimRecordCanonicalBytes", "maxEvidenceRecordCanonicalBytes", "maxVerificationRecordCanonicalBytes", "maxCalculationRecordCanonicalBytes"]
+      .some((key) => values[key]! > values.maxCanonicalEvidenceSetBytes!)) fail("evidence.invalid-options");
+  return {
+    claim: values.maxClaimRecordCanonicalBytes!, evidence: values.maxEvidenceRecordCanonicalBytes!,
+    verification: values.maxVerificationRecordCanonicalBytes!,
+    maximum: Math.max(values.maxClaimRecordCanonicalBytes!, values.maxEvidenceRecordCanonicalBytes!, values.maxVerificationRecordCanonicalBytes!),
   };
-  return { claim: read("maxClaimRecordCanonicalBytes"), evidence: read("maxEvidenceRecordCanonicalBytes"), verification: read("maxVerificationRecordCanonicalBytes") };
 }
 function validateClaimRef(input: unknown): { claimId: string; revision: number } {
   if (utilTypes.isProxy(input) || !isPlain(input) || Reflect.ownKeys(input).length !== 2) fail("evidence.invalid-input");
@@ -379,6 +483,10 @@ function validateEvaluationOptions(options?: Readonly<{ maxEvidencePerClaim?: nu
 function refCompare(left: { evidenceId: string; revision: number }, right: { evidenceId: string; revision: number }): number { return left.evidenceId < right.evidenceId ? -1 : left.evidenceId > right.evidenceId ? 1 : left.revision - right.revision; }
 function checkedAdd(left: number, right: number): number { const result = left + right; if (!Number.isSafeInteger(result)) fail("evidence.input-too-large"); return result; }
 function asciiTrim(value: string): string { return value.replace(/^[\t\n\v\f\r ]+|[\t\n\v\f\r ]+$/gu, ""); }
+function isPortableRelativePath(value: string): boolean {
+  if (value.length === 0 || value.startsWith("/") || value.includes("\\") || /^[A-Za-z]:/u.test(value) || value.includes("\0")) return false;
+  return value.split("/").every((part) => part.length > 0 && part !== "." && part !== "..");
+}
 function isPlain(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype; }
 function deepFreeze<T>(value: T): T { if (value && typeof value === "object" && !Object.isFrozen(value)) { for (const child of Object.values(value as any)) deepFreeze(child); Object.freeze(value); } return value; }
 function fail(code: EvidenceAdmissionErrorCode): never { throw new EvidenceAdmissionError(code); }
