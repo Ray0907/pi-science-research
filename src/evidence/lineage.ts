@@ -3,11 +3,15 @@ import { types as utilTypes } from "node:util";
 import { canonicalJson } from "../crypto/canonical-json.js";
 import { ID_PATTERNS } from "../domain/ids.js";
 import { type SourceRecord } from "../domain/research-records.js";
-import { assertBoundedStructure, StructuralLimitError } from "../storage/bounded-structure.js";
+import { assertBoundedStructure } from "../storage/bounded-structure.js";
 import {
-  ScholarlyIdentifierError,
-  prepareProspectiveSourceIdentityFields,
-} from "../scholarly/identifiers.js";
+  SourceIdentityError,
+  getValidatedSourceRecordsInternal,
+  prepareProspectiveSourceCanonicalInternal,
+  validatePreparedSourceSemanticsInternal,
+  type PreparedProspectiveSourceSemantics,
+  type ValidatedSourceRecords,
+} from "../scholarly/source-identity.js";
 
 export type LineageErrorCode =
   | "lineage.invalid-options"
@@ -99,6 +103,7 @@ interface PreparedSource {
   readonly record: SourceRecord;
   readonly json: string;
   readonly bytes: number;
+  readonly task2Prepared?: PreparedProspectiveSourceSemantics;
 }
 interface StableEdge {
   readonly from: string;
@@ -109,6 +114,12 @@ interface GraphState {
   readonly recordsByRef: ReadonlyMap<string, SourceRecord>;
   readonly componentBySourceId: ReadonlyMap<string, number>;
   readonly relationsByPair: ReadonlyMap<string, ReadonlySet<RelationType>>;
+  readonly sourceValidation: Readonly<{
+    optionsSha256: string;
+    policySha256: string;
+    effectiveRecordBytes: number;
+    effectiveAggregateBytes: number;
+  }> | null;
 }
 
 export function buildLineageGraph(sources: readonly SourceRecord[], options?: LineageOptions): LineageGraph {
@@ -117,31 +128,42 @@ export function buildLineageGraph(sources: readonly SourceRecord[], options?: Li
   const prepared: PreparedSource[] = [];
   for (const input of inputs) prepared.push(prepareRawSource(input, normalized));
   assertAggregateBytes(prepared, normalized);
+  for (const item of prepared) validateRawSourceSemantics(item);
   return buildPreparedGraph(prepared, normalized);
 }
 
 /** Package-internal snapshot seam; deliberately excluded from the package root. */
 export function buildLineageGraphFromValidatedSources(
-  sources: readonly SourceRecord[],
-  sourceCanonicalJson: readonly string[],
+  validatedSources: ValidatedSourceRecords,
   options?: LineageOptions,
 ): LineageGraph {
   const normalized = normalizeOptions(options);
-  const sourceInputs = safeArray(sources, normalized.maxRevisions, "lineage.too-many-sources");
-  const jsonInputs = safeArray(sourceCanonicalJson, normalized.maxRevisions, "lineage.too-many-sources");
-  if (sourceInputs.length !== jsonInputs.length || !Object.isFrozen(sources) || !Object.isFrozen(sourceCanonicalJson))
-    fail("lineage.invalid-input");
+  let internal: ReturnType<typeof getValidatedSourceRecordsInternal>;
+  try { internal = getValidatedSourceRecordsInternal(validatedSources); }
+  catch { return fail("lineage.invalid-input"); }
+  if (internal.sources.length > normalized.maxRevisions) fail("lineage.too-many-sources");
+  if (internal.sources.length !== internal.sourceCanonicalJson.length) fail("lineage.invalid-input");
+  const effectiveRecordBytes = Math.min(
+    normalized.maxSourceRecordCanonicalBytes, internal.maxSourceRecordCanonicalBytes,
+  );
+  const effectiveAggregateBytes = Math.min(
+    normalized.maxAggregateCanonicalBytes, internal.maxAggregateCanonicalBytes,
+  );
   const prepared: PreparedSource[] = [];
-  for (let index = 0; index < sourceInputs.length; index += 1) {
-    const record = sourceInputs[index];
-    const json = jsonInputs[index];
-    if (!isDeepFrozenSource(record) || typeof json !== "string") fail("lineage.invalid-input");
+  for (let index = 0; index < internal.sources.length; index += 1) {
+    const record = internal.sources[index]!;
+    const json = internal.sourceCanonicalJson[index]!;
     const bytes = Buffer.byteLength(json, "utf8");
-    if (bytes > normalized.maxSourceRecordCanonicalBytes) fail("lineage.record-too-large");
-    prepared.push(Object.freeze({ record, json, bytes }) as PreparedSource);
+    if (bytes > effectiveRecordBytes) fail("lineage.record-too-large");
+    prepared.push(Object.freeze({ record, json, bytes }));
   }
-  assertAggregateBytes(prepared, normalized);
-  return buildPreparedGraph(prepared, normalized);
+  assertAggregateBytes(prepared, { ...normalized, maxAggregateCanonicalBytes: effectiveAggregateBytes });
+  return buildPreparedGraph(prepared, normalized, Object.freeze({
+    optionsSha256: internal.optionsSha256,
+    policySha256: internal.policySha256,
+    effectiveRecordBytes,
+    effectiveAggregateBytes,
+  }));
 }
 
 export function compareSourceIndependence(
@@ -184,34 +206,37 @@ export function compareSourceIndependence(
 }
 
 function prepareRawSource(input: unknown, options: NormalizedOptions): PreparedSource {
-  if (utilTypes.isProxy(input)) fail("lineage.invalid-input");
   try {
-    assertBoundedStructure(input, {
-      maxDepth: 64,
-      maxNodes: 100_000,
-      maxKeys: 100_000,
-      maxArrayLength: 100_000,
-      maxStringBytes: options.maxSourceRecordCanonicalBytes,
-      maxScalarBytes: options.maxSourceRecordCanonicalBytes,
-    });
-  } catch (error) {
-    if (error instanceof StructuralLimitError && error.reason === "limit") fail("lineage.record-too-large");
-    return fail("lineage.invalid-input");
-  }
-  try {
-    const prepared = prepareProspectiveSourceIdentityFields(input as SourceRecord, undefined, {
+    const prepared = prepareProspectiveSourceCanonicalInternal(input as SourceRecord, {
+      maxCanonicalScalarBytes: Math.min(4_096, options.maxSourceRecordCanonicalBytes),
       maxSourceRecordCanonicalBytes: options.maxSourceRecordCanonicalBytes,
     });
     if (prepared.canonicalBytes > options.maxSourceRecordCanonicalBytes) fail("lineage.record-too-large");
-    return Object.freeze({ record: prepared.record, json: prepared.canonicalJson, bytes: prepared.canonicalBytes });
-  } catch (error) {
-    if (error instanceof LineageError) throw error;
-    if (error instanceof ScholarlyIdentifierError && error.code === "identifier.record-too-large") fail("lineage.record-too-large");
-    return fail("lineage.invalid-input");
-  }
+    return Object.freeze({
+      record: prepared.record, json: prepared.canonicalJson, bytes: prepared.canonicalBytes, task2Prepared: prepared,
+    });
+  } catch (error) { return translateSourceIdentityError(error); }
 }
 
-function buildPreparedGraph(prepared: readonly PreparedSource[], options: NormalizedOptions): LineageGraph {
+function validateRawSourceSemantics(prepared: PreparedSource): void {
+  if (!prepared.task2Prepared) fail("lineage.invalid-input");
+  try { validatePreparedSourceSemanticsInternal(prepared.task2Prepared, "lineage"); }
+  catch (error) { return translateSourceIdentityError(error); }
+}
+
+function translateSourceIdentityError(error: unknown): never {
+  if (error instanceof LineageError) throw error;
+  if (error instanceof SourceIdentityError) {
+    if (error.code === "source.invalid-options") fail("lineage.invalid-options");
+    if (error.code === "source.record-too-large" || error.code === "source.input-too-large") fail("lineage.record-too-large");
+  }
+  return fail("lineage.invalid-input");
+}
+
+function buildPreparedGraph(
+  prepared: readonly PreparedSource[], options: NormalizedOptions,
+  sourceValidation: GraphState["sourceValidation"] = null,
+): LineageGraph {
   const revisionsBySource = new Map<string, Map<number, PreparedSource>>();
   for (const item of prepared) {
     const revisions = revisionsBySource.get(item.record.sourceId) ?? new Map<number, PreparedSource>();
@@ -297,7 +322,7 @@ function buildPreparedGraph(prepared: readonly PreparedSource[], options: Normal
     recordsByRef.set(refKey(record), record);
     sourceRefs.push(Object.freeze({ sourceId: record.sourceId, revision: record.revision }));
   }
-  const state: GraphState = Object.freeze({ recordsByRef, componentBySourceId, relationsByPair });
+  const state: GraphState = Object.freeze({ recordsByRef, componentBySourceId, relationsByPair, sourceValidation });
   const graph = Object.freeze({
     sourceRefs: Object.freeze(sourceRefs),
     revisionCount: prepared.length,
@@ -402,29 +427,6 @@ function validateRef(input: unknown): SourceRef {
     || typeof sourceIdDescriptor.value !== "string" || !ID_PATTERNS.source.test(sourceIdDescriptor.value)
     || !Number.isSafeInteger(revisionDescriptor.value) || revisionDescriptor.value < 1) fail("lineage.invalid-input");
   return Object.freeze({ sourceId: sourceIdDescriptor.value, revision: revisionDescriptor.value });
-}
-
-function isDeepFrozenSource(input: unknown): input is SourceRecord {
-  const stack: unknown[] = [input];
-  const seen = new WeakSet<object>();
-  while (stack.length > 0) {
-    const value = stack.pop();
-    if (value === null || typeof value !== "object") continue;
-    if (utilTypes.isProxy(value) || seen.has(value) || !Object.isFrozen(value)) return false;
-    seen.add(value);
-    const array = Array.isArray(value);
-    const prototype = Object.getPrototypeOf(value);
-    if ((array && prototype !== Array.prototype) || (!array && prototype !== Object.prototype)) return false;
-    const descriptors = Object.getOwnPropertyDescriptors(value);
-    for (const key of Reflect.ownKeys(descriptors)) {
-      if (typeof key !== "string") return false;
-      if (array && key === "length") continue;
-      const descriptor = descriptors[key]!;
-      if (!("value" in descriptor) || !descriptor.enumerable) return false;
-      stack.push(descriptor.value);
-    }
-  }
-  return true;
 }
 
 function sharesNonEmpty(left: readonly string[], right: readonly string[]): boolean {

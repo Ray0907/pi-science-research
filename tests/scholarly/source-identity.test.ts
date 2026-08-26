@@ -6,6 +6,7 @@ import { prepareProspectiveSourceIdentityFields } from "../../src/scholarly/iden
 import {
   SourceIdentityError,
   buildRequestProvenanceIndex,
+  getValidatedSourceRecordsInternal,
   mergeSourceRecords,
   sourceIdentityKeys,
   validateProspectiveSourceSemantics,
@@ -360,7 +361,11 @@ describe("source identity and provenance", () => {
     expect(Object.keys(index).sort()).toEqual(["optionsSha256", "policySha256", "requestCount", "sourceCount", "witnessCount"]);
     expect(Object.isFrozen(index)).toBe(true);
     expect(JSON.stringify(index)).not.toMatch(/example\.org|logical-|query/i);
-    const internal = validatedProvenanceRecordsForSnapshot(index);
+    const validatedHandle = validatedProvenanceRecordsForSnapshot(index);
+    expect(Object.isFrozen(validatedHandle)).toBe(true);
+    expect(Object.keys(validatedHandle)).toEqual([]);
+    expect(JSON.stringify(validatedHandle)).toBe("{}");
+    const internal = getValidatedSourceRecordsInternal(validatedHandle);
     expect(Object.isFrozen(internal.sources)).toBe(true);
     expect(internal.sourceCanonicalJson).toHaveLength(2);
 
@@ -402,8 +407,8 @@ describe("source identity and provenance", () => {
       metadataStepVisits: 0, witnessInsertions: 0,
     });
     const forwardIndex = buildRequestProvenanceIndex(revisions, [], { maxSources: 2_500, maxProvenanceSteps: 1 });
-    const reverseSnapshot = validatedProvenanceRecordsForSnapshot(reverseIndex);
-    const forwardSnapshot = validatedProvenanceRecordsForSnapshot(forwardIndex);
+    const reverseSnapshot = getValidatedSourceRecordsInternal(validatedProvenanceRecordsForSnapshot(reverseIndex));
+    const forwardSnapshot = getValidatedSourceRecordsInternal(validatedProvenanceRecordsForSnapshot(forwardIndex));
     expect(reverseSnapshot.sources.map(({ revision }) => revision)).toEqual(revisions.map(({ revision }) => revision));
     expect(reverseSnapshot.sourceCanonicalJson).toEqual(forwardSnapshot.sourceCanonicalJson);
   });

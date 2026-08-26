@@ -101,6 +101,30 @@ const PROVENANCE_FIELDS = new Set([
 ]);
 const ACCESS_ORDER = ["metadata-only", "abstract-only", "partial-text", "full-text"] as const;
 const indexState = new WeakMap<object, ProvenanceState>();
+const validatedSourceRecordsState = new WeakMap<object, ProvenanceState>();
+declare const validatedSourceRecordsBrand: unique symbol;
+
+/** @internal Opaque handle to Task 2 validated records. */
+export interface ValidatedSourceRecords {
+  readonly [validatedSourceRecordsBrand]: true;
+}
+/** @internal Read-only package lookup; never exported from the package root. */
+export interface ValidatedSourceRecordsInternal {
+  readonly sources: readonly SourceRecord[];
+  readonly requests: readonly RequestRecord[];
+  readonly sourceCanonicalJson: readonly string[];
+  readonly requestCanonicalJson: readonly string[];
+  readonly maxSourceRecordCanonicalBytes: number;
+  readonly maxAggregateCanonicalBytes: number;
+  readonly optionsSha256: string;
+  readonly policySha256: string;
+}
+/** @internal Prepared Task 2 source snapshot for dependent validators. */
+export interface PreparedProspectiveSourceSemantics {
+  readonly record: SourceRecord;
+  readonly canonicalJson: string;
+  readonly canonicalBytes: number;
+}
 
 interface NormalizedOptions {
   readonly maxSources: number; readonly maxRequests: number; readonly maxProvenanceSteps: number;
@@ -127,13 +151,40 @@ interface ProvenanceState {
   readonly maxSourceRecordCanonicalBytes: number;
   readonly maxCanonicalScalarBytes: number;
   readonly sourceUrlPolicy: SourceUrlPolicyContext | undefined;
+  readonly maxAggregateCanonicalBytes: number;
+  readonly optionsSha256: string;
+  readonly policySha256: string;
 }
 
 export function validateProspectiveSourceSemantics(source: SourceRecord, options?: SourceIdentityOptions): SourceRecord {
+  return prepareProspectiveSourceSemanticsInternal(source, options).record;
+}
+
+/** @internal Validates Task 2 semantics while retaining Task 1 canonical bytes. */
+export function prepareProspectiveSourceSemanticsInternal(
+  source: SourceRecord, options?: SourceIdentityOptions, consumer?: "lineage",
+): PreparedProspectiveSourceSemantics {
+  const prepared = prepareProspectiveSourceCanonicalInternal(source, options);
+  return validatePreparedSourceSemanticsInternal(prepared, consumer);
+}
+
+/** @internal Canonicalizes once so aggregate bounds can precede semantic array reads. */
+export function prepareProspectiveSourceCanonicalInternal(
+  source: SourceRecord, options?: SourceIdentityOptions,
+): PreparedProspectiveSourceSemantics {
   const normalized = normalizeOptions(options);
-  const validated = validateSource(source, normalized).record;
-  validateSourceSemantics(validated);
-  return validated;
+  const validated = validateSource(source, normalized);
+  return Object.freeze({
+    record: validated.record, canonicalJson: validated.json, canonicalBytes: validated.bytes,
+  });
+}
+
+/** @internal Applies Task 2 source semantics to an already prepared source. */
+export function validatePreparedSourceSemanticsInternal(
+  prepared: PreparedProspectiveSourceSemantics, consumer?: "lineage",
+): PreparedProspectiveSourceSemantics {
+  validateSourceSemantics(prepared.record, consumer === "lineage");
+  return prepared;
 }
 
 export function sourceIdentityKeys(source: SourceRecord, options?: SourceIdentityOptions): readonly SourceIdentityKey[] {
@@ -224,6 +275,9 @@ function buildRequestProvenanceIndexInternal(
       accessPolicySha256: normalized.accessPolicySha256!,
       maxApprovedHttpHosts: normalized.approvedHttpHosts.length,
     }) : undefined,
+    maxAggregateCanonicalBytes: normalized.maxAggregateCanonicalBytes,
+    optionsSha256: normalized.optionsSha256,
+    policySha256: normalized.policySha256,
   });
   const view = Object.freeze({
     sourceCount: validatedSources.length, requestCount: validatedRequests.length, witnessCount,
@@ -233,15 +287,27 @@ function buildRequestProvenanceIndexInternal(
   return view;
 }
 
-export function validatedProvenanceRecordsForSnapshot(index: RequestProvenanceIndex): Readonly<{
-  sources: readonly SourceRecord[]; requests: readonly RequestRecord[];
-  sourceCanonicalJson: readonly string[]; requestCanonicalJson: readonly string[];
-}> {
+export function validatedProvenanceRecordsForSnapshot(index: RequestProvenanceIndex): ValidatedSourceRecords {
   const state = indexState.get(index as object);
   if (!state) fail("source.provenance-index-mismatch");
+  const handle = Object.freeze({}) as ValidatedSourceRecords;
+  validatedSourceRecordsState.set(handle, state);
+  return handle;
+}
+
+/** @internal Brand-checks an opaque Task 2 handle for dependent package modules. */
+export function getValidatedSourceRecordsInternal(handle: ValidatedSourceRecords): ValidatedSourceRecordsInternal {
+  const state = validatedSourceRecordsState.get(handle as object);
+  if (!state) fail("source.provenance-index-mismatch");
   return Object.freeze({
-    sources: state.sources, requests: state.requests,
-    sourceCanonicalJson: state.sourceCanonicalJson, requestCanonicalJson: state.requestCanonicalJson,
+    sources: state.sources,
+    requests: state.requests,
+    sourceCanonicalJson: state.sourceCanonicalJson,
+    requestCanonicalJson: state.requestCanonicalJson,
+    maxSourceRecordCanonicalBytes: state.maxSourceRecordCanonicalBytes,
+    maxAggregateCanonicalBytes: state.maxAggregateCanonicalBytes,
+    optionsSha256: state.optionsSha256,
+    policySha256: state.policySha256,
   });
 }
 
@@ -302,6 +368,15 @@ export function mergeSourceRecords(
 
 function validateSource(source: SourceRecord, options: NormalizedOptions): ValidatedSource {
   if (utilTypes.isProxy(source)) fail("source.invalid-input");
+  try {
+    assertBoundedStructure(source, {
+      maxDepth: 64, maxNodes: 100_000, maxKeys: 100_000, maxArrayLength: 100_000,
+      maxStringBytes: options.maxSourceRecordCanonicalBytes, maxScalarBytes: options.maxSourceRecordCanonicalBytes,
+    });
+  } catch (error) {
+    if (error instanceof StructuralLimitError && error.reason === "limit") fail("source.record-too-large");
+    return fail("source.invalid-input");
+  }
   let prepared: ReturnType<typeof prepareProspectiveSourceIdentityFields>;
   try {
     prepared = prepareProspectiveSourceIdentityFields(source, options.sourceUrlPolicy, {
@@ -320,7 +395,7 @@ function validateSource(source: SourceRecord, options: NormalizedOptions): Valid
   return Object.freeze({ record, json, bytes, hash: sha256Hex(json) });
 }
 
-function validateSourceSemantics(record: SourceRecord): void {
+function validateSourceSemantics(record: SourceRecord, deferRelationDuplicates = false): void {
   if (record.lineage.relatedSourceIds.length !== record.lineage.relationTypes.length) fail("source.invalid-lineage");
   assertUnique(record.retrievalRequestIds, "source.invalid-provenance");
   const retrieval = new Set(record.retrievalRequestIds);
@@ -332,8 +407,10 @@ function validateSourceSemantics(record: SourceRecord): void {
   assertUnique(record.authors.map((value) => canonicalJson(value)), "source.invalid-provenance");
   assertUnique(record.lineage.cohortIds, "source.invalid-lineage");
   assertUnique(record.lineage.datasetIds, "source.invalid-lineage");
-  const relationPairs = record.lineage.relatedSourceIds.map((id, index) => `${id}\0${record.lineage.relationTypes[index]}`);
-  assertUnique(relationPairs, "source.invalid-lineage");
+  if (!deferRelationDuplicates) {
+    const relationPairs = record.lineage.relatedSourceIds.map((id, index) => `${id}\0${record.lineage.relationTypes[index]}`);
+    assertUnique(relationPairs, "source.invalid-lineage");
+  }
 }
 
 function validateRequest(input: unknown, options: NormalizedOptions): ValidatedRequest {

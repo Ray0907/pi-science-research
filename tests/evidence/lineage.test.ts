@@ -159,6 +159,36 @@ describe("source lineage", () => {
     for (const [from, target, relation] of pairs) expect(decision(graph, from, target)).toEqual({
       status: "dependent", reasons: [expected[relation], "dependency-component"],
     });
+
+    const article = withLineage(source("src-mixed.article001"), { studyId: "study-article" });
+    const preprint = edge(withLineage(source("src-mixed.preprint01"), { studyId: "study-preprint" }), article, "version-of");
+    const correction = edge(withLineage(source("src-mixed.correct001"), { studyId: "study-correction" }), article, "correction-of");
+    const publicationChain = buildLineageGraph([correction, article, preprint]);
+    expect(publicationChain.edgeCount).toBe(2);
+    expect(decision(publicationChain, preprint, article)).toEqual({
+      status: "dependent", reasons: ["version-relation", "dependency-component"],
+    });
+    expect(decision(publicationChain, correction, article)).toEqual({
+      status: "dependent", reasons: ["correction-relation", "dependency-component"],
+    });
+    expect(decision(publicationChain, preprint, correction)).toEqual({
+      status: "dependent", reasons: ["dependency-component"],
+    });
+
+    const original = withLineage(source("src-mixed.original01"), { studyId: "study-original" });
+    const report = edge(withLineage(source("src-mixed.report0001"), { studyId: "study-report" }), original, "reports");
+    const reanalysis = edge(withLineage(source("src-mixed.reanalyse1"), { studyId: "study-reanalysis" }), original, "reanalysis-of");
+    const analysisChain = buildLineageGraph([reanalysis, report, original]);
+    expect(analysisChain.edgeCount).toBe(2);
+    expect(decision(analysisChain, report, original)).toEqual({
+      status: "dependent", reasons: ["report-relation", "dependency-component"],
+    });
+    expect(decision(analysisChain, reanalysis, original)).toEqual({
+      status: "dependent", reasons: ["reanalysis-relation", "dependency-component"],
+    });
+    expect(decision(analysisChain, report, reanalysis)).toEqual({
+      status: "dependent", reasons: ["dependency-component"],
+    });
   });
 
   test("rejects directed cycles reversals self edges missing nodes and asymmetric sharing", () => {
@@ -173,6 +203,10 @@ describe("source lineage", () => {
     expect(code(() => buildLineageGraph([
       edge(a, b, "version-of"), edge(b, c, "reports"), edge(c, a, "reanalysis-of"),
     ]))).toBe("lineage.cycle");
+    const article = source("src-reverse.article01");
+    const preprint = edge(source("src-reverse.preprint1"), article, "version-of");
+    expect(code(() => buildLineageGraph([preprint, edge(article, preprint, "correction-of")])))
+      .toBe("lineage.invalid-direction");
     expect(code(() => buildLineageGraph([edge(a, b, "shares-cohort"), b]))).toBe("lineage.asymmetric-relation");
     const symmetric = buildLineageGraph([
       withLineage(a, {
@@ -195,9 +229,13 @@ describe("source lineage", () => {
       status: "dependent", reasons: ["version-relation", "dependency-component"],
     });
     const erased = withLineage(base, { relatedSourceIds: [], relationTypes: [] }, 2);
-    const retained = buildLineageGraph([target, erased, base]);
+    const correction = edge(withLineage(source("src-history.correct01"), { studyId: "study-correction" }), target, "correction-of");
+    const retained = buildLineageGraph([correction, target, erased, base]);
     expect(decision(retained, erased, target, 2)).toEqual({
       status: "dependent", reasons: ["version-relation", "dependency-component"],
+    });
+    expect(decision(retained, erased, correction, 2)).toEqual({
+      status: "dependent", reasons: ["dependency-component"],
     });
     const duplicateLatest = withLineage(repeated, {
       relatedSourceIds: [target.sourceId, target.sourceId], relationTypes: ["version-of", "version-of"],
@@ -273,10 +311,16 @@ describe("source lineage", () => {
 
     const provenance = buildRequestProvenanceIndex([a], []);
     const validated = validatedProvenanceRecordsForSnapshot(provenance);
-    expect(buildLineageGraphFromValidatedSources(validated.sources, validated.sourceCanonicalJson, {
+    expect(buildLineageGraphFromValidatedSources(validated, {
       maxSourceRecordCanonicalBytes: recordBytes, maxAggregateCanonicalBytes: aggregateBytes,
     }).revisionCount).toBe(1);
-    expect(code(() => buildLineageGraphFromValidatedSources(validated.sources, [], undefined))).toBe("lineage.invalid-input");
+    for (const forged of [
+      Object.freeze({}),
+      Object.freeze({ ...validated }),
+      Object.freeze({ sources: Object.freeze([a]), sourceCanonicalJson: Object.freeze([canonicalJson(a)]) }),
+      Object.freeze({ sources: Object.freeze([a]), sourceCanonicalJson: Object.freeze([canonicalJson(source("src-swapped.0000001"))]) }),
+      Object.freeze({ optionsSha256: "b".repeat(64), policySha256: "c".repeat(64) }),
+    ]) expect(code(() => buildLineageGraphFromValidatedSources(forged as never))).toBe("lineage.invalid-input");
   });
 
   test("rejects oversized lineage metadata and nested strings under the count cap", () => {
@@ -285,6 +329,18 @@ describe("source lineage", () => {
     });
     expect(code(() => buildLineageGraph([oversized], { maxSourceRecordCanonicalBytes: 1_000 })))
       .toBe("lineage.record-too-large");
+    const semanticBase = withLineage(source("src-semantic.000001"), { studyId: "study-semantic" });
+    expect(code(() => buildLineageGraph([withLineage(semanticBase, { cohortIds: ["same", "same"] })])))
+      .toBe("lineage.invalid-input");
+    expect(code(() => buildLineageGraph([withLineage(semanticBase, { datasetIds: ["same", "same"] })])))
+      .toBe("lineage.invalid-input");
+    expect(code(() => buildLineageGraph([{ ...semanticBase, retrievalRequestIds: [
+      "request-0000000000000001", "request-0000000000000001",
+    ] }]))).toBe("lineage.invalid-input");
+    expect(code(() => buildLineageGraph([{ ...semanticBase,
+      retrievalRequestIds: ["request-0000000000000001"],
+      metadataProvenance: [{ field: "unknown-field", provider: "openalex", requestId: "request-0000000000000001" }],
+    }]))).toBe("lineage.invalid-input");
   });
 
   test("rejects invalid graph and byte limits with lineage.invalid-options", () => {
