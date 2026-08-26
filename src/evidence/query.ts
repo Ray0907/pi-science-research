@@ -437,8 +437,11 @@ function encodeCursor(snapshotHash: string, queryHash: string, position: readonl
   if (Buffer.byteLength(encoded, "utf8") > maximum) fail("query.cursor-invalid");
   return encoded;
 }
-function decodeCursor(value: string, options: NormalizedOptions, snapshotHash: string, queryHash: string): readonly [number, string, number] {
-  if (Buffer.byteLength(value, "utf8") > options.maxCursorBytes || !/^[A-Za-z0-9_-]+$/u.test(value)) fail("query.cursor-invalid");
+function decodeCursor(value: unknown, options: NormalizedOptions, snapshotHash: string, queryHash: string): readonly [number, string, number] {
+  if (typeof value !== "string") fail("query.cursor-invalid");
+  if (value.length > options.maxCursorBytes) fail("query.cursor-invalid");
+  if (Buffer.byteLength(value, "utf8") > options.maxCursorBytes) fail("query.cursor-invalid");
+  if (!/^[A-Za-z0-9_-]+$/u.test(value)) fail("query.cursor-invalid");
   let text: string; try { const bytes = Buffer.from(value, "base64url"); if (bytes.length > options.maxCursorBytes || bytes.toString("base64url") !== value) fail("query.cursor-invalid"); text = bytes.toString("utf8"); } catch { return fail("query.cursor-invalid"); }
   let parsed: unknown; try { parsed = JSON.parse(text); if (canonicalJson(parsed) !== text) fail("query.cursor-invalid"); } catch { return fail("query.cursor-invalid"); }
   if (!isPlain(parsed) || Reflect.ownKeys(parsed).length !== 5 || !["version", "snapshotHash", "queryHash", "position", "checksum"].every((key) => Reflect.ownKeys(parsed).includes(key))) fail("query.cursor-invalid");

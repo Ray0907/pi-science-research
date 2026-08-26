@@ -171,6 +171,17 @@ describe("bounded evidence queries", () => {
   });
   test("treats absent and null cursor as the identical first page", () => { const i = index(); expect(canonicalJson(i.query(query()))).toBe(canonicalJson(i.query(query({ cursor: null })))); });
   test("paginates with cursors bound to every normalized non-cursor field", () => { const e2 = evidence("ev-0000000000000002"); const c = claim(undefined, { evidenceRefs: [claim().evidenceRefs[0]!, { evidenceId: e2.evidenceId, revision: 1 }] }); const i = index(records({ claims: [c], evidence: [evidence(), e2] })); const first = i.query(query({ limit: 1 })); expect(first.nextCursor).not.toBeNull(); expect(i.query(query({ limit: 1, cursor: first.nextCursor })).evidence.some((item) => item.evidenceId === e2.evidenceId)).toBe(true); expect(errorCode(() => i.query(query({ limit: 2, cursor: first.nextCursor })))).toBe("query.cursor-mismatch"); const normalizedCursor = i.query(query({ limit: 1, stances: ["supporting", "supporting"] })).nextCursor!; expect(errorCode(() => i.query(query({ limit: 1, stances: ["supporting"], cursor: normalizedCursor })))).toBeUndefined(); const flipped = `${first.nextCursor!.slice(0, -1)}${first.nextCursor!.endsWith("A") ? "B" : "A"}`; expect(errorCode(() => i.query(query({ limit: 1, cursor: flipped })))).toBe("query.cursor-invalid"); });
+  test("rejects very large cursors before UTF-8 or base64 work and enforces multibyte bytes", () => {
+    const i = index(undefined, { maxCursorBytes: 16 }); const huge = "A".repeat(2_000_000); const multibyte = "é".repeat(9);
+    const guarded = Buffer as unknown as { byteLength: (...args: unknown[]) => number; from: (...args: unknown[]) => Buffer };
+    const originalByteLength = guarded.byteLength; const originalFrom = guarded.from; let hugeByteLengthCalls = 0; let hugeBase64Calls = 0; let multibyteByteLengthCalls = 0; let multibyteBase64Calls = 0;
+    guarded.byteLength = (...args) => { if (args[0] === huge) { hugeByteLengthCalls += 1; throw new Error("SECRET-CURSOR-BYTES"); } if (args[0] === multibyte) multibyteByteLengthCalls += 1; return originalByteLength(...args); };
+    guarded.from = (...args) => { if (args[0] === huge) { hugeBase64Calls += 1; throw new Error("SECRET-CURSOR-BASE64"); } if (args[0] === multibyte) { multibyteBase64Calls += 1; throw new Error("SECRET-CURSOR-BASE64"); } return originalFrom(...args); };
+    try {
+      expect(errorCode(() => i.query(query({ cursor: huge })))).toBe("query.cursor-invalid"); expect([hugeByteLengthCalls, hugeBase64Calls]).toEqual([0, 0]);
+      expect(errorCode(() => i.query(query({ cursor: multibyte })))).toBe("query.cursor-invalid"); expect([multibyteByteLengthCalls, multibyteBase64Calls]).toEqual([1, 0]);
+    } finally { guarded.byteLength = originalByteLength; guarded.from = originalFrom; }
+  });
   test("returns query.cursor-invalid for malformed version integrity and oversized cursor encodings", () => {
     const i = index(undefined, { maxCursorBytes: 16 });
     const body = { version: 2, snapshotHash: "a".repeat(64), queryHash: "b".repeat(64), position: [2, evidence().evidenceId, 1] };
