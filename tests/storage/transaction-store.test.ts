@@ -1,7 +1,7 @@
-import { link, lstat, mkdtemp, readFile, rm, symlink, writeFile, type FileHandle } from "node:fs/promises";
+import { cp, link, lstat, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { canonicalJson } from "../../src/crypto/canonical-json.js";
 import { sha256Hex } from "../../src/crypto/hash.js";
@@ -69,6 +69,32 @@ function request(id = "request-0000000000000001") {
   } as const;
 }
 
+function source(id: string, revision: number, title: string) {
+  return { schemaVersion: 1, sourceId: id, revision, identifiers: { doi: null, pmid: null, pmcid: null }, canonicalUrl: `https://example.org/${id}`, title,
+    authors: [], containerTitle: null, publisher: null, volume: null, issue: null, pages: null, published: { date: null, precision: "unknown" },
+    publicationType: "journal-article", peerReviewStatus: "unknown", accessLevel: "full-text", retrievedAt: AT,
+    retrievalRequestIds: ["request-0000000000000001"], metadataProvenance: [{ field: "title", provider: "openalex", requestId: "request-0000000000000001" }],
+    lineage: { studyId: null, cohortIds: [], datasetIds: [], relatedSourceIds: [], relationTypes: [] } } as const;
+}
+function claim(revision = 1) {
+  return { schemaVersion: 1, claimId: "claim-0000000000000001", revision, statement: "claim", kind: "externally-verifiable-fact", materiality: "load-bearing",
+    scopeQualifiers: { population: null, intervention: null, comparator: null, outcome: null, timeRange: null }, evidenceRule: { minimumLineages: 1, independentVerificationAllowed: true, primarySourceRequired: false, fullTextRequired: false },
+    status: "supported", confidence: 0.8, evidenceRefs: [{ evidenceId: "ev-0000000000000001", revision: 1 }], conflictClaimIds: [], createdByAttemptId: ATTEMPT } as const;
+}
+function evidence() {
+  return { schemaVersion: 1, evidenceId: "ev-0000000000000001", revision: 1, claimRef: { claimId: "claim-0000000000000001", revision: 1 }, evidenceType: "retrieved",
+    sourceRef: { sourceId: "src-openalex.w1", revision: 1 }, calculationId: null, stance: "supporting", quotes: ["evidence"], locators: [], extractedValues: [], method: null,
+    quality: "primary-peer-reviewed", confidence: 0.8, recordedByAttemptId: ATTEMPT, verificationStatus: "verified", conflictsWith: [] } as const;
+}
+function verification() {
+  return { schemaVersion: 1, verificationId: "verify-0000000000000001", revision: 1, attemptId: ATTEMPT, method: "independent-source",
+    checkedClaims: [{ claimId: "claim-0000000000000001", revision: 1 }], checkedEvidence: [{ evidenceId: "ev-0000000000000001", revision: 1 }], requestIds: ["request-0000000000000001"],
+    calculationIds: ["calc-0000000000000001"], result: "accepted", corrections: [], independentEvidenceIds: ["ev-0000000000000001"], notes: "ok" } as const;
+}
+function calculation() {
+  return { schemaVersion: 1, calculationId: "calc-0000000000000001", attemptId: ATTEMPT, sandboxPolicySha256: HASH, runtime: "node", command: "calc", environment: [], inputs: [], sourceFiles: [], outputs: [], networkEnabled: false, startedAt: AT, endedAt: AT, exitCode: 0, status: "success" } as const;
+}
+
 function input(overrides: Partial<CanonicalTransactionInput> = {}): CanonicalTransactionInput {
   return {
     schemaVersion: 1,
@@ -77,15 +103,8 @@ function input(overrides: Partial<CanonicalTransactionInput> = {}): CanonicalTra
     attemptId: ATTEMPT,
     sourceResultSeq: 7,
     createdAt: AT,
-    sources: [
-      { schemaVersion: 1, sourceId: "src-openalex.w2", revision: 2, title: "B" },
-      { schemaVersion: 1, sourceId: "src-openalex.w1", revision: 1, title: "A" },
-    ],
-    claims: [{ schemaVersion: 1, claimId: "claim-0000000000000001", revision: 1, statement: "claim" }],
-    evidence: [{ schemaVersion: 1, evidenceId: "ev-0000000000000001", revision: 1, quote: "evidence" }],
-    verifications: [{ schemaVersion: 1, verificationId: "verify-0000000000000001", revision: 1, result: "accepted" }],
-    requests: [request()],
-    calculations: [{ schemaVersion: 1, calculationId: "calc-0000000000000001", status: "success" }],
+    sources: [source("src-openalex.w2", 1, "B"), source("src-openalex.w1", 1, "A")],
+    claims: [claim()], evidence: [evidence()], verifications: [verification()], requests: [request()], calculations: [calculation()],
     ...overrides,
   };
 }
@@ -111,8 +130,8 @@ describe("canonical transaction store", () => {
     const sourcePath = join(runRoot, ".state/transactions/.staging", TX, "sources.jsonl");
     const sourceBytes = await readFile(sourcePath, "utf8");
     expect(sourceBytes).toBe([
-      canonicalJson({ schemaVersion: 1, sourceId: "src-openalex.w1", revision: 1, title: "A" }),
-      canonicalJson({ schemaVersion: 1, sourceId: "src-openalex.w2", revision: 2, title: "B" }),
+      canonicalJson(source("src-openalex.w1", 1, "A")),
+      canonicalJson(source("src-openalex.w2", 1, "B")),
       "",
     ].join("\n"));
     expect(prepared.manifest.files[0]).toMatchObject({
@@ -121,8 +140,8 @@ describe("canonical transaction store", () => {
       decodedBytes: Buffer.byteLength(sourceBytes),
       sha256: sha256Hex(sourceBytes),
     });
-    expect(steps.at(-1)).toBe("manifest-directory-synced");
-    expect(steps.slice(-2)).toEqual(["manifest-synced", "manifest-directory-synced"]);
+    const prepareSteps = steps.filter((step) => step === "manifest-synced" || step === "manifest-directory-synced");
+    expect(prepareSteps).toEqual(["manifest-synced", "manifest-directory-synced"]);
     const manifestBytes = await readFile(join(runRoot, ".state/transactions/.staging", TX, "manifest.json"), "utf8");
     expect(manifestBytes).toBe(`${canonicalJson(prepared.manifest)}\n`);
     expect(prepared.manifestSha256).toBe(sha256Hex(manifestBytes));
@@ -164,15 +183,132 @@ describe("canonical transaction store", () => {
           if (step === failAt) throw new Error("parent-fsync-secret");
         },
       }), "transaction.io-failed");
-      expect(firstSteps).toEqual(failAt === "committed-parent-synced"
+      const parentSteps = firstSteps.filter((step) => step === "committed-parent-synced" || step === "staging-parent-synced");
+      expect(parentSteps).toEqual(failAt === "committed-parent-synced"
         ? ["committed-parent-synced"]
         : ["committed-parent-synced", "staging-parent-synced"]);
       const retrySteps: TransactionProtocolStep[] = [];
       await expect(commitTransaction(runRoot, TX, {
         durability: async (handle, step) => { retrySteps.push(step); await handle.sync(); },
       })).resolves.toMatchObject({ sha256: prepared.manifestSha256 });
-      expect(retrySteps.slice(-2)).toEqual(["committed-parent-synced", "staging-parent-synced"]);
+      expect(retrySteps.filter((step) => step === "committed-parent-synced" || step === "staging-parent-synced"))
+        .toEqual(["committed-parent-synced", "staging-parent-synced"]);
     }
+  });
+
+  test("cleans exact dual namespaces and roll-forwards cleanup crashes", async () => {
+    for (const crash of [false, true]) {
+      const runRoot = await root();
+      const ref = await committed(runRoot);
+      const committedDir = join(runRoot, ".state/transactions/committed", TX);
+      const stageDir = join(runRoot, ".state/transactions/.staging", TX);
+      await cp(committedDir, stageDir, { recursive: true });
+      if (crash) {
+        let failed = false;
+        await expectCode(commitTransaction(runRoot, TX, { onStep: async (step) => {
+          if (step === "staging-cleaned" && !failed) { failed = true; throw new Error("cleanup-crash"); }
+        } }), "transaction.io-failed");
+      }
+      await expect(commitTransaction(runRoot, TX)).resolves.toEqual(ref);
+      await expect(lstat(stageDir)).rejects.toMatchObject({ code: "ENOENT" });
+    }
+    const conflictRoot = await root();
+    await committed(conflictRoot);
+    const committedDir = join(conflictRoot, ".state/transactions/committed", TX);
+    const stageDir = join(conflictRoot, ".state/transactions/.staging", TX);
+    await cp(committedDir, stageDir, { recursive: true });
+    await writeFile(join(stageDir, "claims.jsonl"), "{}\n");
+    await expectCode(commitTransaction(conflictRoot, TX), "transaction.id-conflict");
+  });
+
+  test("durably initializes hierarchy and recovers every mkdir sync crash", async () => {
+    const phases = [
+      "mkdir-state-directory-synced", "mkdir-state-parent-synced", "mkdir-transactions-directory-synced", "mkdir-transactions-parent-synced",
+      "mkdir-staging-directory-synced", "mkdir-staging-parent-synced", "mkdir-committed-directory-synced", "mkdir-committed-parent-synced",
+      "mkdir-transaction-directory-synced", "mkdir-transaction-parent-synced",
+    ] as const;
+    for (const phase of phases) {
+      const runRoot = await root();
+      let failed = false;
+      await expectCode(prepareTransaction(runRoot, input(), { onStep: async (step) => {
+        if (step === phase && !failed) { failed = true; throw new Error("mkdir-crash"); }
+      } }), "transaction.io-failed");
+      await expect(prepareTransaction(runRoot, input())).resolves.toBeDefined();
+      await expect(lstat(join(runRoot, ".state/transactions/committed", TX))).rejects.toMatchObject({ code: "ENOENT" });
+    }
+  });
+
+  test("recovers deterministic stale mutation locks and rejects live owners", async () => {
+    const runRoot = await root();
+    await prepareTransaction(runRoot, input());
+    const lockPath = join(runRoot, ".state/transactions/.mutation-lock");
+    await mkdir(lockPath, { mode: 0o700 });
+    const stat = await lstat(lockPath);
+    const owner = { schemaVersion: 1, pid: 424242, ownerToken: "f".repeat(64), createdAt: AT, dev: String(stat.dev), ino: String(stat.ino) };
+    await writeFile(join(lockPath, "owner.json"), `${canonicalJson(owner)}\n`);
+    await expectCode(commitTransaction(runRoot, TX, { isProcessAlive: () => true }), "transaction.locked");
+    await expect(commitTransaction(runRoot, TX, { isProcessAlive: () => false, randomToken: () => "e".repeat(64), pid: 123 })).resolves.toBeDefined();
+  });
+
+  test("excludes independent module instances racing the same transaction root", async () => {
+    const runRoot = await root();
+    vi.resetModules();
+    const moduleA = await import("../../src/storage/transaction-store.js");
+    vi.resetModules();
+    const moduleB = await import("../../src/storage/transaction-store.js");
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let held = false;
+    const first = moduleA.prepareTransaction(runRoot, input(), { onStep: async (step: TransactionProtocolStep) => {
+      if (step === "lock-parent-synced" && !held) { held = true; await gate; }
+    } });
+    await vi.waitFor(() => expect(held).toBe(true));
+    const second = moduleB.prepareTransaction(runRoot, input());
+    await expectCode(second, "transaction.locked");
+    release();
+    await expect(first).resolves.toBeDefined();
+    await expect(moduleB.prepareTransaction(runRoot, input())).resolves.toBeDefined();
+
+    const otherRoot = await root();
+    let releaseOther!: () => void;
+    const otherGate = new Promise<void>((resolve) => { releaseOther = resolve; });
+    let otherHeld = false;
+    const empty = { sources: [], claims: [], evidence: [], verifications: [], requests: [], calculations: [] } as const;
+    const tx2 = input({ ...empty, transactionId: "tx-0000000000000002", sourceResultSeq: 8 });
+    const tx3 = input({ ...empty, transactionId: "tx-0000000000000003", sourceResultSeq: 9 });
+    const otherFirst = moduleA.prepareTransaction(otherRoot, tx2, { onStep: async (step: TransactionProtocolStep) => {
+      if (step === "lock-parent-synced" && !otherHeld) { otherHeld = true; await otherGate; }
+    } });
+    await vi.waitFor(() => expect(otherHeld).toBe(true));
+    await expectCode(moduleB.prepareTransaction(otherRoot, tx3), "transaction.locked");
+    releaseOther();
+    await expect(otherFirst).resolves.toBeDefined();
+    await expect(moduleB.prepareTransaction(otherRoot, tx3)).resolves.toBeDefined();
+  });
+
+  test("fails closed when a pinned ancestor is swapped before rename", async () => {
+    const runRoot = await root();
+    await prepareTransaction(runRoot, input());
+    const transactions = join(runRoot, ".state/transactions");
+    const moved = join(runRoot, ".state/transactions-moved");
+    let swapped = false;
+    await expectCode(commitTransaction(runRoot, TX, { onAncestorCheck: async (phase) => {
+      if (phase === "before-rename" && !swapped) {
+        swapped = true;
+        await rename(transactions, moved);
+        await mkdir(transactions);
+        await mkdir(join(transactions, ".staging"));
+        await mkdir(join(transactions, "committed"));
+      }
+    } }), "transaction.unsafe-root");
+    await expect(lstat(join(transactions, "committed", TX))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("enforces record, total and transaction byte bounds before writing", async () => {
+    const runRoot = await root();
+    await expectCode(prepareTransaction(runRoot, input(), { maxRecords: 1, maxTotalRecords: 2 }), "transaction.too-many-records");
+    await expectCode(prepareTransaction(runRoot, input(), { maxTransactionBytes: 128 }), "transaction.file-too-large");
+    await expectCode(prepareTransaction(runRoot, input(), { maxReferences: 1 }), "transaction.too-many-records");
   });
 
   test("makes duplicate matching commit harmless and different content corruption", async () => {
@@ -181,7 +317,29 @@ describe("canonical transaction store", () => {
     const before = await readFile(join(runRoot, first.relativePath));
     await expect(commitTransaction(runRoot, TX)).resolves.toEqual(first);
     expect(await readFile(join(runRoot, first.relativePath))).toEqual(before);
-    await expectCode(prepareTransaction(runRoot, input({ claims: [{ schemaVersion: 1, claimId: "claim-0000000000000001", revision: 1, statement: "changed" }] })), "transaction.id-conflict");
+    await expectCode(prepareTransaction(runRoot, input({ claims: [{ ...claim(), statement: "changed" }] })), "transaction.id-conflict");
+  });
+
+  test("resolves exact refs across transactions and enforces revision progression", async () => {
+    const runRoot = await root();
+    await committed(runRoot);
+    const revisionTwo = input({
+      transactionId: "tx-0000000000000002", sourceResultSeq: 8,
+      sources: [source("src-openalex.w1", 2, "A2")], claims: [], evidence: [], verifications: [], requests: [], calculations: [],
+    });
+    await expect(prepareTransaction(runRoot, revisionTwo)).resolves.toMatchObject({ manifest: { sourceRefs: [{ sourceId: "src-openalex.w1", revision: 2 }] } });
+
+    const staleRoot = await root();
+    await committed(staleRoot);
+    await expectCode(prepareTransaction(staleRoot, { ...revisionTwo, sources: [source("src-openalex.w1", 3, "skip")] }), "transaction.invalid-reference");
+    await expectCode(prepareTransaction(staleRoot, { ...revisionTwo, sources: [source("src-openalex.w1", 1, "duplicate")] }), "transaction.duplicate-record");
+  });
+
+  test("rejects unresolved, stale and cross-kind exact references", async () => {
+    const runRoot = await root();
+    await expectCode(prepareTransaction(runRoot, input({ evidence: [{ ...evidence(), sourceRef: { sourceId: "src-missing00", revision: 1 } }] })), "transaction.invalid-reference");
+    await expectCode(prepareTransaction(runRoot, input({ evidence: [{ ...evidence(), sourceRef: { sourceId: "src-openalex.w1", revision: 2 } }] })), "transaction.invalid-reference");
+    await expectCode(prepareTransaction(runRoot, input({ claims: [{ ...claim(), evidenceRefs: [{ evidenceId: "ev-0000000000009999", revision: 1 }] }] })), "transaction.invalid-reference");
   });
 
   test("serializes concurrent matching prepare/commit and fails closed for different input", async () => {
@@ -192,7 +350,7 @@ describe("canonical transaction store", () => {
     expect(commitOne).toEqual(commitTwo);
 
     const otherRoot = await root();
-    const changed = input({ claims: [{ schemaVersion: 1, claimId: "claim-0000000000000001", revision: 1, statement: "changed" }] });
+    const changed = input({ claims: [{ ...claim(), statement: "changed" }] });
     const results = await Promise.allSettled([prepareTransaction(otherRoot, input()), prepareTransaction(otherRoot, changed)]);
     expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
     expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
@@ -212,16 +370,16 @@ describe("canonical transaction store", () => {
   test("rejects duplicate identities, cross-kind keys, proxies, malformed requests, and bounded-size overflow", async () => {
     const runRoot = await root();
     await expectCode(prepareTransaction(runRoot, input({ sources: [
-      { schemaVersion: 1, sourceId: "src-openalex.w1", revision: 1 },
-      { schemaVersion: 1, sourceId: "src-openalex.w1", revision: 1 },
+      source("src-openalex.w1", 1, "A"),
+      source("src-openalex.w1", 1, "A"),
     ] })), "transaction.duplicate-record");
     await expectCode(prepareTransaction(runRoot, input({ sources: [
-      { schemaVersion: 1, sourceId: "src-openalex.w1", revision: 1 },
-      { schemaVersion: 1, sourceId: "src-openalex.w1", revision: 2 },
+      source("src-openalex.w1", 1, "A"),
+      source("src-openalex.w1", 2, "B"),
     ] })), "transaction.duplicate-record");
-    await expectCode(prepareTransaction(runRoot, input({ sources: [{ schemaVersion: 1, sourceId: "src-openalex.w1", claimId: "claim-0000000000000001", revision: 1 }] })), "transaction.cross-kind-id");
+    await expectCode(prepareTransaction(runRoot, input({ sources: [{ ...source("src-openalex.w1", 1, "A"), claimId: "claim-0000000000000001" }] })), "transaction.cross-kind-id");
     await expectCode(prepareTransaction(runRoot, input({ claims: [{ claimId: "claim-0000000000000001", revision: 1 }] })), "transaction.invalid-record");
-    await expectCode(prepareTransaction(runRoot, input({ claims: [new Proxy({ schemaVersion: 1, claimId: "claim-0000000000000001", revision: 1 }, {})] })), "transaction.invalid-input");
+    await expectCode(prepareTransaction(runRoot, input({ claims: [new Proxy(claim(), {})] })), "transaction.invalid-input");
     const proxyArray = new Proxy(input().claims, { getPrototypeOf: () => { throw new Error("secret-array-trap"); } });
     const proxyFailure = prepareTransaction(runRoot, input({ claims: proxyArray }));
     await expectCode(proxyFailure, "transaction.invalid-input");
@@ -402,7 +560,7 @@ describe("canonical transaction store", () => {
   test("lists verified committed manifests in deterministic order and rejects suspicious entries", async () => {
     const runRoot = await root();
     await committed(runRoot);
-    const second = input({ transactionId: "tx-0000000000000002", sourceResultSeq: 8 });
+    const second = input({ transactionId: "tx-0000000000000002", sourceResultSeq: 8, sources: [], claims: [], evidence: [], verifications: [], requests: [], calculations: [] });
     await committed(runRoot, second);
     expect((await listCommittedTransactions(runRoot)).map((item) => item.manifest.transactionId)).toEqual([TX, second.transactionId]);
     await writeFile(join(runRoot, ".state/transactions/committed", "unexpected"), "x");
