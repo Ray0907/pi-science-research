@@ -25,6 +25,7 @@ import {
 import { recoveryDecisionFor, reduceLedgerEvents } from "../domain/reducer.js";
 import { parseResearchRecord } from "../domain/research-records.js";
 import { parse } from "../domain/schema.js";
+import { assertBoundedStructure, StructuralLimitError, type StructuralLimits } from "./bounded-structure.js";
 
 const KINDS = ["sources", "claims", "evidence", "verifications", "requests", "calculations"] as const;
 export type CanonicalRecordKind = typeof KINDS[number];
@@ -47,6 +48,9 @@ const DEFAULT_MAX_RECORDS = 100_000;
 const DEFAULT_MAX_TOTAL_RECORDS = 300_000;
 const DEFAULT_MAX_REFERENCES = 300_000;
 const DEFAULT_MAX_TRANSACTION_BYTES = 64 * 1024 * 1024;
+const DEFAULT_MAX_DEPTH = 64;
+const DEFAULT_MAX_NODES = 500_000;
+const DEFAULT_MAX_KEYS = 500_000;
 const READ_CHUNK_BYTES = 64 * 1024;
 const fatalUtf8 = new TextDecoder("utf-8", { fatal: true });
 const rootQueues = new Map<string, Promise<void>>();
@@ -79,7 +83,11 @@ export type TransactionProtocolStep =
   | "staging-cleaned"
   | "lock-owner-synced"
   | "lock-directory-synced"
+  | "lock-active-renamed"
   | "lock-parent-synced"
+  | "lock-release-renamed"
+  | "lock-release-parent-synced"
+  | "lock-trash-cleaned"
   | "lock-released";
 
 export interface TransactionStoreOptions {
@@ -89,6 +97,13 @@ export interface TransactionStoreOptions {
   maxTotalRecords?: number;
   maxReferences?: number;
   maxTransactionBytes?: number;
+  maxDepth?: number;
+  maxNodes?: number;
+  maxKeys?: number;
+  maxArrayLength?: number;
+  maxStringBytes?: number;
+  maxScalarBytes?: number;
+  canonicalize?: (value: unknown) => string;
   readChunk?: (handle: FileHandle, buffer: Buffer, position: number) => Promise<number>;
   durability?: (handle: FileHandle, step: TransactionProtocolStep) => Promise<void>;
   rename?: (from: string, to: string) => Promise<void>;
@@ -159,7 +174,7 @@ export async function prepareTransaction(
 ): Promise<PreparedTransaction> {
   const limits = limitsFrom(options);
   preflightTransactionInput(transaction, limits);
-  const snapshot = snapshotTransactionInput(transaction, limits);
+  const snapshot = snapshotTransactionInput(transaction, limits, options);
   const root = await initializeRoot(runRoot, options);
   return withMutationLock(root, options, async () => {
     const catalog = await loadReferenceCatalog(root, limits, snapshot.transactionId);
@@ -218,7 +233,7 @@ export async function commitTransaction(
       const existing = await verifyDirectory(root, "committed", transactionId, limits);
       const stagePath = transactionDirectory(root, ".staging", transactionId);
       if (await pathExists(stagePath)) {
-        await cleanupMatchingStaging(root, transactionId, existing, limits, options);
+        await cleanupMatchingStaging(root, transactionId, existing, limits, options, guard);
         await syncCleanupParents(root, options);
       } else {
         await syncRenameParents(root, options);
@@ -371,7 +386,7 @@ export async function reconstructCanonicalRecords(
   });
 }
 
-interface Limits {
+interface Limits extends StructuralLimits {
   maxFileBytes: number;
   maxLineBytes: number;
   maxRecords: number;
@@ -407,14 +422,17 @@ function preflightTransactionInput(input: CanonicalTransactionInput, limits: Lim
     total += length;
     if (total > limits.maxTotalRecords) fail("transaction.too-many-records");
   }
+  try { assertBoundedStructure(input, limits); }
+  catch (error) { if (error instanceof StructuralLimitError) fail(error.reason === "unsafe" ? "transaction.invalid-input" : "transaction.file-too-large"); throw error; }
 }
 
-function snapshotTransactionInput(input: CanonicalTransactionInput, limits: Limits): CanonicalTransactionInput {
+function snapshotTransactionInput(input: CanonicalTransactionInput, limits: Limits, options: TransactionStoreOptions): CanonicalTransactionInput {
   try {
     const descriptors = Object.getOwnPropertyDescriptors(input);
     const snapshot = Object.create(null) as Record<string, unknown>;
+    const encode = options.canonicalize ?? canonicalJson;
     for (const key of ["schemaVersion", "transactionId", "runId", "attemptId", "sourceResultSeq", "createdAt"] as const) {
-      snapshot[key] = JSON.parse(canonicalJson(descriptors[key]!.value));
+      snapshot[key] = JSON.parse(encode(descriptors[key]!.value));
     }
     let totalBytes = 0;
     for (const kind of KINDS) {
@@ -425,7 +443,7 @@ function snapshotTransactionInput(input: CanonicalTransactionInput, limits: Limi
       for (let index = 0; index < values.length; index += 1) {
         const descriptor = Object.getOwnPropertyDescriptor(values, String(index));
         if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) fail("transaction.invalid-input");
-        const canonical = canonicalJson(descriptor.value);
+        const canonical = encode(descriptor.value);
         const bytes = Buffer.byteLength(canonical) + 1;
         if (bytes > limits.maxLineBytes) fail("transaction.file-too-large");
         totalBytes += bytes;
@@ -503,7 +521,8 @@ function validateAndSortRecords(kind: CanonicalRecordKind, values: readonly Json
         && !(kind === "evidence" && field === "calculationId")) fail("transaction.cross-kind-id");
     }
     const parsedRecord = parseResearchRecord(kind, inputRecord);
-    if (!parsedRecord.success) fail("transaction.invalid-record");
+    if (!parsedRecord.success) fail(kind === "requests" && parsedRecord.issues.some((item) => item.code.startsWith("request."))
+      ? "transaction.invalid-reference" : "transaction.invalid-record");
     const validatedRecord = parsedRecord.value as JsonRecord;
     const id = validatedRecord[metadata.field];
     if (typeof id !== "string" || !metadata.pattern.test(id)) fail("transaction.invalid-record");
@@ -602,6 +621,33 @@ function validateCatalogAndReferences(records: Record<CanonicalRecordKind, JsonR
     if (evidence.calculationId !== null) stable("calculations", evidence.calculationId);
     for (const id of evidence.conflictsWith as string[]) stable("evidence", id);
   }
+  const requestsById = new Map<string, JsonRecord>();
+  const requestSeriesOrdinals = new Map<string, string>();
+  for (const [requestId, revisions] of catalog.requests) {
+    const encoded = revisions.get(0);
+    if (!encoded) fail("transaction.invalid-reference");
+    const requestRecord = JSON.parse(encoded) as JsonRecord;
+    requestsById.set(requestId, requestRecord);
+    const seriesOrdinal = `${String(requestRecord.logicalRequestId)}\0${String(requestRecord.physicalAttemptOrdinal)}`;
+    if (requestSeriesOrdinals.has(seriesOrdinal)) fail("transaction.invalid-reference");
+    requestSeriesOrdinals.set(seriesOrdinal, requestId);
+  }
+  for (const request of records.requests) {
+    for (const sourceId of request.resultSourceIds as string[]) stable("sources", sourceId);
+    const ordinal = request.physicalAttemptOrdinal as number;
+    const predecessorId = request.retryOfRequestId as string | null;
+    if (ordinal === 1) {
+      if (predecessorId !== null) fail("transaction.invalid-reference");
+      continue;
+    }
+    if (predecessorId === null || predecessorId === request.requestId) fail("transaction.invalid-reference");
+    countReference();
+    const predecessor = requestsById.get(predecessorId);
+    if (!predecessor) fail("transaction.invalid-reference");
+    if (predecessor.logicalRequestId !== request.logicalRequestId
+      || predecessor.physicalAttemptOrdinal !== ordinal - 1
+      || !sameRequestSeriesIdentity(predecessor, request)) fail("transaction.invalid-reference");
+  }
   for (const verification of records.verifications) {
     for (const ref of verification.checkedClaims as { claimId: string; revision: number }[]) exact("claims", ref.claimId, ref.revision);
     for (const ref of verification.checkedEvidence as { evidenceId: string; revision: number }[]) exact("evidence", ref.evidenceId, ref.revision);
@@ -611,6 +657,13 @@ function validateCatalogAndReferences(records: Record<CanonicalRecordKind, JsonR
     for (const id of verification.independentEvidenceIds as string[]) stable("evidence", id);
   }
   return catalog;
+}
+
+function sameRequestSeriesIdentity(left: JsonRecord, right: JsonRecord): boolean {
+  return canonicalJson({ attemptId: left.attemptId, executionEpoch: left.executionEpoch, replayPolicy: left.replayPolicy,
+    provider: left.provider, operation: left.operation, normalizedInput: left.normalizedInput, accessPolicySha256: left.accessPolicySha256 })
+    === canonicalJson({ attemptId: right.attemptId, executionEpoch: right.executionEpoch, replayPolicy: right.replayPolicy,
+      provider: right.provider, operation: right.operation, normalizedInput: right.normalizedInput, accessPolicySha256: right.accessPolicySha256 });
 }
 
 function addRecordsToCatalog(records: Record<CanonicalRecordKind, JsonRecord[]>, catalog: ReferenceCatalog, enforceProgression: boolean): void {
@@ -643,7 +696,7 @@ async function verifyDirectory(root: string, location: ".staging" | "committed",
   if (entries.length !== expected.size || entries.some((entry) => !entry.isFile() || !expected.has(entry.name))) fail("transaction.corrupt");
   const manifestBytes = await readSafeFile(join(directory, MANIFEST_FILE), Math.min(limits.maxFileBytes, limits.maxLineBytes), limits);
   let transactionBytes = manifestBytes.byteLength;
-  const manifestInput = parseCanonicalSingleJson(manifestBytes);
+  const manifestInput = parseCanonicalSingleJson(manifestBytes, limits);
   const parsed = parse(CanonicalTransactionManifestSchema, manifestInput);
   if (!parsed.success) fail("transaction.corrupt");
   const manifest = parsed.value;
@@ -678,13 +731,14 @@ async function verifyDirectory(root: string, location: ".staging" | "committed",
   };
 }
 
-function parseCanonicalSingleJson(bytes: Buffer): unknown {
+function parseCanonicalSingleJson(bytes: Buffer, limits: Limits): unknown {
   let text: string;
   try { text = fatalUtf8.decode(bytes); } catch { fail("transaction.corrupt"); }
   if (!text.endsWith("\n") || text.slice(0, -1).includes("\n")) fail("transaction.corrupt");
   const body = text.slice(0, -1);
   let value: unknown;
   try { value = JSON.parse(body); } catch { fail("transaction.corrupt"); }
+  try { assertBoundedStructure(value, limits); } catch { fail("transaction.corrupt"); }
   try { if (canonicalJson(value) !== body) fail("transaction.corrupt"); } catch { fail("transaction.corrupt"); }
   return value;
 }
@@ -699,6 +753,7 @@ function parseJsonLines(bytes: Buffer, limits: Limits): JsonRecord[] {
   return lines.map((line) => {
     let value: unknown;
     try { value = JSON.parse(line); } catch { fail("transaction.corrupt"); }
+    try { assertBoundedStructure(value, limits); } catch { fail("transaction.corrupt"); }
     try { if (canonicalJson(value) !== line) fail("transaction.corrupt"); } catch { fail("transaction.corrupt"); }
     if (value === null || typeof value !== "object" || Array.isArray(value)) fail("transaction.corrupt");
     return value as JsonRecord;
@@ -839,27 +894,59 @@ async function writeExclusiveFile(path: string, bytes: Buffer, step: Transaction
   await protocolStep(step, options);
 }
 
-async function cleanupMatchingStaging(root: string, transactionId: string, committed: VerifiedTransaction, limits: Limits, options: TransactionStoreOptions): Promise<void> {
+async function cleanupMatchingStaging(root: string, transactionId: string, committed: VerifiedTransaction, limits: Limits, options: TransactionStoreOptions, guard: PinnedHierarchy): Promise<void> {
   const stage = transactionDirectory(root, ".staging", transactionId);
   const destination = transactionDirectory(root, "committed", transactionId);
-  const entries = await readdir(stage, { withFileTypes: true }).catch(() => fail("transaction.id-conflict"));
-  const expected = new Set([...KINDS.map((kind) => `${kind}.jsonl`), MANIFEST_FILE]);
-  if (entries.some((entry) => !entry.isFile() || entry.isSymbolicLink() || !expected.has(entry.name))) fail("transaction.id-conflict");
-  for (const entry of entries) {
-    const stagedBytes = await readSafeFile(join(stage, entry.name), limits.maxFileBytes, limits);
-    const committedBytes = await readSafeFile(join(destination, entry.name), limits.maxFileBytes, limits);
-    if (!stagedBytes.equals(committedBytes)) fail("transaction.id-conflict");
-  }
-  if (entries.some((entry) => entry.name === MANIFEST_FILE)) {
-    const stagedManifest = await verifyDirectory(root, ".staging", transactionId, limits).catch(() => fail("transaction.id-conflict"));
-    if (stagedManifest.manifestSha256 !== committed.manifestSha256) fail("transaction.id-conflict");
-  }
-  const removalOrder = [...entries].sort((left, right) => Number(right.name === MANIFEST_FILE) - Number(left.name === MANIFEST_FILE));
-  for (const entry of removalOrder) {
-    try { await unlink(join(stage, entry.name)); } catch { fail("transaction.io-failed"); }
-    await protocolStep("staging-cleaned", options);
-  }
+  await assertPinnedHierarchy(guard, "before-staging-cleanup", options);
+  const before = await lstat(stage).catch(() => fail("transaction.id-conflict"));
+  if (!before.isDirectory() || before.isSymbolicLink()) fail("transaction.unsafe-file");
+  const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+  const directoryFlag = typeof constants.O_DIRECTORY === "number" ? constants.O_DIRECTORY : 0;
+  const handle = await open(stage, constants.O_RDONLY | noFollow | directoryFlag).catch(() => fail("transaction.unsafe-file"));
+  try {
+    const pinned = await handle.stat();
+    if (!pinned.isDirectory() || pinned.dev !== before.dev || pinned.ino !== before.ino) fail("transaction.unsafe-file");
+    const assertStage = async () => {
+      await assertPinnedHierarchy(guard, "during-staging-cleanup", options);
+      const current = await lstat(stage).catch(() => fail("transaction.unsafe-file"));
+      const descriptor = await handle.stat().catch(() => fail("transaction.unsafe-file"));
+      if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== pinned.dev || current.ino !== pinned.ino
+        || descriptor.dev !== pinned.dev || descriptor.ino !== pinned.ino) fail("transaction.unsafe-file");
+    };
+    await assertStage();
+    const entries = await readdir(stage, { withFileTypes: true }).catch(() => fail("transaction.id-conflict"));
+    const expected = new Set([...KINDS.map((kind) => `${kind}.jsonl`), MANIFEST_FILE]);
+    const suspicious = entries.find((entry) => entry.isSymbolicLink() || !entry.isFile() || !expected.has(entry.name));
+    if (suspicious) {
+      if (suspicious.isSymbolicLink()) {
+        await assertStage();
+        await unlink(join(stage, suspicious.name)).catch(() => fail("transaction.unsafe-file"));
+      }
+      fail("transaction.unsafe-file");
+    }
+    for (const entry of entries) {
+      await assertStage();
+      const stagedBytes = await readSafeFile(join(stage, entry.name), limits.maxFileBytes, limits);
+      const committedBytes = await readSafeFile(join(destination, entry.name), limits.maxFileBytes, limits);
+      if (!stagedBytes.equals(committedBytes)) fail("transaction.id-conflict");
+    }
+    if (entries.some((entry) => entry.name === MANIFEST_FILE)) {
+      const stagedManifest = await verifyDirectory(root, ".staging", transactionId, limits).catch(() => fail("transaction.id-conflict"));
+      if (stagedManifest.manifestSha256 !== committed.manifestSha256) fail("transaction.id-conflict");
+    }
+    const removalOrder = [...entries].sort((left, right) => Number(right.name === MANIFEST_FILE) - Number(left.name === MANIFEST_FILE));
+    for (const entry of removalOrder) {
+      await assertStage();
+      const child = await lstat(join(stage, entry.name)).catch(() => fail("transaction.unsafe-file"));
+      if (!child.isFile() || child.isSymbolicLink() || child.nlink !== 1) fail("transaction.unsafe-file");
+      await unlink(join(stage, entry.name)).catch(() => fail("transaction.io-failed"));
+      await protocolStep("staging-cleaned", options);
+    }
+    await assertStage();
+  } finally { await handle.close().catch(() => undefined); }
+  await assertPinnedHierarchy(guard, "after-staging-files", options);
   try { await rmdir(stage); } catch { fail("transaction.io-failed"); }
+  await assertPinnedHierarchy(guard, "after-staging-cleanup", options);
 }
 
 /**
@@ -1000,11 +1087,18 @@ function limitsFrom(options: TransactionStoreOptions): Limits {
   const maxTotalRecords = positiveLimit(options.maxTotalRecords ?? DEFAULT_MAX_TOTAL_RECORDS);
   const maxReferences = positiveLimit(options.maxReferences ?? DEFAULT_MAX_REFERENCES);
   const maxTransactionBytes = positiveLimit(options.maxTransactionBytes ?? DEFAULT_MAX_TRANSACTION_BYTES);
+  const maxDepth = positiveLimit(options.maxDepth ?? DEFAULT_MAX_DEPTH);
+  const maxNodes = positiveLimit(options.maxNodes ?? DEFAULT_MAX_NODES);
+  const maxKeys = positiveLimit(options.maxKeys ?? DEFAULT_MAX_KEYS);
+  const maxArrayLength = positiveLimit(options.maxArrayLength ?? maxRecords);
+  const maxStringBytes = positiveLimit(options.maxStringBytes ?? maxLineBytes);
+  const maxScalarBytes = positiveLimit(options.maxScalarBytes ?? maxTransactionBytes);
   const readChunk = options.readChunk ?? (async (handle: FileHandle, buffer: Buffer, position: number) => {
     const { bytesRead } = await handle.read(buffer, 0, buffer.byteLength, position);
     return bytesRead;
   });
-  return { maxFileBytes, maxLineBytes: Math.min(maxLineBytes, maxFileBytes), maxRecords, readChunk, maxTotalRecords, maxReferences, maxTransactionBytes };
+  return { maxFileBytes, maxLineBytes: Math.min(maxLineBytes, maxFileBytes), maxRecords, readChunk, maxTotalRecords, maxReferences, maxTransactionBytes,
+    maxDepth, maxNodes, maxKeys, maxArrayLength, maxStringBytes, maxScalarBytes };
 }
 
 function positiveLimit(value: number): number {
@@ -1074,59 +1168,98 @@ interface MutationLock { path: string; dev: number | bigint; ino: number | bigin
 interface LockOwner { schemaVersion: 1; pid: number; ownerToken: string; createdAt: string; dev: string; ino: string }
 
 async function acquireMutationLock(root: string, options: TransactionStoreOptions): Promise<MutationLock> {
-  const path = join(root, ".state/transactions/.mutation-lock");
+  const parent = join(root, ".state/transactions");
+  const active = join(parent, ".mutation-lock");
+  await recoverLockTrash(parent, options);
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    let created = false;
-    try {
-      await mkdir(path, { mode: 0o700 });
-      created = true;
-      const stat = await lstat(path);
-      if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) fail("transaction.lock-corrupt");
-      const token = options.randomToken?.() ?? randomBytes(32).toString("hex");
-      const pid = options.pid ?? process.pid;
-      const createdAt = (options.now?.() ?? new Date()).toISOString();
-      if (!/^[a-f0-9]{64}$/.test(token) || !Number.isSafeInteger(pid) || pid < 1 || !isTimestamp(createdAt)) fail("transaction.lock-corrupt");
-      const owner: LockOwner = { schemaVersion: 1, pid, ownerToken: token, createdAt, dev: String(stat.dev), ino: String(stat.ino) };
-      await writeExclusiveFile(join(path, "owner.json"), Buffer.from(`${canonicalJson(owner)}\n`), "lock-owner-synced", options);
-      await syncDirectory(path, "lock-directory-synced", options);
-      await syncDirectory(join(root, ".state/transactions"), "lock-parent-synced", options);
-      return { path, dev: stat.dev, ino: stat.ino, token };
-    } catch (error) {
-      if (created) {
-        await unlink(join(path, "owner.json")).catch((cleanupError) => { if (!isNodeError(cleanupError, "ENOENT")) fail("transaction.lock-corrupt"); });
-        await rmdir(path).catch(() => fail("transaction.lock-corrupt"));
-        await syncDirectory(join(root, ".state/transactions"), "lock-released", options);
-        throw normalize(error);
-      }
-      if (!isNodeError(error, "EEXIST")) {
-        if (error instanceof TransactionStoreError) throw error;
-        fail("transaction.io-failed");
-      }
-      const stat = await lstat(path).catch(() => fail("transaction.lock-corrupt"));
-      if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) fail("transaction.lock-corrupt");
-      const ownerRecord = await readLockOwner(path, options);
+    if (await pathExists(active)) {
+      const activeStat = await lstat(active).catch(() => fail("transaction.lock-corrupt"));
+      if (!activeStat.isDirectory() || activeStat.isSymbolicLink() || (activeStat.mode & 0o077) !== 0) fail("transaction.lock-corrupt");
+      const ownerRecord = await readLockOwner(active, options);
       const owner = ownerRecord.owner;
-      const alive = await (options.isProcessAlive ?? defaultProcessAlive)(owner.pid);
-      if (alive) fail("transaction.locked");
-      const current = await lstat(path).catch(() => fail("transaction.lock-corrupt"));
-      if (current.dev !== stat.dev || current.ino !== stat.ino || owner.dev !== String(stat.dev) || owner.ino !== String(stat.ino)) fail("transaction.lock-corrupt");
-      await assertLockOwnerIdentity(path, ownerRecord);
-      await unlink(join(path, "owner.json")).catch(() => fail("transaction.lock-corrupt"));
-      await rmdir(path).catch(() => fail("transaction.lock-corrupt"));
-      await syncDirectory(join(root, ".state/transactions"), "lock-released", options);
+      if (owner.dev !== String(activeStat.dev) || owner.ino !== String(activeStat.ino)) fail("transaction.lock-corrupt");
+      if (await (options.isProcessAlive ?? defaultProcessAlive)(owner.pid)) fail("transaction.locked");
+      await assertLockOwnerIdentity(active, ownerRecord);
+      const stale = join(parent, `.mutation-lock.release-${owner.ownerToken}`);
+      await nodeRename(active, stale).catch(() => fail("transaction.lock-corrupt"));
+      await syncDirectory(parent, "lock-release-parent-synced", options);
+      await deleteLockDirectory(stale, owner.ownerToken, options);
+      await syncDirectory(parent, "lock-released", options);
     }
+    const token = options.randomToken?.() ?? randomBytes(32).toString("hex");
+    const pid = options.pid ?? process.pid;
+    const createdAt = (options.now?.() ?? new Date()).toISOString();
+    if (!/^[a-f0-9]{64}$/.test(token) || !Number.isSafeInteger(pid) || pid < 1 || !isTimestamp(createdAt)) fail("transaction.lock-corrupt");
+    const temporary = join(parent, `.mutation-lock.acquire-${token}`);
+    try { await mkdir(temporary, { mode: 0o700 }); }
+    catch (error) { if (isNodeError(error, "EEXIST")) continue; throw normalize(error); }
+    const stat = await lstat(temporary).catch(() => fail("transaction.lock-corrupt"));
+    const owner: LockOwner = { schemaVersion: 1, pid, ownerToken: token, createdAt, dev: String(stat.dev), ino: String(stat.ino) };
+    await writeExclusiveFile(join(temporary, "owner.json"), Buffer.from(`${canonicalJson(owner)}\n`), "lock-owner-synced", options);
+    await syncDirectory(temporary, "lock-directory-synced", options);
+    try { await nodeRename(temporary, active); }
+    catch (error) {
+      if (isNodeError(error, "EEXIST") || isNodeError(error, "ENOTEMPTY")) {
+        await deleteLockDirectory(temporary, token, options);
+        await syncDirectory(parent, "lock-released", options);
+        fail("transaction.locked");
+      }
+      throw normalize(error);
+    }
+    const activeStat = await lstat(active).catch(() => fail("transaction.lock-corrupt"));
+    if (activeStat.dev !== stat.dev || activeStat.ino !== stat.ino) fail("transaction.lock-corrupt");
+    await protocolStep("lock-active-renamed", options);
+    await syncDirectory(parent, "lock-parent-synced", options);
+    return { path: active, dev: stat.dev, ino: stat.ino, token };
   }
   fail("transaction.locked");
 }
 
 async function releaseMutationLock(root: string, lock: MutationLock, options: TransactionStoreOptions): Promise<void> {
+  const parent = join(root, ".state/transactions");
   const stat = await lstat(lock.path).catch(() => fail("transaction.lock-corrupt"));
   const ownerRecord = await readLockOwner(lock.path, options);
   if (stat.dev !== lock.dev || stat.ino !== lock.ino || ownerRecord.owner.ownerToken !== lock.token) fail("transaction.lock-corrupt");
   await assertLockOwnerIdentity(lock.path, ownerRecord);
-  await unlink(join(lock.path, "owner.json")).catch(() => fail("transaction.lock-corrupt"));
-  await rmdir(lock.path).catch(() => fail("transaction.lock-corrupt"));
-  await syncDirectory(join(root, ".state/transactions"), "lock-released", options);
+  const releasing = join(parent, `.mutation-lock.release-${lock.token}`);
+  await nodeRename(lock.path, releasing).catch(() => fail("transaction.lock-corrupt"));
+  const releasingStat = await lstat(releasing).catch(() => fail("transaction.lock-corrupt"));
+  if (releasingStat.dev !== lock.dev || releasingStat.ino !== lock.ino) fail("transaction.lock-corrupt");
+  await protocolStep("lock-release-renamed", options);
+  await syncDirectory(parent, "lock-release-parent-synced", options);
+  await deleteLockDirectory(releasing, lock.token, options);
+  await syncDirectory(parent, "lock-released", options);
+}
+
+async function recoverLockTrash(parent: string, options: TransactionStoreOptions): Promise<void> {
+  const entries = await readdir(parent, { withFileTypes: true }).catch(() => fail("transaction.lock-corrupt"));
+  for (const entry of entries) {
+    const match = /^\.mutation-lock\.(?:acquire|release)-([a-f0-9]{64})$/.exec(entry.name);
+    if (!match) continue;
+    if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+    const path = join(parent, entry.name);
+    let ownerRecord: ReadLockOwner;
+    try { ownerRecord = await readLockOwner(path, options); } catch { continue; }
+    if (ownerRecord.owner.ownerToken !== match[1]) continue;
+    if (await (options.isProcessAlive ?? defaultProcessAlive)(ownerRecord.owner.pid)) continue;
+    await deleteLockDirectory(path, match[1]!, options);
+    await syncDirectory(parent, "lock-released", options);
+  }
+}
+
+async function deleteLockDirectory(path: string, token: string, options: TransactionStoreOptions): Promise<void> {
+  const before = await lstat(path).catch(() => fail("transaction.lock-corrupt"));
+  if (!before.isDirectory() || before.isSymbolicLink() || (before.mode & 0o077) !== 0) fail("transaction.lock-corrupt");
+  const ownerRecord = await readLockOwner(path, options);
+  if (ownerRecord.owner.ownerToken !== token || ownerRecord.owner.dev !== String(before.dev) || ownerRecord.owner.ino !== String(before.ino)) fail("transaction.lock-corrupt");
+  await assertLockOwnerIdentity(path, ownerRecord);
+  const current = await lstat(path).catch(() => fail("transaction.lock-corrupt"));
+  if (current.dev !== before.dev || current.ino !== before.ino) fail("transaction.lock-corrupt");
+  await unlink(join(path, "owner.json")).catch(() => fail("transaction.lock-corrupt"));
+  const empty = await lstat(path).catch(() => fail("transaction.lock-corrupt"));
+  if (empty.dev !== before.dev || empty.ino !== before.ino) fail("transaction.lock-corrupt");
+  await rmdir(path).catch(() => fail("transaction.lock-corrupt"));
+  await protocolStep("lock-trash-cleaned", options);
 }
 
 interface ReadLockOwner { owner: LockOwner; dev: number | bigint; ino: number | bigint }
@@ -1135,9 +1268,10 @@ async function readLockOwner(path: string, options: TransactionStoreOptions): Pr
   const ownerPath = join(path, "owner.json");
   const before = await lstat(ownerPath).catch(() => fail("transaction.lock-corrupt"));
   if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1) fail("transaction.lock-corrupt");
-  const limits = limitsFrom({ ...options, maxFileBytes: 4096, maxLineBytes: 4096 });
+  const limits = limitsFrom({ ...options, maxFileBytes: 4096, maxLineBytes: 4096, maxDepth: 8, maxNodes: 32, maxKeys: 16,
+    maxArrayLength: 16, maxStringBytes: 4096, maxScalarBytes: 4096 });
   const bytes = await readSafeFile(ownerPath, 4096, limits).catch(() => fail("transaction.lock-corrupt"));
-  const value = parseCanonicalSingleJson(bytes) as Partial<LockOwner>;
+  const value = parseCanonicalSingleJson(bytes, limits) as Partial<LockOwner>;
   if (value.schemaVersion !== 1 || !Number.isSafeInteger(value.pid) || !/^[a-f0-9]{64}$/.test(value.ownerToken ?? "")
     || !isTimestamp(value.createdAt) || typeof value.dev !== "string" || typeof value.ino !== "string"
     || Reflect.ownKeys(value).length !== 6) fail("transaction.lock-corrupt");
