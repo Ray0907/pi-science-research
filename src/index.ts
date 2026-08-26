@@ -14,4 +14,5 @@ export type {
 export type { ParseResult, ValidationIssue } from "./domain/schema.js";
 export * from "./storage/event-ledger.js";
 export * from "./storage/retry-store.js";
+export * from "./storage/run-root.js";
 export * from "./storage/transaction-store.js";
