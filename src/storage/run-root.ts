@@ -113,6 +113,14 @@ interface OwnerMarker {
   runId: RunId;
   createdAt: string;
   ownershipTokenSha256: string;
+  rootDevice: string;
+  rootInode: string;
+}
+
+interface OwnerMarkerSeed {
+  runId: RunId;
+  createdAt: string;
+  ownershipTokenSha256: string;
 }
 
 export type RunRootErrorCode =
@@ -196,26 +204,26 @@ async function createOwnedRunRootLocked(
   const parent = await canonicalExistingDirectory(dirname(target));
   if (parent !== dirname(target)) fail("run-root.replaced");
   const ancestorPins = await pinExistingAncestors(parent);
-  const marker: OwnerMarker = {
-    schemaVersion: 1,
+  const markerSeed: OwnerMarkerSeed = {
     runId: options.runId,
     createdAt,
     ownershipTokenSha256: sha256Hex(token),
   };
-  const markerBytes = Buffer.from(`${canonicalJson(marker)}\n`, "utf8");
-  if (markerBytes.byteLength > MAX_MARKER_BYTES) fail("run-root.marker-invalid");
-  const published = await prepareAndPublishLeaf(target, collision, markerBytes, ancestorPins, options);
-  await assertPinnedDirectory(trustedProject, projectStat);
-  await recheckPinnedAncestors(ancestorPins);
-  return registerOwnedRoot(
-    published.path,
-    options.runId,
-    token,
-    published.handle,
-    published.rootStat,
-    published.markerStat,
-    sha256Hex(markerBytes),
-  );
+  const published = await prepareAndPublishLeaf(target, collision, markerSeed, ancestorPins, options);
+  try {
+    return registerOwnedRoot(
+      published.path,
+      options.runId,
+      token,
+      published.handle,
+      published.rootStat,
+      published.markerStat,
+      published.markerSha256,
+    );
+  } catch (error) {
+    await published.handle.close().catch(() => undefined);
+    throw wrap(error);
+  }
 }
 
 export async function openOwnedRunRoot(
@@ -237,6 +245,7 @@ export async function openOwnedRunRoot(
     if (!rootStat.isDirectory() || !sameInode(rootStat, pathStat)) fail("run-root.replaced");
     const { marker, stat: markerStat, sha256 } = await readOwnerMarker(canonical);
     assertOwner(marker, runId, ownershipToken);
+    assertMarkerRootBinding(marker, rootStat, "run-root.owner-mismatch");
     return registerOwnedRoot(canonical, runId, ownershipToken, rootHandle, rootStat, markerStat, sha256);
   } catch (error) {
     await rootHandle.close().catch(() => undefined);
@@ -348,8 +357,12 @@ export async function revalidateOwnedRunRoot(root: OwnedRunRoot): Promise<void> 
   }
   if (Number(handleStat.dev) !== internal.dev || Number(handleStat.ino) !== internal.ino) fail("run-root.replaced");
   const read = await readOwnerMarker(internal.path);
-  if (Number(read.stat.dev) !== internal.markerDev || Number(read.stat.ino) !== internal.markerIno) fail("run-root.replaced");
+  if (
+    Number(read.stat.dev) !== internal.markerDev || Number(read.stat.ino) !== internal.markerIno ||
+    read.sha256 !== internal.markerSha256
+  ) fail("run-root.replaced");
   assertOwner(read.marker, internal.runId, internal.ownershipToken);
+  assertMarkerRootBinding(read.marker, handleStat, "run-root.replaced");
 }
 
 function registerOwnedRoot(
@@ -407,10 +420,10 @@ async function readOwnerMarker(root: string): Promise<{
   const handle = await openReadNoFollow(markerPath);
   try {
     const opened = await handle.stat();
-    if (!opened.isFile() || opened.nlink !== 1 || !sameInode(opened, before)) fail("run-root.replaced");
+    if (!opened.isFile() || opened.nlink !== 1 || !sameStableFileObservation(opened, before)) fail("run-root.replaced");
     const bytes = await readBounded(handle, MAX_MARKER_BYTES);
     const after = await handle.stat();
-    if (!sameInode(opened, after) || opened.size !== after.size || bytes.byteLength !== after.size) fail("run-root.replaced");
+    if (!sameStableFileObservation(opened, after) || bytes.byteLength !== after.size) fail("run-root.replaced");
     let text: string;
     let value: unknown;
     try {
@@ -430,7 +443,9 @@ async function readOwnerMarker(root: string): Promise<{
 function parseOwnerMarker(value: unknown): OwnerMarker {
   if (utilTypes.isProxy(value) || !isPlainRecord(value)) fail("run-root.marker-invalid");
   const keys = Reflect.ownKeys(value);
-  if (keys.length !== 4 || keys.some((key) => typeof key !== "string" || !["schemaVersion", "runId", "createdAt", "ownershipTokenSha256"].includes(key))) {
+  if (keys.length !== 6 || keys.some((key) => typeof key !== "string" || ![
+    "schemaVersion", "runId", "createdAt", "ownershipTokenSha256", "rootDevice", "rootInode",
+  ].includes(key))) {
     fail("run-root.marker-invalid");
   }
   const record = value as Record<string, unknown>;
@@ -438,7 +453,9 @@ function parseOwnerMarker(value: unknown): OwnerMarker {
     record.schemaVersion !== 1 ||
     typeof record.runId !== "string" || !ID_PATTERNS.run.test(record.runId) ||
     !isTimestamp(record.createdAt) ||
-    !isSha256(record.ownershipTokenSha256)
+    !isSha256(record.ownershipTokenSha256) ||
+    typeof record.rootDevice !== "string" || !/^[0-9]+$/.test(record.rootDevice) ||
+    typeof record.rootInode !== "string" || !/^[0-9]+$/.test(record.rootInode)
   ) fail("run-root.marker-invalid");
   return record as unknown as OwnerMarker;
 }
@@ -447,6 +464,14 @@ function assertOwner(marker: OwnerMarker, runId: RunId, token: string): void {
   if (marker.runId !== runId || !safeHashEqual(marker.ownershipTokenSha256, sha256Hex(token))) {
     fail("run-root.owner-mismatch");
   }
+}
+
+function assertMarkerRootBinding(
+  marker: OwnerMarker,
+  rootStat: { dev: number | bigint; ino: number | bigint },
+  code: "run-root.owner-mismatch" | "run-root.replaced",
+): void {
+  if (marker.rootDevice !== String(rootStat.dev) || marker.rootInode !== String(rootStat.ino)) fail(code);
 }
 
 interface PinnedAncestor {
@@ -460,6 +485,7 @@ interface PublishedLeaf {
   handle: FileHandle;
   rootStat: Awaited<ReturnType<FileHandle["stat"]>>;
   markerStat: Awaited<ReturnType<FileHandle["stat"]>>;
+  markerSha256: string;
 }
 
 async function ensurePreparedResearchDirectory(
@@ -523,7 +549,7 @@ async function ensurePreparedResearchDirectory(
 async function prepareAndPublishLeaf(
   base: string,
   useSuffix: boolean,
-  markerBytes: Buffer,
+  markerSeed: OwnerMarkerSeed,
   ancestorPins: readonly PinnedAncestor[],
   options: CreateOwnedRunRootOptions,
 ): Promise<PublishedLeaf> {
@@ -537,6 +563,15 @@ async function prepareAndPublishLeaf(
     // performs the first lstat immediately after mkdir, before it resolves and
     // before any callback or other package-controlled operation can run.
     const first = createdTemp.firstStat;
+    const marker: OwnerMarker = {
+      schemaVersion: 1,
+      ...markerSeed,
+      rootDevice: String(first.dev),
+      rootInode: String(first.ino),
+    };
+    const markerBytes = Buffer.from(`${canonicalJson(marker)}\n`, "utf8");
+    if (markerBytes.byteLength > MAX_MARKER_BYTES) fail("run-root.marker-invalid");
+    const markerSha256 = sha256Hex(markerBytes);
     await recheckPinnedAncestors(ancestorPins);
     await options.onCheck?.("after-leaf-temp-mkdir-before-pin");
     await assertExpectedDirectory(temp, first);
@@ -602,8 +637,11 @@ async function prepareAndPublishLeaf(
     finalHandle = await openDirectoryNoFollow(publishedPath);
     const finalStat = await finalHandle.stat();
     if (!sameInode(first, finalStat)) fail("run-root.replaced");
-    const marker = await readOwnerMarker(publishedPath);
-    if (!sameInode(marker.stat, markerStat!)) fail("run-root.replaced");
+    const markerRead = await readOwnerMarker(publishedPath);
+    if (!sameStableFileObservation(markerRead.stat, markerStat!) || markerRead.sha256 !== markerSha256) fail("run-root.replaced");
+    assertMarkerSeed(markerRead.marker, markerSeed);
+    assertMarkerRootBinding(markerRead.marker, first, "run-root.replaced");
+    await options.onCheck?.("after-final-marker-read-before-return");
     await options.onCheck?.("after-final-open-before-return");
     await assertExpectedDirectory(publishedPath, first);
     if (!sameInode(await finalHandle.stat(), first)) fail("run-root.replaced");
@@ -614,16 +652,77 @@ async function prepareAndPublishLeaf(
     } finally {
       await parentHandle.close().catch(() => undefined);
     }
+    await options.onCheck?.("after-leaf-parent-synced-before-return");
     await recheckPinnedAncestors(ancestorPins);
+    await finalHandle.close();
+    finalHandle = undefined;
     await tempHandle.close();
     tempHandle = undefined;
-    return { path: publishedPath, handle: finalHandle, rootStat: finalStat, markerStat: markerStat! };
+    const verified = await verifyPublishedOwnership(
+      publishedPath,
+      first,
+      markerSeed,
+      markerStat!,
+      markerSha256,
+    );
+    return { path: publishedPath, handle: verified.handle, rootStat: verified.rootStat, markerStat: verified.markerStat, markerSha256 };
   } catch (error) {
     await finalHandle?.close().catch(() => undefined);
     throw wrap(error);
   } finally {
-    await tempHandle?.close().catch(() => undefined);
+    if (tempHandle) await tempHandle.close().catch(() => undefined);
   }
+}
+
+async function verifyPublishedOwnership(
+  path: string,
+  expectedRoot: { dev: number | bigint; ino: number | bigint },
+  markerSeed: OwnerMarkerSeed,
+  expectedMarker: Awaited<ReturnType<FileHandle["stat"]>>,
+  expectedMarkerSha256: string,
+): Promise<{
+  handle: FileHandle;
+  rootStat: Awaited<ReturnType<FileHandle["stat"]>>;
+  markerStat: Awaited<ReturnType<FileHandle["stat"]>>;
+}> {
+  const pathBefore = await safeLstat(path);
+  if (pathBefore.isSymbolicLink() || !pathBefore.isDirectory() || !sameInode(pathBefore, expectedRoot)) {
+    fail("run-root.replaced");
+  }
+  const handle = await openDirectoryNoFollow(path);
+  try {
+    const opened = await handle.stat();
+    if (!opened.isDirectory() || !sameInode(opened, expectedRoot) || !sameInode(opened, pathBefore)) {
+      fail("run-root.replaced");
+    }
+    const marker = await readOwnerMarker(path);
+    if (
+      !sameStableFileObservation(marker.stat, expectedMarker) ||
+      marker.sha256 !== expectedMarkerSha256
+    ) fail("run-root.replaced");
+    assertMarkerSeed(marker.marker, markerSeed);
+    assertMarkerRootBinding(marker.marker, opened, "run-root.replaced");
+    // These are the final asynchronous observations before returning the pinned
+    // handle. No hook or filesystem operation is performed after them.
+    const pathAfter = await safeLstat(path);
+    const finalStat = await handle.stat();
+    if (
+      pathAfter.isSymbolicLink() || !pathAfter.isDirectory() ||
+      !sameInode(pathAfter, expectedRoot) || !sameInode(finalStat, expectedRoot) ||
+      !sameInode(pathAfter, finalStat)
+    ) fail("run-root.replaced");
+    return { handle, rootStat: finalStat, markerStat: marker.stat };
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    throw wrap(error);
+  }
+}
+
+function assertMarkerSeed(marker: OwnerMarker, seed: OwnerMarkerSeed): void {
+  if (
+    marker.runId !== seed.runId || marker.createdAt !== seed.createdAt ||
+    !safeHashEqual(marker.ownershipTokenSha256, seed.ownershipTokenSha256)
+  ) fail("run-root.replaced");
 }
 
 async function createUnpredictableTempDirectory(
@@ -1052,6 +1151,16 @@ async function safeStat(path: string): Promise<Awaited<ReturnType<typeof stat>>>
 
 function sameInode(a: { dev: number | bigint; ino: number | bigint }, b: { dev: number | bigint; ino: number | bigint }): boolean {
   return String(a.dev) === String(b.dev) && String(a.ino) === String(b.ino);
+}
+
+function sameStableFileObservation(
+  a: { dev: number | bigint; ino: number | bigint; size: number | bigint; mtimeMs: number | bigint; ctimeMs: number | bigint },
+  b: { dev: number | bigint; ino: number | bigint; size: number | bigint; mtimeMs: number | bigint; ctimeMs: number | bigint },
+): boolean {
+  return sameInode(a, b) &&
+    String(a.size) === String(b.size) &&
+    String(a.mtimeMs) === String(b.mtimeMs) &&
+    String(a.ctimeMs) === String(b.ctimeMs);
 }
 
 function inodeKey(info: { dev: number | bigint; ino: number | bigint }): string {

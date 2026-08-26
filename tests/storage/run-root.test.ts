@@ -25,6 +25,7 @@ import {
   assertContainedWrite,
   createOwnedRunRoot,
   openOwnedRunRoot,
+  revalidateOwnedRunRoot,
 } from "../../src/storage/run-root.js";
 import { sha256Hex } from "../../src/crypto/hash.js";
 
@@ -95,6 +96,8 @@ describe("createOwnedRunRoot", () => {
       runId: RUN_ID,
       createdAt: NOW.toISOString(),
       ownershipTokenSha256: sha256Hex(TOKEN),
+      rootDevice: String((await stat(owned.path)).dev),
+      rootInode: String((await stat(owned.path)).ino),
     });
     expect(markerText).not.toContain(TOKEN);
     await owned.close();
@@ -415,6 +418,7 @@ test("cross-process create", async () => {
     "after-marker-fsync-before-rename",
     "after-leaf-rename-before-final-open",
     "after-final-open-before-return",
+    "after-leaf-parent-synced-before-return",
   ])("never adopts a replacement directory injected at %s", async (phase) => {
     const { base, project } = await fixture();
     let injected = false;
@@ -425,7 +429,7 @@ test("cross-process create", async () => {
         injected = true;
         const research = join(await realpath(project), "research");
         const entries = await readdir(research);
-        const selected = phase === "after-leaf-rename-before-final-open" || phase === "after-final-open-before-return"
+        const selected = phase === "after-leaf-rename-before-final-open" || phase === "after-final-open-before-return" || phase === "after-leaf-parent-synced-before-return"
           ? entries.find((entry) => entry.includes(`swap-${phase}`) && !entry.startsWith(".tmp-"))
           : entries.find((entry) => entry.startsWith(".tmp-run-root-"));
         if (!selected) throw new Error("injection target absent");
@@ -441,6 +445,25 @@ test("cross-process create", async () => {
       if (!entry.includes(`swap-${phase}`) || entry.startsWith(".tmp-")) continue;
       await expect(readFile(join(research, entry, ".pi-science-research-owner.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     }
+  });
+
+  test("rejects in-place marker mutation after the marker was previously read", async () => {
+    const { project } = await fixture();
+    let mutated = false;
+    await expect(createOwnedRunRoot(options(project, {
+      topic: "marker-mutation",
+      onCheck: async (phase: string) => {
+        if (phase !== "after-final-marker-read-before-return" || mutated) return;
+        mutated = true;
+        const research = join(await realpath(project), "research");
+        const leaf = (await readdir(research)).find((entry) => entry.includes("marker-mutation") && !entry.startsWith(".tmp-"));
+        if (!leaf) throw new Error("published leaf absent");
+        const markerPath = join(research, leaf, ".pi-science-research-owner.json");
+        const original = await readFile(markerPath, "utf8");
+        await writeFile(markerPath, original.replace("12:34:56.000Z", "12:34:57.000Z"));
+      },
+    }))).rejects.toBeInstanceOf(RunRootError);
+    expect(mutated).toBe(true);
   });
 
   test.each([
@@ -564,6 +587,29 @@ describe("openOwnedRunRoot", () => {
     );
   });
 
+  test("rejects a copied owner marker whose pinned root identity differs", async () => {
+    const { project } = await fixture();
+    const created = await createOwnedRunRoot(options(project));
+    const marker = await readFile(join(created.path, ".pi-science-research-owner.json"));
+    const replacement = join(await realpath(project), "copied-marker-root");
+    await mkdir(replacement);
+    await writeFile(join(replacement, ".pi-science-research-owner.json"), marker);
+    await created.close();
+
+    await expect(openOwnedRunRoot(replacement, RUN_ID, TOKEN)).rejects.toEqual(expectCode("run-root.owner-mismatch"));
+  });
+
+  test("active ownership revalidation detects same-inode marker mutation", async () => {
+    const { project } = await fixture();
+    const created = await createOwnedRunRoot(options(project));
+    const markerPath = join(created.path, ".pi-science-research-owner.json");
+    const original = await readFile(markerPath, "utf8");
+    await writeFile(markerPath, original.replace("12:34:56.000Z", "12:34:57.000Z"));
+
+    await expect(revalidateOwnedRunRoot(created)).rejects.toEqual(expectCode("run-root.replaced"));
+    await created.close();
+  });
+
   test("rejects a root reached through a symlinked parent alias", async () => {
     const { project } = await fixture();
     const created = await createOwnedRunRoot(options(project));
@@ -597,7 +643,11 @@ describe("openOwnedRunRoot", () => {
     await expect(openOwnedRunRoot(created.path, RUN_ID, TOKEN)).rejects.toEqual(expectCode("run-root.symlink"));
 
     await rm(marker);
-    const valid = JSON.stringify({ schemaVersion: 1, runId: RUN_ID, createdAt: NOW.toISOString(), ownershipTokenSha256: sha256Hex(TOKEN) }) + "\n";
+    const rootIdentity = await stat(created.path);
+    const valid = JSON.stringify({
+      schemaVersion: 1, runId: RUN_ID, createdAt: NOW.toISOString(), ownershipTokenSha256: sha256Hex(TOKEN),
+      rootDevice: String(rootIdentity.dev), rootInode: String(rootIdentity.ino),
+    }) + "\n";
     await writeFile(marker, valid);
     await link(marker, join(base, "marker-hardlink"));
     await expect(openOwnedRunRoot(created.path, RUN_ID, TOKEN)).rejects.toEqual(expectCode("run-root.unsafe-link"));
@@ -688,8 +738,10 @@ describe("assertContainedWrite", () => {
     const original = `${owned.path}-moved`;
     await rename(owned.path, original);
     await mkdir(owned.path);
+    const replacementIdentity = await stat(owned.path);
     await writeFile(join(owned.path, ".pi-science-research-owner.json"), JSON.stringify({
       schemaVersion: 1, runId: RUN_ID, createdAt: NOW.toISOString(), ownershipTokenSha256: sha256Hex(TOKEN),
+      rootDevice: String(replacementIdentity.dev), rootInode: String(replacementIdentity.ino),
     }) + "\n");
 
     await expect(assertContainedWrite(owned, join(owned.path, "file"))).rejects.toEqual(expectCode("run-root.replaced"));
