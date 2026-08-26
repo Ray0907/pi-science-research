@@ -488,9 +488,12 @@ test("cross-process create", async () => {
   });
 
   test.each([
-    "after-final-leaf-mkdir-before-pin",
-    "after-final-leaf-pin-before-open",
+    "after-final-leaf-sync-pin-before-path-check",
+    "after-final-leaf-path-check-before-secondary-open",
+    "after-final-leaf-secondary-open-before-fstat",
     "after-final-leaf-open-before-marker",
+    "before-marker-create",
+    "after-marker-pathname-open-before-root-recheck",
     "after-marker-create-before-write",
     "after-marker-write-before-fsync",
     "after-marker-fsync-before-finalization",

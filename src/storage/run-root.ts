@@ -1,5 +1,11 @@
 import { randomBytes as nodeRandomBytes, timingSafeEqual } from "node:crypto";
-import { constants } from "node:fs";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  openSync,
+  type Stats,
+} from "node:fs";
 import {
   lstat,
   mkdir,
@@ -46,6 +52,20 @@ export type RunRootDurabilityStep =
   | "leaf-marker-directory-synced"
   | "leaf-parent-synced";
 
+type DirectoryStat = Awaited<ReturnType<FileHandle["stat"]>>;
+
+interface OwnedDirectoryHandle {
+  readonly fd: number;
+  stat(): Promise<DirectoryStat>;
+  close(): Promise<void>;
+}
+
+/**
+ * Creation keeps the final leaf descriptor pinned. Where Node lacks a
+ * descriptor-relative child-open primitive (notably Darwin/Node 24), marker
+ * creation uses exclusive no-follow pathname open bracketed by inode checks;
+ * a same-user attacker can still race within that kernel pathname-open gap.
+ */
 export interface CreateOwnedRunRootOptions {
   trustedProject: string;
   repositoryRoot?: string;
@@ -103,7 +123,7 @@ export interface OwnedRunRoot {
 }
 
 interface InternalOwnedRunRoot extends OwnedRunRoot {
-  readonly rootHandle: FileHandle;
+  readonly rootHandle: OwnedDirectoryHandle;
   readonly inodeKey: string;
   readonly markerDev: number;
   readonly markerIno: number;
@@ -123,6 +143,28 @@ interface OwnerMarkerSeed {
   runId: RunId;
   createdAt: string;
   ownershipTokenSha256: string;
+}
+
+class SynchronouslyPinnedDirectory implements OwnedDirectoryHandle {
+  readonly fd: number;
+  readonly initialStat: Stats;
+  private closed = false;
+
+  constructor(fd: number, initialStat: Stats) {
+    this.fd = fd;
+    this.initialStat = initialStat;
+  }
+
+  async stat(): Promise<DirectoryStat> {
+    if (this.closed) throw Object.assign(new Error("closed directory pin"), { code: "EBADF" });
+    return fstatSync(this.fd);
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    closeSync(this.fd);
+  }
 }
 
 export type RunRootErrorCode =
@@ -401,8 +443,8 @@ function registerOwnedRoot(
   path: string,
   runId: RunId,
   ownershipToken: string,
-  rootHandle: FileHandle,
-  rootStat: Awaited<ReturnType<FileHandle["stat"]>>,
+  rootHandle: OwnedDirectoryHandle,
+  rootStat: DirectoryStat,
   markerStat: Awaited<ReturnType<FileHandle["stat"]>>,
   markerSha256: string,
 ): OwnedRunRoot {
@@ -539,8 +581,8 @@ async function verifyOpenedRootPath(
 
 async function verifyPinnedRootPath(
   path: string,
-  retainedHandle: FileHandle,
-  expectedRoot: Awaited<ReturnType<FileHandle["stat"]>>,
+  retainedHandle: OwnedDirectoryHandle,
+  expectedRoot: DirectoryStat,
 ): Promise<void> {
   const pathBefore = await safeLstat(path);
   if (pathBefore.isSymbolicLink() || !pathBefore.isDirectory() || !sameInode(pathBefore, expectedRoot)) {
@@ -602,8 +644,8 @@ interface PinnedAncestor {
 
 interface PublishedLeaf {
   path: string;
-  handle: FileHandle;
-  rootStat: Awaited<ReturnType<FileHandle["stat"]>>;
+  handle: OwnedDirectoryHandle;
+  rootStat: DirectoryStat;
   markerStat: Awaited<ReturnType<FileHandle["stat"]>>;
   markerSha256: string;
 }
@@ -674,6 +716,7 @@ async function prepareAndPublishLeaf(
 ): Promise<PublishedLeaf> {
   const parent = dirname(base);
   let publishedPath: string | undefined;
+  let leafPin: SynchronouslyPinnedDirectory | undefined;
   for (let suffix = 1; suffix <= 10_000; suffix += 1) {
     const candidate = suffix === 1 ? base : `${base}-${suffix}`;
     if (!useSuffix && suffix > 1) fail("run-root.conflict");
@@ -686,6 +729,10 @@ async function prepareAndPublishLeaf(
     await recheckPinnedAncestors(ancestorPins);
     try {
       await mkdir(candidate, { mode: 0o700 });
+      // This synchronous open+fstat is deliberately the first operation after
+      // mkdir resolves. No callback, pathname check, or additional await may
+      // be inserted before the new final leaf is pinned.
+      leafPin = pinDirectoryImmediately(candidate);
       publishedPath = candidate;
       break;
     } catch (error) {
@@ -696,18 +743,19 @@ async function prepareAndPublishLeaf(
       }
     }
   }
-  if (!publishedPath) fail("run-root.conflict");
+  if (!publishedPath || !leafPin) fail("run-root.conflict");
 
   // mkdir(O_EXCL semantics) is the publication primitive. No rename or unlink
-  // ever targets this authoritative final pathname.
-  const first = await safeLstat(publishedPath);
-  if (!first.isDirectory() || first.isSymbolicLink()) fail("run-root.replaced");
+  // ever targets this authoritative final pathname. leafPin remains open until
+  // ownership is returned or the entire operation fails.
+  const first = leafPin.initialStat;
   let leafHandle: FileHandle | undefined;
   try {
-    await options.onCheck?.("after-final-leaf-mkdir-before-pin");
+    await options.onCheck?.("after-final-leaf-sync-pin-before-path-check");
     await assertExpectedDirectory(publishedPath, first);
-    await options.onCheck?.("after-final-leaf-pin-before-open");
+    await options.onCheck?.("after-final-leaf-path-check-before-secondary-open");
     leafHandle = await openDirectoryNoFollow(publishedPath);
+    await options.onCheck?.("after-final-leaf-secondary-open-before-fstat");
     const opened = await leafHandle.stat();
     if (!sameInode(first, opened)) fail("run-root.replaced");
     await options.onCheck?.("after-final-leaf-open-before-marker");
@@ -727,11 +775,26 @@ async function prepareAndPublishLeaf(
     const markerSha256 = sha256Hex(markerBytes);
 
     await options.onCheck?.("before-marker-create");
+    // Linux can resolve a child through the retained directory descriptor. On
+    // Darwin/Node 24, /dev/fd directory traversal is unavailable, so the
+    // fallback is an exclusive no-follow pathname open bracketed by root and
+    // marker inode checks. This retains a residual same-user pathname TOCTOU;
+    // every observable mismatch fails closed and no replacement is adopted.
     await assertExpectedDirectory(publishedPath, first);
     await recheckPinnedAncestors(ancestorPins);
-    const markerHandle = await openExclusiveFile(join(publishedPath, RUN_ROOT_OWNER_FILE));
+    const canonicalMarkerPath = join(publishedPath, RUN_ROOT_OWNER_FILE);
+    const markerHandle = await openExclusiveFile(markerCreationPath(publishedPath, leafPin.fd));
     let markerStat: Awaited<ReturnType<FileHandle["stat"]>>;
     try {
+      await options.onCheck?.("after-marker-pathname-open-before-root-recheck");
+      await assertExpectedDirectory(publishedPath, first);
+      const openedMarker = await markerHandle.stat();
+      const openedMarkerPath = await safeLstat(canonicalMarkerPath);
+      if (
+        !openedMarker.isFile() || openedMarker.nlink !== 1 ||
+        openedMarkerPath.isSymbolicLink() || !openedMarkerPath.isFile() || openedMarkerPath.nlink !== 1 ||
+        !sameInode(openedMarker, openedMarkerPath)
+      ) fail("run-root.replaced");
       await options.onCheck?.("after-marker-create-before-write");
       await assertExpectedDirectory(publishedPath, first);
       await recheckPinnedAncestors(ancestorPins);
@@ -743,13 +806,20 @@ async function prepareAndPublishLeaf(
       if (!markerStat.isFile() || markerStat.nlink !== 1) fail("run-root.unsafe-link");
       await durability(options, markerHandle, "marker-synced");
       await assertExpectedDirectory(publishedPath, first);
+      const markerPathAfterSync = await safeLstat(canonicalMarkerPath);
+      const markerAfterSync = await markerHandle.stat();
+      if (
+        markerPathAfterSync.isSymbolicLink() || markerPathAfterSync.nlink !== 1 ||
+        !sameStableFileObservation(markerPathAfterSync, markerStat) ||
+        !sameStableFileObservation(markerAfterSync, markerStat)
+      ) fail("run-root.replaced");
       await recheckPinnedAncestors(ancestorPins);
     } finally {
       await markerHandle.close().catch(() => undefined);
     }
     await options.onCheck?.("after-marker-fsync-before-finalization");
     await assertExpectedDirectory(publishedPath, first);
-    if (!sameInode(await leafHandle.stat(), first)) fail("run-root.replaced");
+    if (!sameInode(await leafPin.stat(), first)) fail("run-root.replaced");
     await durability(options, leafHandle, "leaf-marker-directory-synced");
     await recheckPinnedAncestors(ancestorPins);
 
@@ -760,7 +830,7 @@ async function prepareAndPublishLeaf(
     await options.onCheck?.("after-final-marker-read-before-return");
     await options.onCheck?.("after-final-open-before-return");
     await assertExpectedDirectory(publishedPath, first);
-    if (!sameInode(await leafHandle.stat(), first)) fail("run-root.replaced");
+    if (!sameInode(await leafPin.stat(), first)) fail("run-root.replaced");
     await recheckPinnedAncestors(ancestorPins);
     const parentHandle = await openDirectoryNoFollow(parent);
     try {
@@ -779,9 +849,12 @@ async function prepareAndPublishLeaf(
       markerStat!,
       markerSha256,
     );
-    return { path: publishedPath, handle: verified.handle, rootStat: verified.rootStat, markerStat: verified.markerStat, markerSha256 };
+    const retainedPin = leafPin;
+    leafPin = undefined;
+    return { path: publishedPath, handle: retainedPin, rootStat: verified.rootStat, markerStat: verified.markerStat, markerSha256 };
   } catch (error) {
     await leafHandle?.close().catch(() => undefined);
+    await leafPin?.close().catch(() => undefined);
     throw wrap(error);
   }
 }
@@ -793,8 +866,7 @@ async function verifyPublishedOwnership(
   expectedMarker: Awaited<ReturnType<FileHandle["stat"]>>,
   expectedMarkerSha256: string,
 ): Promise<{
-  handle: FileHandle;
-  rootStat: Awaited<ReturnType<FileHandle["stat"]>>;
+  rootStat: DirectoryStat;
   markerStat: Awaited<ReturnType<FileHandle["stat"]>>;
 }> {
   const pathBefore = await safeLstat(path);
@@ -823,10 +895,11 @@ async function verifyPublishedOwnership(
       !sameInode(pathAfter, expectedRoot) || !sameInode(finalStat, expectedRoot) ||
       !sameInode(pathAfter, finalStat)
     ) fail("run-root.replaced");
-    return { handle, rootStat: finalStat, markerStat: marker.stat };
+    return { rootStat: finalStat, markerStat: marker.stat };
   } catch (error) {
-    await handle.close().catch(() => undefined);
     throw wrap(error);
+  } finally {
+    await handle.close().catch(() => undefined);
   }
 }
 
@@ -1152,6 +1225,24 @@ function sanitizeTopicSlug(topic: string): string {
   return slug || "research";
 }
 
+function pinDirectoryImmediately(path: string): SynchronouslyPinnedDirectory {
+  let fd: number | undefined;
+  try {
+    if (directoryFlag === 0 || noFollow === 0) fail("run-root.io-failed");
+    fd = openSync(path, constants.O_RDONLY | directoryFlag | noFollow);
+    const first = fstatSync(fd);
+    if (!first.isDirectory()) fail("run-root.replaced");
+    const pin = new SynchronouslyPinnedDirectory(fd, first);
+    fd = undefined;
+    return pin;
+  } catch (error) {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* retain the original failure */ }
+    }
+    throw wrap(error);
+  }
+}
+
 async function openDirectoryNoFollow(path: string): Promise<FileHandle> {
   try {
     const handle = await open(path, constants.O_RDONLY | directoryFlag | noFollow);
@@ -1162,6 +1253,12 @@ async function openDirectoryNoFollow(path: string): Promise<FileHandle> {
     if (isNodeError(error, "ELOOP")) fail("run-root.symlink");
     throw wrap(error);
   }
+}
+
+function markerCreationPath(root: string, pinnedFd: number): string {
+  return process.platform === "linux"
+    ? `/proc/self/fd/${pinnedFd}/${RUN_ROOT_OWNER_FILE}`
+    : join(root, RUN_ROOT_OWNER_FILE);
 }
 
 async function openExclusiveFile(path: string): Promise<FileHandle> {
