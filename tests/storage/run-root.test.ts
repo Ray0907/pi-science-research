@@ -478,6 +478,37 @@ test("cross-process create", async () => {
     await expect(lstat(join(low, "run"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  test.each(["leaf-swap-and-restore", "unrelated-parent-metadata"] as const)(
+    "does not absorb $kind after the one-time approval advance",
+    async (kind) => {
+      const { base, project } = await fixture();
+      const approved = join(base, `approved-once-${kind}`);
+      await mkdir(approved);
+      const target = join(approved, "run");
+      let mutated = false;
+
+      await expect(createOwnedRunRoot(options(project, {
+        requestedPath: target,
+        allowAbsoluteRequestedPath: true,
+        approvedOutsideRoots: [approved],
+        onCheck: async (phase: string) => {
+          if (phase !== "after-final-leaf-sync-pin-before-path-check" || mutated) return;
+          mutated = true;
+          if (kind === "leaf-swap-and-restore") {
+            const moved = join(base, "approved-leaf-moved");
+            await rename(target, moved);
+            await rename(moved, target);
+          } else {
+            const unrelated = join(approved, "unrelated");
+            await mkdir(unrelated);
+            await rm(unrelated, { recursive: true });
+          }
+        },
+      }))).rejects.toEqual(expectCode("run-root.replaced"));
+      expect(mutated).toBe(true);
+    },
+  );
+
   test("rechecks the approved outside chain immediately before exclusive creation", async () => {
     const { base, project } = await fixture();
     const outside = join(base, "outside-late-swap");

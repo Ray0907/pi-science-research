@@ -275,7 +275,7 @@ async function createOwnedRunRootLocked(
   };
   const published = await prepareAndPublishLeaf(target, collision, markerSeed, ancestorPins, approvalProof, options);
   try {
-    await recheckApprovalProof(approvalProof);
+    await recheckApprovalProof(published.approvalProof);
     return registerOwnedRoot(
       published.path,
       options.runId,
@@ -694,10 +694,20 @@ interface ApprovedPathNode {
   birthtimeNs: string | null;
 }
 
-interface LocationApprovalProof {
+interface ApprovalProofBase {
   target: string;
-  nodes: ApprovedPathNode[];
+  nodes: readonly ApprovedPathNode[];
 }
+
+interface GrantedApprovalProof extends ApprovalProofBase {
+  state: "granted";
+}
+
+interface AdvancedApprovalProof extends ApprovalProofBase {
+  state: "advanced-after-mkdir";
+}
+
+type LocationApprovalProof = GrantedApprovalProof | AdvancedApprovalProof;
 
 interface PublishedLeaf {
   path: string;
@@ -705,6 +715,7 @@ interface PublishedLeaf {
   rootStat: DirectoryStat;
   markerStat: Awaited<ReturnType<FileHandle["stat"]>>;
   markerSha256: string;
+  approvalProof: AdvancedApprovalProof;
 }
 
 async function ensurePreparedResearchDirectory(
@@ -769,7 +780,7 @@ async function prepareAndPublishLeaf(
   useSuffix: boolean,
   markerSeed: OwnerMarkerSeed,
   ancestorPins: readonly PinnedAncestor[],
-  approvalProof: LocationApprovalProof,
+  approvalProof: GrantedApprovalProof,
   options: CreateOwnedRunRootOptions,
 ): Promise<PublishedLeaf> {
   const parent = dirname(base);
@@ -810,9 +821,10 @@ async function prepareAndPublishLeaf(
   const first = leafPin.initialStat;
   let leafHandle: FileHandle | undefined;
   try {
-    // The synchronous leaf pin must precede this first post-creation await.
-    approvalProof = await advanceApprovalProofAfterCreation(approvalProof, dirname(publishedPath));
+    // The synchronous leaf pin must precede this one permitted proof advance.
+    const advancedApprovalProof = await advanceApprovalProofAfterCreation(approvalProof, dirname(publishedPath));
     await options.onCheck?.("after-final-leaf-sync-pin-before-path-check");
+    await recheckApprovalProof(advancedApprovalProof);
     await assertExpectedDirectory(publishedPath, first);
     await options.onCheck?.("after-final-leaf-path-check-before-secondary-open");
     leafHandle = await openDirectoryNoFollow(publishedPath);
@@ -900,9 +912,9 @@ async function prepareAndPublishLeaf(
     } finally {
       await parentHandle.close().catch(() => undefined);
     }
-    approvalProof = await advanceApprovalProofAfterCreation(approvalProof, parent);
+    await recheckApprovalProof(advancedApprovalProof);
     await options.onCheck?.("after-leaf-parent-synced-before-return");
-    await recheckApprovalProof(approvalProof);
+    await recheckApprovalProof(advancedApprovalProof);
     await recheckPinnedAncestors(ancestorPins);
     await leafHandle.close();
     leafHandle = undefined;
@@ -915,7 +927,14 @@ async function prepareAndPublishLeaf(
     );
     const retainedPin = leafPin;
     leafPin = undefined;
-    return { path: publishedPath, handle: retainedPin, rootStat: verified.rootStat, markerStat: verified.markerStat, markerSha256 };
+    return {
+      path: publishedPath,
+      handle: retainedPin,
+      rootStat: verified.rootStat,
+      markerStat: verified.markerStat,
+      markerSha256,
+      approvalProof: advancedApprovalProof,
+    };
   } catch (error) {
     await leafHandle?.close().catch(() => undefined);
     await leafPin?.close().catch(() => undefined);
@@ -1022,9 +1041,9 @@ async function authorizeLocation(
   target: string,
   trustedProject: string,
   options: CreateOwnedRunRootOptions,
-): Promise<LocationApprovalProof> {
+): Promise<GrantedApprovalProof> {
   if (isStrictDescendantOrEqual(trustedProject, target)) {
-    return { target, nodes: [] };
+    return { state: "granted", target, nodes: [] };
   }
 
   const allowlist = options.approvedOutsideRoots ?? [];
@@ -1047,7 +1066,7 @@ async function authorizeLocation(
   return proof;
 }
 
-async function observeApprovalChain(target: string, approvalAnchor: string): Promise<LocationApprovalProof> {
+async function observeApprovalChain(target: string, approvalAnchor: string): Promise<GrantedApprovalProof> {
   const canonicalTarget = await canonicalCandidate(target);
   if (canonicalTarget !== target || !isStrictDescendantOrEqual(approvalAnchor, target)) fail("run-root.replaced");
   const paths = [approvalAnchor];
@@ -1070,7 +1089,7 @@ async function observeApprovalChain(target: string, approvalAnchor: string): Pro
     nodes.push(node);
     if (node.type !== "directory") break;
   }
-  return { target, nodes };
+  return { state: "granted", target, nodes };
 }
 
 async function observeApprovedPathNode(path: string): Promise<ApprovedPathNode> {
@@ -1102,20 +1121,23 @@ async function recheckApprovalProof(proof: LocationApprovalProof): Promise<void>
 }
 
 async function advanceApprovalProofAfterCreation(
-  proof: LocationApprovalProof,
+  proof: GrantedApprovalProof,
   changedParent: string,
-): Promise<LocationApprovalProof> {
+): Promise<AdvancedApprovalProof> {
   const nodes: ApprovedPathNode[] = [];
   for (const expected of proof.nodes) {
     const observed = await observeApprovedPathNode(expected.path).catch((error: unknown) => { throw wrap(error); });
-    const expectedWithoutCtime = { ...expected, ctimeNs: observed.ctimeNs };
-    if (expected.path !== changedParent ? !sameApprovedNode(expected, observed) : !sameApprovedNode(expectedWithoutCtime, observed)) {
+    const expectedAfterOwnMkdir = {
+      ...expected,
+      ctimeNs: observed.ctimeNs,
+      birthtimeNs: observed.birthtimeNs,
+    };
+    if (expected.path !== changedParent ? !sameApprovedNode(expected, observed) : !sameApprovedNode(expectedAfterOwnMkdir, observed)) {
       fail("run-root.replaced");
     }
     nodes.push(observed);
   }
-  proof.nodes = nodes;
-  return proof;
+  return { state: "advanced-after-mkdir", target: proof.target, nodes };
 }
 
 async function assertForbiddenRoot(
