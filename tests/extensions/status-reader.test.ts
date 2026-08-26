@@ -1,6 +1,6 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 
 import { FoundationStatusReadError, readFoundationStatus } from "../../extensions/research/status-reader.js";
@@ -176,6 +176,32 @@ describe("readFoundationStatus", () => {
     expect(status?.unmaterializedResults).toBe(0);
     expect(prepared.manifestSha256).toBe(ref.sha256);
     expect(committedPrepared.manifestSha256).toBe(committedRef.sha256);
+  });
+
+  test.each(["root", "state"])("rejects %s ABA swap-and-restore across the read-only status epoch", async (target) => {
+    const value = await fixture(); await value.ledger.close();
+    const original = target === "root" ? value.root : join(value.root, ".state");
+    const replacement = `${original}.replacement`;
+    const moved = `${original}.moved`;
+    await cp(original, replacement, { recursive: true, preserveTimestamps: true });
+    const parentBefore = await stat(dirname(original), { bigint: true });
+    let swapped = false;
+    const phase = target === "root" ? "after-owned-root-inspection" : "after-transaction-snapshot";
+    const failure = readFoundationStatus(
+      { cwd: value.project, rootPath: value.root },
+      { inspectOwnedRunRootIntegrity, readVerifiedLedgerSnapshot, inspectCanonicalTransactionsReadOnly },
+      { onCheck: async (current) => {
+        if (current !== phase || swapped) return;
+        swapped = true;
+        await rename(original, moved);
+        await rename(replacement, original);
+        await rename(original, replacement);
+        await rename(moved, original);
+      } },
+    );
+    await expect(failure).rejects.toMatchObject({ code: "run-root.replaced" });
+    await expect(failure.catch((error: Error) => error.message)).resolves.not.toContain(replacement);
+    expect((await stat(dirname(original), { bigint: true })).ctimeNs).not.toBe(parentBefore.ctimeNs);
   });
 
   test("preserves a primary status error when root cleanup also fails and redacts cleanup-only failure", async () => {

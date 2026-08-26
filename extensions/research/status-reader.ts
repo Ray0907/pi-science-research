@@ -15,6 +15,10 @@ export class FoundationStatusReadError extends Error {
   constructor() { super("Research status unavailable."); this.name = "FoundationStatusReadError"; }
 }
 
+export interface FoundationStatusReaderOptions {
+  onCheck?: (phase: "after-owned-root-inspection" | "after-ledger-snapshot" | "after-transaction-snapshot" | "before-final-revalidation") => void | Promise<void>;
+}
+
 export interface FoundationStatusReaderDependencies {
   inspectOwnedRunRootIntegrity: typeof inspectOwnedRunRootIntegrity;
   readVerifiedLedgerSnapshot: typeof readVerifiedLedgerSnapshot;
@@ -30,6 +34,7 @@ const DEFAULT_DEPENDENCIES: FoundationStatusReaderDependencies = {
 export async function readFoundationStatus(
   request: FoundationStatusRequest,
   dependencies: FoundationStatusReaderDependencies = DEFAULT_DEPENDENCIES,
+  options: FoundationStatusReaderOptions = {},
 ): Promise<FoundationStatus | null> {
   if (request.rootPath === null) return null;
   const rootPath = resolve(request.cwd, request.rootPath);
@@ -37,7 +42,9 @@ export async function readFoundationStatus(
   let result: FoundationStatus | undefined;
   let failure: unknown;
   try {
+    await options.onCheck?.("after-owned-root-inspection");
     const events = await dependencies.readVerifiedLedgerSnapshot(join(inspected.path, ".state", "events.jsonl"), { trustedRoot: inspected.path });
+    await options.onCheck?.("after-ledger-snapshot");
     await inspected.revalidate();
     const reduced = reduceLedgerEvents(events);
     const runEvents = events.filter((event) => event.type === "run_created");
@@ -45,6 +52,7 @@ export async function readFoundationStatus(
       throw new Error("status integrity failure");
     }
     const transactions = await dependencies.inspectCanonicalTransactionsReadOnly(inspected.path, events);
+    await options.onCheck?.("after-transaction-snapshot");
     await inspected.revalidate();
 
     const latestTasks = new Map<string, (typeof events)[number] & { type: "task_upserted" }>();
@@ -66,6 +74,8 @@ export async function readFoundationStatus(
       ? null
       : pending.map((schedule) => schedule.notBeforeAt).sort()[0]!;
 
+    await options.onCheck?.("before-final-revalidation");
+    await inspected.revalidate();
     result = Object.freeze({
       runId: inspected.runId,
       state: reduced.runState,

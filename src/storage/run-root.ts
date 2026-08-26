@@ -4,6 +4,7 @@ import {
   constants,
   fstatSync,
   openSync,
+  type BigIntStats,
   type Stats,
 } from "node:fs";
 import {
@@ -127,6 +128,20 @@ export interface OwnedRunRoot {
  * binding but deliberately does not authenticate ownership or expose token
  * material. Callers must close it.
  */
+interface InspectionProofNode {
+  readonly path: string;
+  readonly handle: FileHandle;
+  readonly initial: BigIntStats;
+  readonly ownedByRoot: boolean;
+}
+
+interface InspectionMarkerProof {
+  readonly path: string;
+  readonly handle: FileHandle;
+  readonly initial: BigIntStats;
+  readonly sha256: string;
+}
+
 export interface InspectedOwnedRunRoot {
   readonly path: string;
   readonly runId: RunId;
@@ -319,11 +334,13 @@ export async function inspectOwnedRunRootIntegrity(
   await assertGlobalForbiddenRoot(canonical, []);
   const handle = await openDirectoryNoFollow(canonical);
   const fd = handle.fd;
+  let epochNodes: InspectionProofNode[] = [];
+  let markerProof: InspectionMarkerProof | undefined;
   let closed = false;
   let closePromise: Promise<void> | undefined;
   try {
-    const rootStat = await handle.stat();
-    const pathStat = await safeLstat(canonical);
+    const rootStat = await handle.stat({ bigint: true });
+    const pathStat = await lstat(canonical, { bigint: true }).catch((error) => { throw wrap(error); });
     if (!rootStat.isDirectory() || pathStat.isSymbolicLink() || !sameInode(rootStat, pathStat)) fail("run-root.replaced");
     const first = await readOwnerMarker(canonical, options.onCheck);
     if (!ID_PATTERNS.run.test(first.marker.runId)) fail("run-root.marker-invalid");
@@ -336,6 +353,10 @@ export async function inspectOwnedRunRootIntegrity(
       || !sameInode(first.stat, second.stat) || first.sha256 !== second.sha256
       || first.marker.runId !== second.marker.runId) fail("run-root.replaced");
     assertMarkerRootBinding(second.marker, finalHandleStat, "run-root.replaced");
+    const epoch = await pinInspectionEpoch(canonical, handle, rootStat, second.sha256);
+    epochNodes = epoch.nodes;
+    markerProof = epoch.marker;
+    await revalidateInspectionEpoch(epochNodes, markerProof);
     return Object.freeze({
       path: canonical,
       runId: second.marker.runId as RunId,
@@ -343,6 +364,7 @@ export async function inspectOwnedRunRootIntegrity(
       ino: Number(finalHandleStat.ino),
       async revalidate() {
         if (closed) fail("run-root.closed");
+        await revalidateInspectionEpoch(epochNodes, markerProof!);
         const [currentHandleStat, currentPathStat] = await Promise.all([handle.stat(), safeLstat(canonical)]);
         const marker = await readOwnerMarker(canonical);
         if (!sameInode(rootStat, currentHandleStat) || !sameInode(rootStat, currentPathStat)
@@ -353,15 +375,107 @@ export async function inspectOwnedRunRootIntegrity(
       async close() {
         if (closed) return;
         if (closePromise) return closePromise;
-        const attempt = closeFileHandleConfirmed(handle, fd).then(() => { closed = true; });
+        const attempt = (async () => {
+          let failure: unknown;
+          if (markerProof) try { await markerProof.handle.close(); } catch (error) { failure = error; }
+          for (const node of [...epochNodes].reverse()) {
+            if (node.ownedByRoot) continue;
+            try { await node.handle.close(); } catch (error) { failure ??= error; }
+          }
+          try { await closeFileHandleConfirmed(handle, fd); } catch (error) { failure ??= error; }
+          if (failure) throw failure;
+          closed = true;
+        })();
         closePromise = attempt;
         try { await attempt; } finally { if (closePromise === attempt) closePromise = undefined; }
       },
     });
   } catch (error) {
+    await markerProof?.handle.close().catch(() => undefined);
+    for (const node of [...epochNodes].reverse()) if (!node.ownedByRoot) await node.handle.close().catch(() => undefined);
     await closeFileHandleConfirmed(handle, fd).catch(() => undefined);
     throw wrap(error);
   }
+}
+
+async function pinInspectionEpoch(
+  canonical: string,
+  rootHandle: FileHandle,
+  rootInitial: BigIntStats,
+  markerSha256: string,
+): Promise<{ nodes: InspectionProofNode[]; marker: InspectionMarkerProof }> {
+  const nodes: InspectionProofNode[] = [];
+  const opened: FileHandle[] = [];
+  let markerHandle: FileHandle | undefined;
+  try {
+    // The owned-root namespace parent is the stable boundary for this explicit
+    // run. Pinning shared filesystem ancestors would reject unrelated sibling
+    // activity outside the run namespace.
+    for (const path of [dirname(canonical)]) {
+      const proofHandle = await openDirectoryNoFollow(path);
+      opened.push(proofHandle);
+      const initial = await proofHandle.stat({ bigint: true });
+      const pathname = await lstat(path, { bigint: true });
+      assertExactInspectionNode(initial, pathname, true);
+      nodes.push({ path, handle: proofHandle, initial, ownedByRoot: false });
+    }
+    const rootPathStat = await lstat(canonical, { bigint: true });
+    assertExactInspectionNode(rootInitial, rootPathStat, true);
+    nodes.push({ path: canonical, handle: rootHandle, initial: rootInitial, ownedByRoot: true });
+    for (const relativePath of [".state", ".state/transactions", ".state/transactions/committed"]) {
+      const path = join(canonical, relativePath);
+      const pathname = await lstat(path, { bigint: true }).catch((error) => {
+        if (isNodeError(error, "ENOENT")) return undefined;
+        throw error;
+      });
+      if (!pathname) continue;
+      const proofHandle = await openDirectoryNoFollow(path);
+      opened.push(proofHandle);
+      const initial = await proofHandle.stat({ bigint: true });
+      assertExactInspectionNode(initial, pathname, true);
+      nodes.push({ path, handle: proofHandle, initial, ownedByRoot: false });
+    }
+    const markerPath = join(canonical, RUN_ROOT_OWNER_FILE);
+    markerHandle = await open(markerPath, constants.O_RDONLY | noFollow);
+    const markerInitial = await markerHandle.stat({ bigint: true });
+    const markerPathStat = await lstat(markerPath, { bigint: true });
+    assertExactInspectionNode(markerInitial, markerPathStat, false);
+    return { nodes, marker: { path: markerPath, handle: markerHandle, initial: markerInitial, sha256: markerSha256 } };
+  } catch (error) {
+    await markerHandle?.close().catch(() => undefined);
+    for (const item of opened.reverse()) await item.close().catch(() => undefined);
+    throw wrap(error);
+  }
+}
+
+async function revalidateInspectionEpoch(nodes: readonly InspectionProofNode[], marker: InspectionMarkerProof): Promise<void> {
+  try {
+    for (const node of nodes) {
+      const [descriptor, pathname] = await Promise.all([node.handle.stat({ bigint: true }), lstat(node.path, { bigint: true })]);
+      assertExactInspectionNode(descriptor, pathname, true);
+      if (!sameExactInspectionStat(node.initial, descriptor)) fail("run-root.replaced");
+    }
+    const [markerDescriptor, markerPathStat] = await Promise.all([
+      marker.handle.stat({ bigint: true }),
+      lstat(marker.path, { bigint: true }),
+    ]);
+    assertExactInspectionNode(markerDescriptor, markerPathStat, false);
+    if (!sameExactInspectionStat(marker.initial, markerDescriptor)) fail("run-root.replaced");
+    const markerRead = await readOwnerMarker(dirname(marker.path));
+    if (markerRead.sha256 !== marker.sha256) fail("run-root.replaced");
+  } catch (error) {
+    throw wrap(error);
+  }
+}
+
+function assertExactInspectionNode(descriptor: BigIntStats, pathname: BigIntStats, directory: boolean): void {
+  const expectedType = directory ? descriptor.isDirectory() && pathname.isDirectory() : descriptor.isFile() && pathname.isFile();
+  if (!expectedType || pathname.isSymbolicLink() || !sameExactInspectionStat(descriptor, pathname)) fail("run-root.replaced");
+}
+
+function sameExactInspectionStat(left: BigIntStats, right: BigIntStats): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode && left.nlink === right.nlink
+    && left.ctimeNs === right.ctimeNs && left.mtimeNs === right.mtimeNs && left.birthtimeNs === right.birthtimeNs;
 }
 
 export async function openOwnedRunRoot(
