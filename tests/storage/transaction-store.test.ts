@@ -23,7 +23,9 @@ const AT = "2026-08-25T12:00:00.000Z";
 const RUN = "run-0000000000000001";
 const TASK = "task-0000000000000001";
 const ATTEMPT = "attempt-0000000000000001";
+const ATTEMPT_2 = "attempt-0000000000000002";
 const TX = "tx-0000000000000001";
+const RETRY = "retry-0000000000000001";
 const HASH = "a".repeat(64);
 const roots: string[] = [];
 
@@ -150,6 +152,29 @@ describe("canonical transaction store", () => {
     await expect(verifyTransaction(runRoot, ref)).resolves.toMatchObject({ manifest: prepared.manifest });
   });
 
+  test("fsyncs committed then staging parent after rename and roll-forwards either failure on retry", async () => {
+    for (const failAt of ["committed-parent-synced", "staging-parent-synced"] as const) {
+      const runRoot = await root();
+      const prepared = await prepareTransaction(runRoot, input());
+      const firstSteps: TransactionProtocolStep[] = [];
+      await expectCode(commitTransaction(runRoot, TX, {
+        durability: async (handle, step) => {
+          firstSteps.push(step);
+          await handle.sync();
+          if (step === failAt) throw new Error("parent-fsync-secret");
+        },
+      }), "transaction.io-failed");
+      expect(firstSteps).toEqual(failAt === "committed-parent-synced"
+        ? ["committed-parent-synced"]
+        : ["committed-parent-synced", "staging-parent-synced"]);
+      const retrySteps: TransactionProtocolStep[] = [];
+      await expect(commitTransaction(runRoot, TX, {
+        durability: async (handle, step) => { retrySteps.push(step); await handle.sync(); },
+      })).resolves.toMatchObject({ sha256: prepared.manifestSha256 });
+      expect(retrySteps.slice(-2)).toEqual(["committed-parent-synced", "staging-parent-synced"]);
+    }
+  });
+
   test("makes duplicate matching commit harmless and different content corruption", async () => {
     const runRoot = await root();
     const first = await committed(runRoot);
@@ -266,6 +291,76 @@ describe("canonical transaction store", () => {
     await expect(handles[0]!.stat()).rejects.toBeDefined();
   });
 
+  test("bounds descriptor reads at maxFileBytes plus one", async () => {
+    const runRoot = await root();
+    const ref = await committed(runRoot);
+    const requested: number[] = [];
+    await expectCode(verifyTransaction(runRoot, ref, {
+      maxFileBytes: 2048,
+      readChunk: async (_handle, buffer) => {
+        requested.push(buffer.byteLength);
+        buffer.fill(0x61);
+        return buffer.byteLength;
+      },
+    }), "transaction.file-too-large");
+    expect(requested).toEqual([2049]);
+  });
+
+  test("rejects closed-manifest ref extras and secret accessors before property access", async () => {
+    const refShapes = [
+      ["sourceRefs", "sourceId"], ["claimRefs", "claimId"],
+      ["evidenceRefs", "evidenceId"], ["verificationRefs", "verificationId"],
+    ] as const;
+    for (const [field, idField] of refShapes) {
+      for (const mutation of ["extra", "revision", "id"] as const) {
+        const runRoot = await root();
+        const ref = await committed(runRoot);
+        const manifestPath = join(runRoot, ref.relativePath);
+        const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+        if (mutation === "extra") manifest[field][0].unexpected = true;
+        else if (mutation === "revision") manifest[field][0].revision = 0;
+        else manifest[field][0][idField] = "wrong-id";
+        const bytes = `${canonicalJson(manifest)}\n`;
+        await writeFile(manifestPath, bytes);
+        await expectCode(verifyTransaction(runRoot, { ...ref, sha256: sha256Hex(bytes) }), "transaction.corrupt");
+      }
+    }
+    for (const [field, wrong] of [["requestIds", "request-wrong"], ["calculationIds", "calc-wrong"]] as const) {
+      const runRoot = await root();
+      const ref = await committed(runRoot);
+      const manifestPath = join(runRoot, ref.relativePath);
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+      manifest[field][0] = wrong;
+      const bytes = `${canonicalJson(manifest)}\n`;
+      await writeFile(manifestPath, bytes);
+      await expectCode(verifyTransaction(runRoot, { ...ref, sha256: sha256Hex(bytes) }), "transaction.corrupt");
+    }
+
+    const refRoot = await root();
+    const validRef = await committed(refRoot);
+    await expectCode(verifyTransaction(refRoot, { ...validRef, unexpected: true } as never), "transaction.invalid-input");
+    const accessorRef = { transactionId: validRef.transactionId, relativePath: validRef.relativePath } as Record<string, unknown>;
+    Object.defineProperty(accessorRef, "sha256", { enumerable: true, get: () => { throw new Error("secret-ref-accessor"); } });
+    const refFailure = verifyTransaction(refRoot, accessorRef as never);
+    await expectCode(refFailure, "transaction.invalid-input");
+    await expect(refFailure.catch((error: Error) => error.message)).resolves.not.toContain("secret-ref-accessor");
+
+    const recordKinds = [
+      ["sources", "sourceId"], ["claims", "claimId"], ["evidence", "evidenceId"],
+      ["verifications", "verificationId"], ["requests", "requestId"], ["calculations", "calculationId"],
+    ] as const;
+    for (const [kind, idField] of recordKinds) {
+      const runRoot = await root();
+      const original = input()[kind][0] as Record<string, unknown>;
+      const bad = { ...original };
+      delete bad[idField];
+      Object.defineProperty(bad, idField, { enumerable: true, get: () => { throw new Error(`secret-${kind}`); } });
+      const failure = prepareTransaction(runRoot, input({ [kind]: [bad] }));
+      await expectCode(failure, "transaction.invalid-input");
+      await expect(failure.catch((error: Error) => error.message)).resolves.not.toContain(`secret-${kind}`);
+    }
+  });
+
   test("rejects symlink and hardlink substitution, tampered bytes, hashes, counts, and refs", async () => {
     const cases: ((runRoot: string, ref: Awaited<ReturnType<typeof committed>>) => Promise<void>)[] = [
       async (runRoot, ref) => { await writeFile(join(runRoot, ref.relativePath, "..", "sources.jsonl"), "{}\n"); },
@@ -312,6 +407,34 @@ describe("canonical transaction store", () => {
     expect((await listCommittedTransactions(runRoot)).map((item) => item.manifest.transactionId)).toEqual([TX, second.transactionId]);
     await writeFile(join(runRoot, ".state/transactions/committed", "unexpected"), "x");
     await expectCode(listCommittedTransactions(runRoot), "transaction.suspicious-entry");
+  });
+
+  test("does not promote cancelled, superseded, or late-epoch diagnostic results", async () => {
+    const cancelledRoot = await root();
+    const cancelled = cancelledResultEvents(false);
+    await committed(cancelledRoot, input({ sourceResultSeq: cancelled.at(-1)!.seq }));
+    expect(await reconcileCanonicalTransactions(cancelledRoot, cancelled)).toEqual([]);
+    expect(await reconstructCanonicalRecords(cancelledRoot, cancelled)).toMatchObject({
+      sources: [], claims: [], evidence: [], verifications: [], requests: [], calculations: [],
+    });
+
+    const lateRoot = await root();
+    const late = cancelledResultEvents(true);
+    await committed(lateRoot, input({ sourceResultSeq: late.at(-1)!.seq }));
+    expect(await reconcileCanonicalTransactions(lateRoot, late)).toEqual([]);
+
+    const supersededRoot = await root();
+    const superseded = supersededResultEvents();
+    await committed(supersededRoot, input({ sourceResultSeq: superseded.at(-1)!.seq }));
+    expect(await reconcileCanonicalTransactions(supersededRoot, superseded)).toEqual([]);
+  });
+
+  test("rejects cross-run transaction objects during reconcile and reconstruction", async () => {
+    const runRoot = await root();
+    await committed(runRoot, input({ runId: "run-0000000000000002" }));
+    const events = baseEvents();
+    await expectCode(reconcileCanonicalTransactions(runRoot, events), "transaction.corrupt");
+    await expectCode(reconstructCanonicalRecords(runRoot, events), "transaction.corrupt");
   });
 
   test("reconciles committed object without records event and reconstructs only from ledger plus objects", async () => {
@@ -375,14 +498,38 @@ function runSnapshot(): RunSnapshot {
 function task(): TaskRecord {
   return { schemaVersion: 1, taskId: TASK, revision: 1, description: "task", evidenceRule: { minimumLineages: 1, independentVerificationAllowed: true, primarySourceRequired: false, fullTextRequired: false }, role: "literature-searcher", state: "running", attemptIds: [], blocker: null, resolution: null };
 }
-function attempt(): AttemptRecord {
-  return { schemaVersion: 1, attemptId: ATTEMPT, revision: 1, runId: RUN, taskId: TASK, executionEpoch: 0, logicalOperationId: "op", attemptOrdinal: 1, retryOfAttemptId: null, attemptKind: "research", replayPolicy: "safe-read", state: "intent-recorded", providerModel: "p/m", thinkingLevel: "medium", promptTemplateSha256: HASH, renderedPromptSha256: "b".repeat(64), logicalInputSha256: "c".repeat(64), attemptEnvelopeSha256: "d".repeat(64), toolAllowlist: [], deadlineAt: AT, capabilityId: "cap", resultSha256: null, billingStatus: "unknown", reportedUsage: null, error: null, createdAt: AT, updatedAt: AT };
+function attempt(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
+  return { schemaVersion: 1, attemptId: ATTEMPT, revision: 1, runId: RUN, taskId: TASK, executionEpoch: 0, logicalOperationId: "op", attemptOrdinal: 1, retryOfAttemptId: null, attemptKind: "research", replayPolicy: "safe-read", state: "intent-recorded", providerModel: "p/m", thinkingLevel: "medium", promptTemplateSha256: HASH, renderedPromptSha256: "b".repeat(64), logicalInputSha256: "c".repeat(64), attemptEnvelopeSha256: "d".repeat(64), toolAllowlist: [], deadlineAt: AT, capabilityId: "cap", resultSha256: null, billingStatus: "unknown", reportedUsage: null, error: null, createdAt: AT, updatedAt: AT, ...overrides };
 }
 function event<T extends FoundationEventType>(type: T, payload: FoundationEventPayload<T>): FoundationLedgerEvent {
   const seq = eventSeq++;
   return { schemaVersion: 1, seq, occurredAt: AT, eventId: `event-${seq}`, type, payload, prevSha256: "0".repeat(64), entrySha256: HASH } as FoundationLedgerEvent;
 }
 let eventSeq = 1;
+
+function cancelledResultEvents(resumed: boolean): FoundationLedgerEvent[] {
+  const events = baseEvents().slice(0, -1);
+  eventSeq = 7;
+  events.push(event("cancel_requested", { executionEpoch: 0, reason: "user-pause" }));
+  if (resumed) events.push(event("resume_epoch_started", { priorEpoch: 0, executionEpoch: 1, priorCancelSeq: 7, checkpointStage: null, ownerTokenSha256: HASH }));
+  events.push(event("result_recorded", { attemptId: ATTEMPT, resultSha256: HASH, manifestSha256: null, transactionId: TX }));
+  return events;
+}
+
+function supersededResultEvents(): FoundationLedgerEvent[] {
+  const events = baseEvents().slice(0, -1);
+  eventSeq = 7;
+  events.push(event("attempt_failed", { attemptId: ATTEMPT, state: "retryable-failed", errorClass: "transient", message: "retry" }));
+  events.push(event("identity_reserved", { kind: "retry-schedule", id: RETRY, origin: "parent-generated" }));
+  events.push(event("retry_scheduled", { scheduleId: RETRY, logicalOperationId: "op", failedAttemptId: ATTEMPT, nextAttemptOrdinal: 2, notBeforeAt: AT, delayMs: 0, reasonClass: "transient" }));
+  events.push(event("identity_reserved", { kind: "attempt", id: ATTEMPT_2, origin: "parent-generated" }));
+  events.push(event("retry_started", { scheduleId: RETRY, logicalOperationId: "op", attemptId: ATTEMPT_2, attemptOrdinal: 2, scheduledFromSeq: 9 }));
+  events.push(event("dispatch_intent", { attempt: attempt({ attemptId: ATTEMPT_2, attemptOrdinal: 2, retryOfAttemptId: ATTEMPT, attemptEnvelopeSha256: "e".repeat(64) }) }));
+  events.push(event("attempt_failed", { attemptId: ATTEMPT, state: "superseded", errorClass: "superseded", message: "replacement" }));
+  events.push(event("result_recorded", { attemptId: ATTEMPT, resultSha256: HASH, manifestSha256: null, transactionId: TX }));
+  return events;
+}
+
 function baseEvents(): FoundationLedgerEvent[] {
   eventSeq = 1;
   return [

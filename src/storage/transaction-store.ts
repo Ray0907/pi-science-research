@@ -16,9 +16,10 @@ import { RequestRecordSchema, type FoundationLedgerEvent } from "../domain/event
 import { ID_PATTERNS, isTimestamp, type TransactionId } from "../domain/ids.js";
 import {
   CanonicalTransactionManifestSchema,
+  type AttemptRecord,
   type CanonicalTransactionManifest,
 } from "../domain/records.js";
-import { reduceLedgerEvents } from "../domain/reducer.js";
+import { recoveryDecisionFor, reduceLedgerEvents } from "../domain/reducer.js";
 import { parse } from "../domain/schema.js";
 
 const KINDS = ["sources", "claims", "evidence", "verifications", "requests", "calculations"] as const;
@@ -39,6 +40,7 @@ const MANIFEST_FILE = "manifest.json";
 const DEFAULT_MAX_FILE_BYTES = 16 * 1024 * 1024;
 const DEFAULT_MAX_LINE_BYTES = 4 * 1024 * 1024;
 const DEFAULT_MAX_RECORDS = 100_000;
+const READ_CHUNK_BYTES = 64 * 1024;
 const fatalUtf8 = new TextDecoder("utf-8", { fatal: true });
 const rootQueues = new Map<string, Promise<void>>();
 
@@ -71,6 +73,7 @@ export interface TransactionStoreOptions {
   maxFileBytes?: number;
   maxLineBytes?: number;
   maxRecords?: number;
+  readChunk?: (handle: FileHandle, buffer: Buffer, position: number) => Promise<number>;
   durability?: (handle: FileHandle, step: TransactionProtocolStep) => Promise<void>;
   rename?: (from: string, to: string) => Promise<void>;
   close?: (handle: FileHandle) => Promise<void>;
@@ -186,6 +189,7 @@ export async function commitTransaction(
         const staged = await verifyDirectory(root, ".staging", transactionId, limits).catch(() => fail("transaction.id-conflict"));
         if (staged.manifestSha256 !== existing.manifestSha256) fail("transaction.id-conflict");
       }
+      await syncRenameParents(root, options);
       return manifestRef(existing.manifest, existing.manifestSha256);
     }
 
@@ -201,8 +205,7 @@ export async function commitTransaction(
       fail("transaction.io-failed");
     }
     await protocolStep("renamed", options);
-    await syncDirectory(join(root, ".state/transactions/.staging"), "staging-parent-synced", options);
-    await syncDirectory(join(root, ".state/transactions/committed"), "committed-parent-synced", options);
+    await syncRenameParents(root, options);
     const verified = await verifyDirectory(root, "committed", transactionId, limits);
     if (verified.manifestSha256 !== staged.manifestSha256) fail("transaction.corrupt");
     return manifestRef(verified.manifest, verified.manifestSha256);
@@ -214,12 +217,13 @@ export async function verifyTransaction(
   reference: TransactionManifestRef,
   options: TransactionStoreOptions = {},
 ): Promise<VerifiedTransaction> {
+  const snapshot = snapshotManifestRef(reference);
   const root = await initializeRoot(runRoot);
-  assertManifestRef(reference);
+  assertManifestRef(snapshot);
   return withRootLock(root, async () => {
-    const verified = await verifyDirectory(root, "committed", reference.transactionId, limitsFrom(options));
-    if (reference.relativePath !== manifestRef(verified.manifest, verified.manifestSha256).relativePath
-      || reference.sha256 !== verified.manifestSha256) fail("transaction.corrupt");
+    const verified = await verifyDirectory(root, "committed", snapshot.transactionId, limitsFrom(options));
+    if (snapshot.relativePath !== manifestRef(verified.manifest, verified.manifestSha256).relativePath
+      || snapshot.sha256 !== verified.manifestSha256) fail("transaction.corrupt");
     return verified;
   });
 }
@@ -247,7 +251,8 @@ export async function reconcileCanonicalTransactions(
   events: readonly FoundationLedgerEvent[],
   options: TransactionStoreOptions = {},
 ): Promise<TransactionReconciliationDecision[]> {
-  reduceLedgerEvents(events);
+  const reduced = reduceLedgerEvents(events);
+  const ledger = canonicalLedgerLinks(events);
   const root = await initializeRoot(runRoot);
   return withRootLock(root, async () => {
     const results = new Map<string, Extract<FoundationLedgerEvent, { type: "result_recorded" }>>();
@@ -259,15 +264,20 @@ export async function reconcileCanonicalTransactions(
     const decisions: TransactionReconciliationDecision[] = [];
     for (const [transactionId, result] of results) {
       const commit = commits.get(transactionId);
+      const attempt = ledger.attempts.get(result.payload.attemptId);
+      if (!attempt) fail("transaction.corrupt");
       if (commit) {
         const verified = await verifyCommittedEvent(root, commit, limitsFrom(options));
-        assertResultManifestLink(result, verified.manifest);
+        assertResultManifestLink(result, verified.manifest, ledger.runId, attempt);
       } else {
         const directory = transactionDirectory(root, "committed", transactionId as TransactionId);
         if (await pathExists(directory)) {
           const verified = await verifyDirectory(root, "committed", transactionId as TransactionId, limitsFrom(options));
-          assertResultManifestLink(result, verified.manifest);
-          decisions.push(Object.freeze({ kind: "finish-transaction", transactionId: transactionId as TransactionId }));
+          assertResultManifestLink(result, verified.manifest, ledger.runId, attempt);
+          const decision = recoveryDecisionFor(reduced, attempt.logicalOperationId);
+          if (decision.kind === "finish-transaction" && decision.transactionId === transactionId) {
+            decisions.push(Object.freeze({ kind: "finish-transaction", transactionId: transactionId as TransactionId }));
+          }
         }
       }
     }
@@ -317,7 +327,12 @@ export async function reconstructCanonicalRecords(
   });
 }
 
-interface Limits { maxFileBytes: number; maxLineBytes: number; maxRecords: number }
+interface Limits {
+  maxFileBytes: number;
+  maxLineBytes: number;
+  maxRecords: number;
+  readChunk: (handle: FileHandle, buffer: Buffer, position: number) => Promise<number>;
+}
 interface BuiltTransaction {
   manifest: CanonicalTransactionManifest;
   manifestBytes: Buffer;
@@ -438,7 +453,7 @@ async function verifyDirectory(root: string, location: ".staging" | "committed",
   const expected = new Set([...KINDS.map((kind) => `${kind}.jsonl`), MANIFEST_FILE]);
   if (entries.some((entry) => entry.isSymbolicLink())) fail("transaction.unsafe-file");
   if (entries.length !== expected.size || entries.some((entry) => !entry.isFile() || !expected.has(entry.name))) fail("transaction.corrupt");
-  const manifestBytes = await readSafeFile(join(directory, MANIFEST_FILE), limits.maxFileBytes);
+  const manifestBytes = await readSafeFile(join(directory, MANIFEST_FILE), Math.min(limits.maxFileBytes, limits.maxLineBytes), limits);
   const manifestInput = parseCanonicalSingleJson(manifestBytes);
   const parsed = parse(CanonicalTransactionManifestSchema, manifestInput);
   if (!parsed.success) fail("transaction.corrupt");
@@ -448,7 +463,7 @@ async function verifyDirectory(root: string, location: ".staging" | "committed",
   const records = Object.create(null) as Record<CanonicalRecordKind, JsonRecord[]>;
   for (const [index, kind] of KINDS.entries()) {
     const file = manifest.files[index]!;
-    const bytes = await readSafeFile(join(directory, file.relativePath), limits.maxFileBytes);
+    const bytes = await readSafeFile(join(directory, file.relativePath), limits.maxFileBytes, limits);
     if (bytes.byteLength !== file.decodedBytes || sha256Hex(bytes) !== file.sha256) fail("transaction.corrupt");
     const parsedRecords = parseJsonLines(bytes, limits);
     if (parsedRecords.length !== file.recordCount) fail("transaction.corrupt");
@@ -526,8 +541,29 @@ async function verifyCommittedEvent(root: string, event: Extract<FoundationLedge
   return verified;
 }
 
-function assertResultManifestLink(event: Extract<FoundationLedgerEvent, { type: "result_recorded" }>, manifest: CanonicalTransactionManifest): void {
-  if (event.payload.transactionId !== manifest.transactionId || event.payload.attemptId !== manifest.attemptId || event.seq !== manifest.sourceResultSeq) fail("transaction.corrupt");
+function canonicalLedgerLinks(events: readonly FoundationLedgerEvent[]): { runId: string; attempts: Map<string, AttemptRecord> } {
+  const runs = events.filter((event) => event.type === "run_created");
+  if (runs.length !== 1) fail("transaction.corrupt");
+  const attempts = new Map<string, AttemptRecord>();
+  for (const event of events) {
+    if (event.type !== "dispatch_intent") continue;
+    if (attempts.has(event.payload.attempt.attemptId)) fail("transaction.corrupt");
+    attempts.set(event.payload.attempt.attemptId, event.payload.attempt);
+  }
+  return { runId: runs[0]!.payload.run.runId, attempts };
+}
+
+function assertResultManifestLink(
+  event: Extract<FoundationLedgerEvent, { type: "result_recorded" }>,
+  manifest: CanonicalTransactionManifest,
+  runId: string,
+  attempt: AttemptRecord,
+): void {
+  if (manifest.runId !== runId || attempt.runId !== runId
+    || event.payload.transactionId !== manifest.transactionId
+    || event.payload.attemptId !== attempt.attemptId
+    || event.payload.attemptId !== manifest.attemptId
+    || event.seq !== manifest.sourceResultSeq) fail("transaction.corrupt");
 }
 
 async function initializeRoot(runRoot: string): Promise<string> {
@@ -578,6 +614,15 @@ async function writeExclusiveFile(path: string, bytes: Buffer, step: Transaction
   await protocolStep(step, options);
 }
 
+/**
+ * A renamed directory is roll-forward state. Persist the destination name
+ * first, then removal of the source name. Retries repeat both fsyncs.
+ */
+async function syncRenameParents(root: string, options: TransactionStoreOptions): Promise<void> {
+  await syncDirectory(join(root, ".state/transactions/committed"), "committed-parent-synced", options);
+  await syncDirectory(join(root, ".state/transactions/.staging"), "staging-parent-synced", options);
+}
+
 async function syncDirectory(path: string, step: TransactionProtocolStep, options: TransactionStoreOptions): Promise<void> {
   const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
   const directoryFlag = typeof constants.O_DIRECTORY === "number" ? constants.O_DIRECTORY : 0;
@@ -614,17 +659,31 @@ async function protocolStep(step: TransactionProtocolStep, options: TransactionS
   try { await options.onStep?.(step); } catch { fail("transaction.io-failed"); }
 }
 
-async function readSafeFile(path: string, maxBytes: number): Promise<Buffer> {
-  let before;
-  try { before = await lstat(path); } catch { fail("transaction.corrupt"); }
-  if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1 || before.size > maxBytes) fail(before.size > maxBytes ? "transaction.file-too-large" : "transaction.unsafe-file");
+async function readSafeFile(path: string, maxBytes: number, limits: Limits): Promise<Buffer> {
   const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
   let handle: FileHandle | undefined;
+  let initial: Awaited<ReturnType<FileHandle["stat"]>> | undefined;
+  const parts: Buffer[] = [];
+  let total = 0;
   try {
     handle = await open(path, constants.O_RDONLY | noFollow);
-    const stat = await handle.stat();
-    if (!stat.isFile() || stat.nlink !== 1 || stat.size > maxBytes || stat.dev !== before.dev || stat.ino !== before.ino) fail("transaction.unsafe-file");
-    return await handle.readFile();
+    initial = await handle.stat();
+    if (!initial.isFile() || initial.nlink !== 1) fail("transaction.unsafe-file");
+    if (initial.size > maxBytes) fail("transaction.file-too-large");
+    for (;;) {
+      const remainingProbe = maxBytes + 1 - total;
+      const buffer = Buffer.allocUnsafe(Math.min(READ_CHUNK_BYTES, remainingProbe));
+      const bytesRead = await limits.readChunk(handle, buffer, total);
+      if (!Number.isSafeInteger(bytesRead) || bytesRead < 0 || bytesRead > buffer.byteLength) fail("transaction.unsafe-file");
+      if (bytesRead === 0) break;
+      total += bytesRead;
+      if (total > maxBytes) fail("transaction.file-too-large");
+      parts.push(Buffer.from(buffer.subarray(0, bytesRead)));
+    }
+    const after = await handle.stat();
+    if (!after.isFile() || after.nlink !== 1 || after.dev !== initial.dev || after.ino !== initial.ino
+      || after.size !== total || after.size !== initial.size || after.mtimeMs !== initial.mtimeMs) fail("transaction.unsafe-file");
+    return Buffer.concat(parts, total);
   } catch (error) {
     throw normalize(error, "transaction.unsafe-file");
   } finally {
@@ -651,8 +710,19 @@ function transactionDirectory(root: string, location: ".staging" | "committed", 
   return directory;
 }
 
+function snapshotManifestRef(reference: TransactionManifestRef): TransactionManifestRef {
+  try {
+    return JSON.parse(canonicalJson(reference)) as TransactionManifestRef;
+  } catch {
+    fail("transaction.invalid-input");
+  }
+}
+
 function assertManifestRef(reference: TransactionManifestRef): void {
-  if (utilTypes.isProxy(reference) || !ID_PATTERNS.transaction.test(reference.transactionId)
+  const keys = Reflect.ownKeys(reference);
+  if (utilTypes.isProxy(reference) || keys.length !== 3
+    || keys.some((key) => typeof key !== "string" || !["transactionId", "relativePath", "sha256"].includes(key))
+    || !ID_PATTERNS.transaction.test(reference.transactionId)
     || reference.relativePath !== relativeManifestPath("committed", reference.transactionId)
     || !/^[a-f0-9]{64}$/.test(reference.sha256)) fail("transaction.invalid-input");
 }
@@ -665,7 +735,11 @@ function limitsFrom(options: TransactionStoreOptions): Limits {
   const maxFileBytes = positiveLimit(options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES);
   const maxLineBytes = positiveLimit(options.maxLineBytes ?? DEFAULT_MAX_LINE_BYTES);
   const maxRecords = positiveLimit(options.maxRecords ?? DEFAULT_MAX_RECORDS);
-  return { maxFileBytes, maxLineBytes: Math.min(maxLineBytes, maxFileBytes), maxRecords };
+  const readChunk = options.readChunk ?? (async (handle: FileHandle, buffer: Buffer, position: number) => {
+    const { bytesRead } = await handle.read(buffer, 0, buffer.byteLength, position);
+    return bytesRead;
+  });
+  return { maxFileBytes, maxLineBytes: Math.min(maxLineBytes, maxFileBytes), maxRecords, readChunk };
 }
 
 function positiveLimit(value: number): number {
