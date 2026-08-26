@@ -10,19 +10,41 @@ import type { FoundationStatus, FoundationStatusRequest } from "./commands/statu
 
 const TASK_STATES = ["open", "ready", "running", "blocked", "resolved", "cancelled"] as const;
 
-export async function readFoundationStatus(request: FoundationStatusRequest): Promise<FoundationStatus | null> {
+export class FoundationStatusReadError extends Error {
+  readonly code = "status.unavailable";
+  constructor() { super("Research status unavailable."); this.name = "FoundationStatusReadError"; }
+}
+
+export interface FoundationStatusReaderDependencies {
+  inspectOwnedRunRootIntegrity: typeof inspectOwnedRunRootIntegrity;
+  readVerifiedLedgerSnapshot: typeof readVerifiedLedgerSnapshot;
+  inspectCanonicalTransactionsReadOnly: typeof inspectCanonicalTransactionsReadOnly;
+}
+
+const DEFAULT_DEPENDENCIES: FoundationStatusReaderDependencies = {
+  inspectOwnedRunRootIntegrity,
+  readVerifiedLedgerSnapshot,
+  inspectCanonicalTransactionsReadOnly,
+};
+
+export async function readFoundationStatus(
+  request: FoundationStatusRequest,
+  dependencies: FoundationStatusReaderDependencies = DEFAULT_DEPENDENCIES,
+): Promise<FoundationStatus | null> {
   if (request.rootPath === null) return null;
   const rootPath = resolve(request.cwd, request.rootPath);
-  const inspected = await inspectOwnedRunRootIntegrity(rootPath);
+  const inspected = await dependencies.inspectOwnedRunRootIntegrity(rootPath);
+  let result: FoundationStatus | undefined;
+  let failure: unknown;
   try {
-    const events = await readVerifiedLedgerSnapshot(join(inspected.path, ".state", "events.jsonl"), { trustedRoot: inspected.path });
+    const events = await dependencies.readVerifiedLedgerSnapshot(join(inspected.path, ".state", "events.jsonl"), { trustedRoot: inspected.path });
     await inspected.revalidate();
     const reduced = reduceLedgerEvents(events);
     const runEvents = events.filter((event) => event.type === "run_created");
     if (runEvents.length !== 1 || runEvents[0]!.payload.run.runId !== inspected.runId || reduced.runState === null) {
       throw new Error("status integrity failure");
     }
-    const transactions = await inspectCanonicalTransactionsReadOnly(inspected.path, events);
+    const transactions = await dependencies.inspectCanonicalTransactionsReadOnly(inspected.path, events);
     await inspected.revalidate();
 
     const latestTasks = new Map<string, (typeof events)[number] & { type: "task_upserted" }>();
@@ -44,7 +66,7 @@ export async function readFoundationStatus(request: FoundationStatusRequest): Pr
       ? null
       : pending.map((schedule) => schedule.notBeforeAt).sort()[0]!;
 
-    return Object.freeze({
+    result = Object.freeze({
       runId: inspected.runId,
       state: reduced.runState,
       tasksByState: Object.freeze(tasksByState),
@@ -59,7 +81,11 @@ export async function readFoundationStatus(request: FoundationStatusRequest): Pr
       executionEpoch: reduced.currentEpoch,
       integrity: "verified",
     });
-  } finally {
-    await inspected.close();
+  } catch (error) {
+    failure = error;
   }
+  try { await inspected.close(); }
+  catch { failure ??= new FoundationStatusReadError(); }
+  if (failure) throw failure;
+  return result!;
 }

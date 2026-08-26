@@ -55,6 +55,7 @@ const DEFAULT_LOCK_TRASH_MIN_AGE_MS = 5 * 60 * 1000;
 const READ_CHUNK_BYTES = 64 * 1024;
 const fatalUtf8 = new TextDecoder("utf-8", { fatal: true });
 const rootQueues = new Map<string, Promise<void>>();
+const releasedHandles = new WeakSet<FileHandle>();
 
 export interface CanonicalTransactionInput {
   schemaVersion: 1;
@@ -113,6 +114,7 @@ export interface TransactionStoreOptions {
   durability?: (handle: FileHandle, step: TransactionProtocolStep) => Promise<void>;
   rename?: (from: string, to: string) => Promise<void>;
   close?: (handle: FileHandle) => Promise<void>;
+  isHandleReleased?: (handle: FileHandle) => boolean | Promise<boolean>;
   onStep?: (step: TransactionProtocolStep) => Promise<void>;
   pid?: number;
   now?: () => Date;
@@ -1205,12 +1207,33 @@ async function syncDirectory(path: string, step: TransactionProtocolStep, option
 }
 
 async function closeForOperation(handle: FileHandle, options: TransactionStoreOptions, priorFailure: unknown): Promise<unknown> {
+  if (releasedHandles.has(handle)) return priorFailure;
   try {
     await (options.close ?? ((file) => file.close()))(handle);
+    releasedHandles.add(handle);
     return priorFailure;
   } catch {
-    await handle.close().catch(() => undefined);
+    if (await isHandleReleased(handle, options)) {
+      releasedHandles.add(handle);
+    } else {
+      try {
+        await handle.close();
+        releasedHandles.add(handle);
+      } catch {
+        if (await isHandleReleased(handle, options)) releasedHandles.add(handle);
+      }
+    }
     return priorFailure ?? new TransactionStoreError("transaction.io-failed");
+  }
+}
+
+async function isHandleReleased(handle: FileHandle, options: TransactionStoreOptions): Promise<boolean> {
+  try {
+    if (options.isHandleReleased) return await options.isHandleReleased(handle);
+    await handle.stat();
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException | undefined)?.code === "EBADF";
   }
 }
 

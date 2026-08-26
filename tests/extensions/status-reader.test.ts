@@ -3,11 +3,11 @@ import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 
-import { readFoundationStatus } from "../../extensions/research/status-reader.js";
+import { FoundationStatusReadError, readFoundationStatus } from "../../extensions/research/status-reader.js";
 import type { AttemptRecord, RunSnapshot, TaskRecord } from "../../src/domain/records.js";
-import { openEventLedger, type EventLedger } from "../../src/storage/event-ledger.js";
-import { createOwnedRunRoot } from "../../src/storage/run-root.js";
-import { commitTransaction, prepareTransaction } from "../../src/storage/transaction-store.js";
+import { openEventLedger, readVerifiedLedgerSnapshot, type EventLedger } from "../../src/storage/event-ledger.js";
+import { createOwnedRunRoot, inspectOwnedRunRootIntegrity } from "../../src/storage/run-root.js";
+import { commitTransaction, inspectCanonicalTransactionsReadOnly, prepareTransaction } from "../../src/storage/transaction-store.js";
 
 const RUN = "run-0123456789abcdef" as const;
 const TASK = "task-0123456789abcdef" as const;
@@ -176,6 +176,33 @@ describe("readFoundationStatus", () => {
     expect(status?.unmaterializedResults).toBe(0);
     expect(prepared.manifestSha256).toBe(ref.sha256);
     expect(committedPrepared.manifestSha256).toBe(committedRef.sha256);
+  });
+
+  test("preserves a primary status error when root cleanup also fails and redacts cleanup-only failure", async () => {
+    const value = await fixture(); await value.ledger.close();
+    const primary = new Error("PRIMARY_STATUS_SENTINEL");
+    let closeAttempts = 0;
+    const inspectWithFailingClose = async (path: string) => {
+      const inspected = await inspectOwnedRunRootIntegrity(path);
+      return { ...inspected, close: async () => { closeAttempts++; await inspected.close(); throw new Error("CLOSE_SECRET_SENTINEL"); } };
+    };
+    const primaryFailure = readFoundationStatus({ cwd: value.project, rootPath: value.root }, {
+      inspectOwnedRunRootIntegrity: inspectWithFailingClose,
+      readVerifiedLedgerSnapshot,
+      inspectCanonicalTransactionsReadOnly: async () => { throw primary; },
+    });
+    await expect(primaryFailure.catch((error) => error)).resolves.toBe(primary);
+    expect(closeAttempts).toBe(1);
+
+    closeAttempts = 0;
+    const cleanupFailure = readFoundationStatus({ cwd: value.project, rootPath: value.root }, {
+      inspectOwnedRunRootIntegrity: inspectWithFailingClose,
+      readVerifiedLedgerSnapshot,
+      inspectCanonicalTransactionsReadOnly,
+    });
+    await expect(cleanupFailure).rejects.toBeInstanceOf(FoundationStatusReadError);
+    await expect(cleanupFailure.catch((error: Error) => error.message)).resolves.not.toContain("CLOSE_SECRET_SENTINEL");
+    expect(closeAttempts).toBe(1);
   });
 
   test("fails closed for missing or tampered transaction objects and closes descriptors", async () => {

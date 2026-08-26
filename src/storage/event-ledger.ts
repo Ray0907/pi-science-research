@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { constants } from "node:fs";
+import { constants, type BigIntStats } from "node:fs";
 import { lstat, open, type FileHandle } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { TextDecoder } from "node:util";
@@ -56,6 +56,9 @@ export interface VerifiedLedgerSnapshotOptions {
   maxLineBytes?: number;
   trustedRoot?: string;
   onCheck?: (phase: "before-final-path-check") => void | Promise<void>;
+  onHandleOpened?: (kind: "parent" | "ledger", path: string, handle: FileHandle) => void | Promise<void>;
+  lstat?: (path: string) => Promise<BigIntStats>;
+  close?: (handle: FileHandle) => Promise<void>;
 }
 
 export interface EventLedgerOptions {
@@ -122,12 +125,16 @@ export async function readVerifiedLedgerSnapshot(
   const maxLineBytes = validateMaxLineBytes(options.maxLineBytes ?? DEFAULT_MAX_LEDGER_LINE_BYTES);
   let handle: FileHandle | undefined;
   let parentGuard: SnapshotParent[] = [];
+  let result: FoundationLedgerEvent[] | undefined;
+  let failure: unknown;
+  const snapshotLstat = options.lstat ?? ((target: string) => lstat(target, { bigint: true }));
   try {
-    if (options.trustedRoot !== undefined) parentGuard = await pinSnapshotParents(options.trustedRoot, canonicalPath);
-    const beforePath = await lstat(canonicalPath, { bigint: true });
+    if (options.trustedRoot !== undefined) parentGuard = await pinSnapshotParents(options.trustedRoot, canonicalPath, options, snapshotLstat);
+    const beforePath = await snapshotLstat(canonicalPath);
     if (beforePath.isSymbolicLink()) throw new EventLedgerError("ledger.symlink");
     const noFollow = constants.O_NOFOLLOW ?? 0;
     handle = await open(canonicalPath, constants.O_RDONLY | noFollow);
+    await options.onHandleOpened?.("ledger", canonicalPath, handle);
     const before = await handle.stat({ bigint: true });
     if (!before.isFile()) throw new EventLedgerError("ledger.not-file");
     if (!sameStableFile(before, beforePath)) throw new EventLedgerError("ledger.concurrent-mutation");
@@ -136,22 +143,20 @@ export async function readVerifiedLedgerSnapshot(
     await options.onCheck?.("before-final-path-check");
     const [after, afterPath] = await Promise.all([
       handle.stat({ bigint: true }),
-      lstat(canonicalPath, { bigint: true }),
+      snapshotLstat(canonicalPath),
     ]);
     if (afterPath.isSymbolicLink() || !sameStableFile(before, after) || !sameStableFile(before, afterPath)) {
       throw new EventLedgerError("ledger.concurrent-mutation");
     }
-    await assertSnapshotParents(parentGuard);
-    return events;
+    await assertSnapshotParents(parentGuard, snapshotLstat);
+    result = events;
   } catch (error) {
-    if (error instanceof EventLedgerError || error instanceof Error && error.name === "LedgerReducerCorruptionError") throw error;
-    const code = (error as NodeJS.ErrnoException | undefined)?.code;
-    if (code === "ELOOP") throw new EventLedgerError("ledger.symlink");
-    throw new EventLedgerError("ledger.open-failed");
-  } finally {
-    if (handle) await handle.close().catch(() => undefined);
-    await Promise.all(parentGuard.map(({ handle: parent }) => parent.close().catch(() => undefined)));
+    failure = normalizeSnapshotError(error);
   }
+  const cleanup = [handle, ...[...parentGuard].reverse().map(({ handle: parent }) => parent)].filter((item): item is FileHandle => item !== undefined);
+  for (const item of cleanup) failure = await closeSnapshotHandle(item, options.close, failure);
+  if (failure) throw failure;
+  return result!;
 }
 
 interface SnapshotParent {
@@ -163,7 +168,12 @@ interface SnapshotParent {
   ctimeNs: bigint;
 }
 
-async function pinSnapshotParents(trustedRoot: string, target: string): Promise<SnapshotParent[]> {
+async function pinSnapshotParents(
+  trustedRoot: string,
+  target: string,
+  options: VerifiedLedgerSnapshotOptions,
+  snapshotLstat: (path: string) => Promise<BigIntStats>,
+): Promise<SnapshotParent[]> {
   const root = resolve(trustedRoot);
   const rel = relative(root, target);
   if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
@@ -176,40 +186,71 @@ async function pinSnapshotParents(trustedRoot: string, target: string): Promise<
     paths.push(current);
   }
   const pinned: SnapshotParent[] = [];
+  const opened: FileHandle[] = [];
   const noFollow = constants.O_NOFOLLOW ?? 0;
   const directory = constants.O_DIRECTORY ?? 0;
   try {
     for (const parentPath of paths) {
-      const before = await lstat(parentPath, { bigint: true });
+      const before = await snapshotLstat(parentPath);
       if (before.isSymbolicLink() || !before.isDirectory()) throw new EventLedgerError("ledger.symlink");
       const parent = await open(parentPath, constants.O_RDONLY | noFollow | directory);
+      opened.push(parent);
+      await options.onHandleOpened?.("parent", parentPath, parent);
       const descriptor = await parent.stat({ bigint: true });
-      const pathname = await lstat(parentPath, { bigint: true });
+      const pathname = await snapshotLstat(parentPath);
       if (!descriptor.isDirectory() || pathname.isSymbolicLink() || !sameStableDirectory(descriptor, pathname)) {
-        await parent.close().catch(() => undefined);
         throw new EventLedgerError("ledger.symlink");
       }
       pinned.push({ path: parentPath, handle: parent, dev: descriptor.dev, ino: descriptor.ino, mtimeNs: descriptor.mtimeNs, ctimeNs: descriptor.ctimeNs });
     }
     return pinned;
   } catch (error) {
-    await Promise.all(pinned.map(({ handle: parent }) => parent.close().catch(() => undefined)));
-    if (error instanceof EventLedgerError) throw error;
-    throw new EventLedgerError("ledger.open-failed");
+    let failure: unknown = normalizeSnapshotError(error);
+    for (const parent of opened.reverse()) failure = await closeSnapshotHandle(parent, options.close, failure);
+    throw failure;
   }
 }
 
-async function assertSnapshotParents(parents: readonly SnapshotParent[]): Promise<void> {
+async function assertSnapshotParents(parents: readonly SnapshotParent[], snapshotLstat: (path: string) => Promise<BigIntStats>): Promise<void> {
   for (const parent of parents) {
     const [descriptor, pathname] = await Promise.all([
       parent.handle.stat({ bigint: true }),
-      lstat(parent.path, { bigint: true }),
+      snapshotLstat(parent.path),
     ]).catch(() => { throw new EventLedgerError("ledger.concurrent-mutation"); });
     if (pathname.isSymbolicLink() || !descriptor.isDirectory() || !sameStableDirectory(descriptor, pathname)
       || descriptor.dev !== parent.dev || descriptor.ino !== parent.ino
       || descriptor.mtimeNs !== parent.mtimeNs || descriptor.ctimeNs !== parent.ctimeNs) {
       throw new EventLedgerError("ledger.concurrent-mutation");
     }
+  }
+}
+
+function normalizeSnapshotError(error: unknown): unknown {
+  if (error instanceof EventLedgerError || error instanceof Error && error.name === "LedgerReducerCorruptionError") return error;
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return new EventLedgerError(code === "ELOOP" ? "ledger.symlink" : "ledger.open-failed");
+}
+
+async function closeSnapshotHandle(
+  handle: FileHandle,
+  closeOperation: VerifiedLedgerSnapshotOptions["close"],
+  primary: unknown,
+): Promise<unknown> {
+  try {
+    await (closeOperation ?? ((item: FileHandle) => item.close()))(handle);
+    return primary;
+  } catch {
+    if (!(await snapshotDescriptorClosed(handle))) await handle.close().catch(() => undefined);
+    return primary ?? new EventLedgerError("ledger.close-failed");
+  }
+}
+
+async function snapshotDescriptorClosed(handle: FileHandle): Promise<boolean> {
+  try {
+    await handle.stat();
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException | undefined)?.code === "EBADF";
   }
 }
 

@@ -1,4 +1,4 @@
-import { appendFile, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { appendFile, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -146,6 +146,63 @@ describe("readVerifiedLedgerSnapshot", () => {
     await symlink(outside, state);
     await expect(readVerifiedLedgerSnapshot(join(state, "events.jsonl"), { trustedRoot: root }))
       .rejects.toMatchObject({ code: "ledger.symlink" });
+  });
+
+  test.each(["first-stat", "lstat"])("closes every acquired parent after injected %s failure and can reopen", async (kind) => {
+    const { root } = await fixture();
+    const path = join(root, ".state", "events.jsonl");
+    await mkdir(dirname(path), { recursive: true });
+    const ledger = await openEventLedger(path, { now: () => new Date(AT), eventId: () => "event-1" });
+    await ledger.append("run_created", { run: runSnapshot() });
+    await ledger.close();
+    const handles: FileHandle[] = [];
+    const closes = new Map<FileHandle, number>();
+    let lstatCalls = 0;
+    const options = {
+      trustedRoot: root,
+      onHandleOpened: async (_kind: string, _path: string, handle: FileHandle) => {
+        handles.push(handle);
+        if (kind === "first-stat" && handles.length === 1) {
+          Object.defineProperty(handle, "stat", { configurable: true, value: async () => { throw new Error("stat-secret"); } });
+        }
+      },
+      lstat: async (target: string) => {
+        lstatCalls++;
+        if (kind === "lstat" && lstatCalls === 2) throw new Error("lstat-secret");
+        return lstat(target, { bigint: true });
+      },
+      close: async (handle: FileHandle) => {
+        closes.set(handle, (closes.get(handle) ?? 0) + 1);
+        await handle.close();
+      },
+    };
+    await expect(readVerifiedLedgerSnapshot(path, options)).rejects.toMatchObject({ code: "ledger.open-failed" });
+    expect(handles.length).toBeGreaterThan(0);
+    for (const handle of handles) expect(closes.get(handle)).toBe(1);
+    expect(await readVerifiedLedgerSnapshot(path, { trustedRoot: root })).toHaveLength(1);
+  });
+
+  test("preserves ledger primary errors across close failures and reports close-only failure", async () => {
+    const { root } = await fixture();
+    const path = join(root, ".state", "events.jsonl");
+    await mkdir(dirname(path), { recursive: true });
+    const ledger = await openEventLedger(path, { now: () => new Date(AT), eventId: () => "event-1" });
+    await ledger.append("run_created", { run: runSnapshot() });
+    await ledger.close();
+    const closeCounts = new Map<FileHandle, number>();
+    const close = async (handle: FileHandle) => {
+      closeCounts.set(handle, (closeCounts.get(handle) ?? 0) + 1);
+      await handle.close();
+      throw new Error("close-secret");
+    };
+    await appendFile(path, "{", "utf8");
+    await expect(readVerifiedLedgerSnapshot(path, { trustedRoot: root, close })).rejects.toMatchObject({ code: "ledger.torn-tail" });
+    for (const count of closeCounts.values()) expect(count).toBe(1);
+    await writeFile(path, (await readFile(path)).subarray(0, -1));
+    closeCounts.clear();
+    await expect(readVerifiedLedgerSnapshot(path, { trustedRoot: root, close })).rejects.toMatchObject({ code: "ledger.close-failed" });
+    for (const count of closeCounts.values()) expect(count).toBe(1);
+    expect(await readVerifiedLedgerSnapshot(path, { trustedRoot: root })).toHaveLength(1);
   });
 
   test("does not leak descriptors across repeated success and failure", async () => {

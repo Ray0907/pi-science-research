@@ -992,6 +992,44 @@ describe("read-only transaction race resistance", () => {
     for (const handle of handles) await expect(handle.stat()).rejects.toBeDefined();
   });
 
+  test.each(["closes-then-throws", "throws-while-open"])("releases each retained descriptor exactly once when injected close %s", async (mode) => {
+    const runRoot = await root();
+    await committed(runRoot);
+    const handles: FileHandle[] = [];
+    const closeCalls = new Map<FileHandle, number>();
+    const nativeCalls = new Map<FileHandle, number>();
+    const options = {
+      onHandleOpened: async (_kind: string, _path: string, handle: FileHandle) => {
+        handles.push(handle);
+        const nativeClose = handle.close.bind(handle);
+        Object.defineProperty(handle, "close", {
+          configurable: true,
+          value: async () => {
+            nativeCalls.set(handle, (nativeCalls.get(handle) ?? 0) + 1);
+            await nativeClose();
+          },
+        });
+      },
+      close: async (handle: FileHandle) => {
+        closeCalls.set(handle, (closeCalls.get(handle) ?? 0) + 1);
+        if (mode === "closes-then-throws") await handle.close();
+        throw new Error("close-state-secret");
+      },
+      isHandleReleased: async (handle: FileHandle) => {
+        try { await handle.stat(); return false; }
+        catch (error) { return (error as NodeJS.ErrnoException).code === "EBADF"; }
+      },
+    };
+    await expectCode(inspectCanonicalTransactionsReadOnly(runRoot, baseEvents(), options), "transaction.io-failed");
+    expect(handles.length).toBeGreaterThanOrEqual(13);
+    for (const handle of handles) {
+      expect(closeCalls.get(handle)).toBe(1);
+      expect(nativeCalls.get(handle)).toBe(1);
+      await expect(handle.stat()).rejects.toMatchObject({ code: "EBADF" });
+    }
+    expect(await inspectCanonicalTransactionsReadOnly(runRoot, baseEvents())).toMatchObject({ pendingCount: 1 });
+  });
+
   test.each([
     ["first-stat", 1],
     ["validation", 1],
