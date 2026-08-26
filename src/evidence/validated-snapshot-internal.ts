@@ -77,6 +77,15 @@ interface NormalizedOptions {
   readonly optionsSha256: string;
 }
 interface Prepared<T> { readonly record: T; readonly json: string; readonly bytes: number; readonly prospective?: PreparedProspectiveEvidenceSemanticsInternal }
+interface PreparedTask4Preflight {
+  readonly claims: Prepared<ClaimRecord>[];
+  readonly evidence: Prepared<EvidenceRecord>[];
+  readonly verifications: Prepared<VerificationRecord>[];
+  readonly calculations: Prepared<CalculationRecord>[];
+  readonly preparedByKind: Record<SnapshotRecordKind, readonly Prepared<unknown>[]>;
+  readonly canonicalBytes: number;
+  readonly referenceCount: number;
+}
 interface InternalSnapshotState {
   readonly open: true;
   readonly snapshotSha256: string;
@@ -115,8 +124,7 @@ export function buildBoundedValidatedEvidenceSnapshotInternal(
   validateDiagnostics(diagnostics);
   const arrayViews = inspectSetArrays(records, normalized.limits);
   const totalRecords = arrayViews.totalRecords;
-  const sourceInputs = snapshotArray(arrayViews.values.sources, arrayViews.lengths.sources);
-  const requestInputs = snapshotArray(arrayViews.values.requests, arrayViews.lengths.requests);
+  let task4Preflight: PreparedTask4Preflight | undefined;
 
   const provenanceDiagnostics: RequestProvenanceDiagnostics = {
     sourceVisits: 0, requestVisits: 0, requestUrlVisits: 0, metadataStepVisits: 0, witnessInsertions: 0,
@@ -124,7 +132,7 @@ export function buildBoundedValidatedEvidenceSnapshotInternal(
   let requestProvenanceIndex: RequestProvenanceIndex;
   try {
     requestProvenanceIndex = buildRequestProvenanceIndexForEvidenceSnapshotInternal(
-      sourceInputs as readonly SourceRecord[], requestInputs as readonly RequestRecord[],
+      arrayViews.values.sources as readonly SourceRecord[], arrayViews.values.requests as readonly RequestRecord[],
       {
         maxSources: normalized.limits.maxPerKind.sources,
         maxRequests: normalized.limits.maxPerKind.requests,
@@ -137,13 +145,20 @@ export function buildBoundedValidatedEvidenceSnapshotInternal(
       },
       provenanceDiagnostics,
       (prepared) => {
-        const sourceRequestRecords: Record<SnapshotRecordKind, readonly Prepared<unknown>[]> = {
+        if (task4Preflight !== undefined) fail("evidence.invalid-input");
+        const claims = prepareEvidenceKind(snapshotArray(arrayViews.values.claims, arrayViews.lengths.claims), "claim", normalized.limits.maxClaimRecordCanonicalBytes, diagnostics) as Prepared<ClaimRecord>[];
+        const evidence = prepareEvidenceKind(snapshotArray(arrayViews.values.evidence, arrayViews.lengths.evidence), "evidence", normalized.limits.maxEvidenceRecordCanonicalBytes, diagnostics) as Prepared<EvidenceRecord>[];
+        const verifications = prepareEvidenceKind(snapshotArray(arrayViews.values.verifications, arrayViews.lengths.verifications), "verification", normalized.limits.maxVerificationRecordCanonicalBytes, diagnostics) as Prepared<VerificationRecord>[];
+        const calculations = prepareKind(snapshotArray(arrayViews.values.calculations, arrayViews.lengths.calculations), CalculationRecordSchema, normalized.limits.maxCalculationRecordCanonicalBytes, diagnostics) as Prepared<CalculationRecord>[];
+        const preparedByKind: Record<SnapshotRecordKind, readonly Prepared<unknown>[]> = {
           sources: prepared.sources.map((record, index) => Object.freeze({ record, json: prepared.sourceCanonicalJson[index]!, bytes: Buffer.byteLength(prepared.sourceCanonicalJson[index]!, "utf8") })),
           requests: prepared.requests.map((record, index) => Object.freeze({ record, json: prepared.requestCanonicalJson[index]!, bytes: Buffer.byteLength(prepared.requestCanonicalJson[index]!, "utf8") })),
-          claims: [], evidence: [], verifications: [], calculations: [],
+          claims, evidence, verifications, calculations,
         };
-        preflightReferences(sourceRequestRecords, normalized.limits.maxReferences);
+        const canonicalBytes = measureCanonicalSet(preparedByKind, normalized.limits.maxCanonicalEvidenceSetBytes);
+        const referenceCount = preflightReferences(preparedByKind, normalized.limits.maxReferences);
         preflightLineageComponents(prepared.sources, normalized.limits.maxLineageComponents);
+        task4Preflight = Object.freeze({ claims, evidence, verifications, calculations, preparedByKind, canonicalBytes, referenceCount });
       },
     );
   } catch (error) {
@@ -151,6 +166,8 @@ export function buildBoundedValidatedEvidenceSnapshotInternal(
     if (isEvidenceSnapshotDuplicateRequestError(error)) fail("evidence.duplicate-request");
     return translateSourceError(error);
   }
+  if (task4Preflight === undefined) fail("evidence.invalid-input");
+  const completedPreflight = task4Preflight;
   bump(diagnostics, "requestRecordsIndexed", provenanceDiagnostics.requestVisits);
   bump(diagnostics, "requestUrlVisits", provenanceDiagnostics.requestUrlVisits);
   bump(diagnostics, "metadataStepVisits", provenanceDiagnostics.metadataStepVisits);
@@ -169,17 +186,12 @@ export function buildBoundedValidatedEvidenceSnapshotInternal(
     catch (error) { return translateSourceError(error); }
   }
 
-  let claims = prepareEvidenceKind(snapshotArray(arrayViews.values.claims, arrayViews.lengths.claims), "claim", normalized.limits.maxClaimRecordCanonicalBytes, diagnostics) as Prepared<ClaimRecord>[];
-  let evidence = prepareEvidenceKind(snapshotArray(arrayViews.values.evidence, arrayViews.lengths.evidence), "evidence", normalized.limits.maxEvidenceRecordCanonicalBytes, diagnostics) as Prepared<EvidenceRecord>[];
-  let verifications = prepareEvidenceKind(snapshotArray(arrayViews.values.verifications, arrayViews.lengths.verifications), "verification", normalized.limits.maxVerificationRecordCanonicalBytes, diagnostics) as Prepared<VerificationRecord>[];
-  let calculations = prepareKind(snapshotArray(arrayViews.values.calculations, arrayViews.lengths.calculations), CalculationRecordSchema, normalized.limits.maxCalculationRecordCanonicalBytes, diagnostics) as Prepared<CalculationRecord>[];
-  const preparedByKind: Record<SnapshotRecordKind, readonly Prepared<unknown>[]> = {
-    sources: task2Records.sources.map((record, index) => Object.freeze({ record, json: task2Records.sourceCanonicalJson[index]!, bytes: Buffer.byteLength(task2Records.sourceCanonicalJson[index]!, "utf8") })),
-    requests: task2Records.requests.map((record, index) => Object.freeze({ record, json: task2Records.requestCanonicalJson[index]!, bytes: Buffer.byteLength(task2Records.requestCanonicalJson[index]!, "utf8") })),
-    claims, evidence, verifications, calculations,
-  };
-  const canonicalBytes = measureCanonicalSet(preparedByKind, normalized.limits.maxCanonicalEvidenceSetBytes);
-  const preflightReferenceCount = preflightReferences(preparedByKind, normalized.limits.maxReferences);
+  let { claims, evidence, verifications, calculations } = completedPreflight;
+  const preparedByKind = completedPreflight.preparedByKind;
+  preparedByKind.sources = task2Records.sources.map((record, index) => Object.freeze({ record, json: task2Records.sourceCanonicalJson[index]!, bytes: Buffer.byteLength(task2Records.sourceCanonicalJson[index]!, "utf8") }));
+  preparedByKind.requests = task2Records.requests.map((record, index) => Object.freeze({ record, json: task2Records.requestCanonicalJson[index]!, bytes: Buffer.byteLength(task2Records.requestCanonicalJson[index]!, "utf8") }));
+  const canonicalBytes = completedPreflight.canonicalBytes;
+  const preflightReferenceCount = completedPreflight.referenceCount;
   claims = orderPrepared("claims", claims); evidence = orderPrepared("evidence", evidence);
   verifications = orderPrepared("verifications", verifications); calculations = orderPrepared("calculations", calculations);
   preparedByKind.claims = claims; preparedByKind.evidence = evidence;

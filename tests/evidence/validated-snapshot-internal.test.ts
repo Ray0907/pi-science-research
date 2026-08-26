@@ -242,7 +242,7 @@ describe("validated evidence snapshot internals", () => {
     expect(componentVisits.revisionIndexInsertions).toBe(0);
     expect(componentVisits.lineageVisits).toBe(0);
   });
-  test("preflights all array counts and Task 2 policy before touching later records", () => {
+  test("preflights all array counts and later-kind limits before Task 2 semantics and indexes", () => {
     let touched = 0;
     const accessorClaims: unknown[] = [];
     Object.defineProperty(accessorClaims, "0", { enumerable: true, get() { touched += 1; throw new Error("SECRET-LATE-COUNT"); } });
@@ -255,13 +255,35 @@ describe("validated evidence snapshot internals", () => {
     expect(touched).toBe(0);
     expect(countVisits).toEqual(diagnostics());
 
-    const hostileClaim = new Proxy({}, { ownKeys() { touched += 1; throw new Error("SECRET-LATE-POLICY"); }, get() { touched += 1; throw new Error("SECRET-LATE-POLICY"); } });
-    const unattributed = source({ identifiers: { doi: null, pmid: null, pmcid: null }, canonicalUrl: "https://example.org/unattributed" });
-    const policyVisits = diagnostics();
-    expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: [unattributed], claims: [hostileClaim as never] }), undefined, policyVisits))).toBe("evidence.source-url-unattributed");
-    expect(touched).toBe(0);
-    expect(policyVisits.canonicalRecordVisits).toBe(1);
-    expect(policyVisits.revisionIndexInsertions).toBe(0);
+    const malformedSource = source({ lineage: { ...source().lineage, cohortIds: ["duplicate", "duplicate"] } });
+    const oversizedClaim = { ...claim(), statement: "x".repeat(2_000) };
+    const oversizedVisits = diagnostics();
+    expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: [malformedSource], claims: [oversizedClaim] }), {
+      limits: { maxClaimRecordCanonicalBytes: 1_000 },
+    }, oversizedVisits))).toBe("evidence.record-too-large");
+    expect(oversizedVisits.requestRecordsIndexed).toBe(0);
+    expect(oversizedVisits.requestUrlVisits).toBe(0);
+    expect(oversizedVisits.sourceIdentityVisits).toBe(0);
+    expect(oversizedVisits.lineageVisits).toBe(0);
+    expect(oversizedVisits.revisionIndexInsertions).toBe(0);
+
+    const request: RequestRecord = {
+      schemaVersion: 1, requestId: "request-0000000000000001", attemptId: ATTEMPT, executionEpoch: 0, logicalRequestId: "logical-0000000000000001",
+      physicalAttemptOrdinal: 1, retryOfRequestId: null, replayPolicy: "safe-read", provider: "openalex", operation: "fetch",
+      normalizedInput: { query: null, identifier: null, url: "https://api.example/a", parameters: [] }, accessPolicySha256: HASH,
+      startedAt: AT, endedAt: AT, status: "success", httpStatus: 200, requestedUrl: "https://api.example/a", finalUrl: null,
+      redirectUrls: [], responseSha256: null, responseFile: null, encodedBytes: 0, decodedBytes: 0, resultSourceIds: [], errorClass: null,
+    };
+    const overReferenceClaim = { ...claim(), evidenceRefs: Array.from({ length: 6 }, () => ({ evidenceId: evidence().evidenceId, revision: 1 })) };
+    const referenceVisits = diagnostics();
+    expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ claims: [overReferenceClaim], requests: [request, { ...request }] }), {
+      limits: { maxReferences: 5 },
+    }, referenceVisits))).toBe("evidence.too-many-references");
+    expect(referenceVisits.requestRecordsIndexed).toBe(0);
+    expect(referenceVisits.requestUrlVisits).toBe(0);
+    expect(referenceVisits.sourceIdentityVisits).toBe(0);
+    expect(referenceVisits.lineageVisits).toBe(0);
+    expect(referenceVisits.revisionIndexInsertions).toBe(0);
   });
   test("validates nested source policy before touching hostile record arrays", () => {
     const hostile = new Proxy({}, { ownKeys() { throw new Error("SECRET-RECORDS"); }, get() { throw new Error("SECRET-RECORDS"); } });

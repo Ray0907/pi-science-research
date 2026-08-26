@@ -214,7 +214,10 @@ export interface PreparedProvenanceRecordsForEvidenceSnapshotInternal {
   readonly sourceCanonicalJson: readonly string[];
   readonly requestCanonicalJson: readonly string[];
 }
-/** Package-internal Task 4 seam; retains the public Task 2 100,000-source hard cap. */
+/**
+ * Package-internal Task 4 seam. The callback runs after bounded canonical preparation and before
+ * semantic validation or index allocation; callback failure publishes no provenance state.
+ */
 export function buildRequestProvenanceIndexForEvidenceSnapshotInternal(
   sources: readonly SourceRecord[], requests: readonly RequestRecord[], options: SourceIdentityOptions,
   diagnostics?: RequestProvenanceDiagnostics,

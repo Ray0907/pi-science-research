@@ -6,6 +6,7 @@ import { prepareProspectiveSourceIdentityFields } from "../../src/scholarly/iden
 import {
   SourceIdentityError,
   buildRequestProvenanceIndex,
+  buildRequestProvenanceIndexForEvidenceSnapshotInternal,
   getValidatedSourceRecordsInternal,
   mergeSourceRecords,
   sourceIdentityKeys,
@@ -349,6 +350,36 @@ describe("source identity and provenance", () => {
     expect(validateSourceCanonicalUrlProvenanceFromSnapshotInternal(firstSource, first)).toEqual({ kind: "identifier-resolver", identifierKind: "doi" });
     expect(validateSourceCanonicalUrlProvenanceFromSnapshotInternal(secondSource, second)).toEqual({ kind: "identifier-resolver", identifierKind: "doi" });
     expect(errorCode(() => validateSourceCanonicalUrlProvenanceFromSnapshotInternal(firstSource, second))).toBe("source.provenance-index-mismatch");
+  });
+
+  test("runs the internal pre-semantic hook without publishing partial provenance state", () => {
+    const source = src("src-hook.00000001", {
+      retrievalRequestIds: [REQUEST_A],
+      metadataProvenance: [{ field: "canonicalUrl", provider: "openalex", requestId: REQUEST_A }],
+    });
+    const request = req(REQUEST_A, source.sourceId, { finalUrl: source.canonicalUrl });
+    const malformed = { ...source, lineage: { ...source.lineage, cohortIds: ["duplicate", "duplicate"] } };
+    const visits = diagnostics(); let callbacks = 0;
+    let captured: Parameters<NonNullable<Parameters<typeof buildRequestProvenanceIndexForEvidenceSnapshotInternal>[4]>>[0] | undefined;
+    const sentinel = new Error("callback-stop");
+    expect(() => buildRequestProvenanceIndexForEvidenceSnapshotInternal([malformed], [request], options(), visits, (prepared) => {
+      callbacks += 1; captured = prepared; throw sentinel;
+    })).toThrow(sentinel);
+    expect(callbacks).toBe(1);
+    expect(captured).toBeDefined();
+    expect(Object.isFrozen(captured)).toBe(true);
+    expect(Object.isFrozen(captured!.sources)).toBe(true);
+    expect(Object.isFrozen(captured!.requests)).toBe(true);
+    expect(Object.keys(captured!).sort()).toEqual(["requestCanonicalJson", "requests", "sourceCanonicalJson", "sources"]);
+    expect(Object.values(captured!).some((value) => value instanceof Map || value instanceof Set)).toBe(false);
+    expect(visits).toEqual({ sourceVisits: 1, requestVisits: 1, requestUrlVisits: 0, metadataStepVisits: 0, witnessInsertions: 0 });
+    expect(errorCode(() => getValidatedSourceRecordsInternal(captured!.sources, captured!.sourceCanonicalJson))).toBe("source.provenance-index-mismatch");
+
+    let normalCallbacks = 0;
+    const index = buildRequestProvenanceIndexForEvidenceSnapshotInternal([source], [request], options(), diagnostics(), () => { normalCallbacks += 1; });
+    expect(normalCallbacks).toBe(1);
+    const validated = validatedProvenanceRecordsForSnapshot(index);
+    expect(getValidatedSourceRecordsInternal(validated.sources, validated.sourceCanonicalJson).sources).toBe(validated.sources);
   });
 
   test("builds one immutable request provenance index in linear visits", () => {
