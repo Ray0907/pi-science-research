@@ -483,6 +483,10 @@ describe("closed record schemas", () => {
     }
   });
 
+  test("rejects a current revision on a non-completed run when completedAt remains null", () => {
+    expectInvalid(RunSnapshotSchema, runFixture({ currentRevisionId: ids.revision }), "/currentRevisionId");
+  });
+
   test("enforces run budget, lifecycle, and calculation matrices", () => {
     for (const [limit, reserve] of [[100_000, 50_000], [300_000, 60_000], [600_000, 120_000], [3_600_000, 600_000]]) {
       expectValid(RunSnapshotSchema, runFixture({ budget: { ...runFixture().budget, activeTimeLimitMs: limit, finalizationReserveMs: reserve } }));
