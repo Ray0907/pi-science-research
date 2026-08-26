@@ -22,6 +22,9 @@ const RETRY_1 = "retry-0000000000000001";
 const RETRY_2 = "retry-0000000000000002";
 const REVISION_1 = "rev-20260825T120000000Z-000000000001";
 const LOGICAL = "operation-primary";
+const REQUEST_1 = "request-0000000000000001";
+const REQUEST_2 = "request-0000000000000002";
+const REQUEST_RETRY = "retry-0000000000000099";
 
 function runSnapshot(overrides: Partial<RunSnapshot> = {}): RunSnapshot {
   return {
@@ -147,6 +150,13 @@ class Events {
     this.add("dispatch_started", { attemptId, pid: 123, requestCorrelation: null });
   }
 
+  resume(priorEpoch: number, executionEpoch: number, priorCancelSeq: number): void {
+    this.add("state_changed", { from: "researching", to: "paused", blocker: null });
+    this.add("resume_epoch_started", { priorEpoch, executionEpoch, priorCancelSeq, checkpointStage: "researching", ownerTokenSha256: HASH });
+    this.add("state_changed", { from: "paused", to: "recovering", blocker: null });
+    this.add("state_changed", { from: "recovering", to: "researching", blocker: null });
+  }
+
   result(attemptId = ATTEMPT_1, transactionId = TX_1): FoundationLedgerEvent {
     this.add("identity_reserved", { kind: "transaction", id: transactionId, origin: "parent-generated" });
     return this.add("result_recorded", { attemptId, resultSha256: HASH, manifestSha256: null, transactionId });
@@ -162,6 +172,47 @@ class Events {
     });
     this.add("attempt_committed", { attemptId, transactionId, taskId: TASK_ID, sourceResultSeq });
   }
+}
+
+function requestIntent(overrides: Record<string, unknown> = {}) {
+  return {
+    schemaVersion: 1 as const,
+    requestId: REQUEST_1,
+    attemptId: ATTEMPT_1,
+    executionEpoch: 0,
+    logicalRequestId: "request-series",
+    physicalAttemptOrdinal: 1,
+    retryOfRequestId: null,
+    replayPolicy: "safe-read" as const,
+    provider: "openalex" as const,
+    operation: "search" as const,
+    normalizedInput: { query: "q", identifier: null, url: null, parameters: [] },
+    accessPolicySha256: HASH,
+    deadlineAt: LATER,
+    createdAt: AT,
+    ...overrides,
+  };
+}
+
+function requestResult(overrides: Record<string, unknown> = {}) {
+  const intent = requestIntent(overrides);
+  const { deadlineAt: _deadlineAt, createdAt: _createdAt, ...identity } = intent;
+  return {
+    ...identity,
+    startedAt: AT,
+    endedAt: LATER,
+    status: "retryable-error" as const,
+    httpStatus: 503,
+    requestedUrl: "https://example.test",
+    finalUrl: "https://example.test",
+    redirectUrls: [],
+    responseSha256: null,
+    responseFile: null,
+    encodedBytes: 0,
+    decodedBytes: 0,
+    resultSourceIds: [],
+    errorClass: "transient",
+  };
 }
 
 function expectCorruption(events: readonly FoundationLedgerEvent[], code: string): void {
@@ -372,13 +423,7 @@ describe("pure ledger recovery reduction", () => {
       reason: "cancelled-epoch",
     });
 
-    events.add("resume_epoch_started", {
-      priorEpoch: 0,
-      executionEpoch: 1,
-      priorCancelSeq: cancel.seq,
-      checkpointStage: "researching",
-      ownerTokenSha256: HASH,
-    });
+    events.resume(0, 1, cancel.seq);
     expect(recoveryDecisionFor(reduceLedgerEvents(events.values), LOGICAL)).toEqual({
       kind: "quarantined",
       reason: "cancelled-epoch",
@@ -391,13 +436,7 @@ describe("pure ledger recovery reduction", () => {
     events.started();
     const cancel = events.add("cancel_requested", { executionEpoch: 0, reason: "user-pause" });
     events.result(ATTEMPT_1, TX_1);
-    events.add("resume_epoch_started", {
-      priorEpoch: 0,
-      executionEpoch: 1,
-      priorCancelSeq: cancel.seq,
-      checkpointStage: "researching",
-      ownerTokenSha256: HASH,
-    });
+    events.resume(0, 1, cancel.seq);
     const next = attemptRecord({ attemptId: ATTEMPT_2, logicalOperationId: "operation-next-epoch", executionEpoch: 1, attemptEnvelopeSha256: "c".repeat(64) });
     events.add("identity_reserved", { kind: "attempt", id: ATTEMPT_2, origin: "parent-generated" });
     events.add("dispatch_intent", { attempt: next });
@@ -436,14 +475,14 @@ describe("pure ledger recovery reduction", () => {
     events.base();
     events.started();
     const cancel0 = events.add("cancel_requested", { executionEpoch: 0, reason: "user-pause" });
-    events.add("resume_epoch_started", { priorEpoch: 0, executionEpoch: 1, priorCancelSeq: cancel0.seq, checkpointStage: "researching", ownerTokenSha256: HASH });
+    events.resume(0, 1, cancel0.seq);
 
     const epoch1Operation = "operation-epoch-1";
     events.add("identity_reserved", { kind: "attempt", id: ATTEMPT_2, origin: "parent-generated" });
     events.add("dispatch_intent", { attempt: attemptRecord({ attemptId: ATTEMPT_2, logicalOperationId: epoch1Operation, executionEpoch: 1, attemptEnvelopeSha256: "c".repeat(64) }) });
     events.started(ATTEMPT_2);
     const cancel1 = events.add("cancel_requested", { executionEpoch: 1, reason: "user-pause" });
-    events.add("resume_epoch_started", { priorEpoch: 1, executionEpoch: 2, priorCancelSeq: cancel1.seq, checkpointStage: "researching", ownerTokenSha256: HASH });
+    events.resume(1, 2, cancel1.seq);
 
     const epoch2Operation = "operation-epoch-2";
     events.add("identity_reserved", { kind: "attempt", id: ATTEMPT_3, origin: "parent-generated" });
@@ -471,7 +510,7 @@ describe("pure ledger recovery reduction", () => {
 
     const oldSchedule = scheduledRetryEvents();
     const cancel = oldSchedule.add("cancel_requested", { executionEpoch: 0, reason: "user-pause" });
-    oldSchedule.add("resume_epoch_started", { priorEpoch: 0, executionEpoch: 1, priorCancelSeq: cancel.seq, checkpointStage: "researching", ownerTokenSha256: HASH });
+    oldSchedule.resume(0, 1, cancel.seq);
     oldSchedule.add("identity_reserved", { kind: "attempt", id: ATTEMPT_2, origin: "parent-generated" });
     const oldScheduleSeq = oldSchedule.values.find((event) => event.type === "retry_scheduled")!.seq;
     oldSchedule.add("retry_started", { scheduleId: RETRY_1, logicalOperationId: LOGICAL, attemptId: ATTEMPT_2, attemptOrdinal: 2, scheduledFromSeq: oldScheduleSeq });
@@ -479,7 +518,7 @@ describe("pure ledger recovery reduction", () => {
 
     const replacement = scheduledRetryEvents();
     const replacementCancel = replacement.add("cancel_requested", { executionEpoch: 0, reason: "user-pause" });
-    replacement.add("resume_epoch_started", { priorEpoch: 0, executionEpoch: 1, priorCancelSeq: replacementCancel.seq, checkpointStage: "researching", ownerTokenSha256: HASH });
+    replacement.resume(0, 1, replacementCancel.seq);
     replacement.add("identity_reserved", { kind: "retry-schedule", id: RETRY_2, origin: "parent-generated" });
     replacement.add("retry_scheduled", { scheduleId: RETRY_2, logicalOperationId: LOGICAL, failedAttemptId: ATTEMPT_1, nextAttemptOrdinal: 2, notBeforeAt: LATER, delayMs: 2, reasonClass: "resumed" });
     expect(recoveryDecisionFor(reduceLedgerEvents(replacement.values), LOGICAL)).toMatchObject({
@@ -487,7 +526,7 @@ describe("pure ledger recovery reduction", () => {
       schedule: { scheduleId: RETRY_2 },
     });
     const cancel1 = replacement.add("cancel_requested", { executionEpoch: 1, reason: "user-pause" });
-    replacement.add("resume_epoch_started", { priorEpoch: 1, executionEpoch: 2, priorCancelSeq: cancel1.seq, checkpointStage: "researching", ownerTokenSha256: HASH });
+    replacement.resume(1, 2, cancel1.seq);
     expect(recoveryDecisionFor(reduceLedgerEvents(replacement.values), LOGICAL)).toEqual({
       kind: "quarantined",
       reason: "cancelled-epoch",
@@ -499,13 +538,7 @@ describe("pure ledger recovery reduction", () => {
     events.base();
     events.started();
     const cancel = events.add("cancel_requested", { executionEpoch: 0, reason: "user-pause" });
-    events.add("resume_epoch_started", {
-      priorEpoch: 0,
-      executionEpoch: 1,
-      priorCancelSeq: cancel.seq,
-      checkpointStage: "researching",
-      ownerTokenSha256: HASH,
-    });
+    events.resume(0, 1, cancel.seq);
     events.result();
     const next = attemptRecord({
       attemptId: ATTEMPT_2,
@@ -589,7 +622,9 @@ describe("run state reduction", () => {
     const paused = new Events();
     paused.add("run_created", { run: runSnapshot({ state: "created", checkpointStage: null }) });
     paused.add("state_changed", { from: "created", to: "planning", blocker: null });
+    const pauseCancel = paused.add("cancel_requested", { executionEpoch: 0, reason: "user-pause" });
     paused.add("state_changed", { from: "planning", to: "paused", blocker: null });
+    paused.add("resume_epoch_started", { priorEpoch: 0, executionEpoch: 1, priorCancelSeq: pauseCancel.seq, checkpointStage: "planning", ownerTokenSha256: HASH });
     paused.add("state_changed", { from: "paused", to: "recovering", blocker: null });
     paused.add("state_changed", { from: "recovering", to: "planning", blocker: null });
     expect(reduceLedgerEvents(paused.values).runState).toBe("planning");
@@ -755,6 +790,7 @@ describe("semantic corruption", () => {
         name: "resume epoch skips an increment",
         build: () => {
           const events = new Events(); events.base(); const cancel = events.add("cancel_requested", { executionEpoch: 0, reason: "user-pause" });
+          events.add("state_changed", { from: "researching", to: "paused", blocker: null });
           events.add("resume_epoch_started", { priorEpoch: 0, executionEpoch: 2, priorCancelSeq: cancel.seq, checkpointStage: "researching", ownerTokenSha256: HASH });
           return events.values;
         },
@@ -870,3 +906,117 @@ function scheduledRetryEvents(): Events {
   events.add("retry_scheduled", { scheduleId: RETRY_1, logicalOperationId: LOGICAL, failedAttemptId: ATTEMPT_1, nextAttemptOrdinal: 2, notBeforeAt: LATER, delayMs: 1, reasonClass: "transient" });
   return events;
 }
+
+describe("cross-module ledger invariants", () => {
+  test("reduces a linked request intent/result and rejects immutable mismatch", () => {
+    const events = new Events(); events.base(); events.started();
+    events.add("identity_reserved", { kind: "request", id: REQUEST_1, origin: "child-import" });
+    const intent = events.add("request_intent_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: 1, journalEntrySha256: HASH, intent: requestIntent() });
+    events.add("request_result_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: 2, journalEntrySha256: HASH_B, intentLedgerSeq: intent.seq, request: requestResult() });
+    const state = reduceLedgerEvents(events.values);
+    expect(state.requests[REQUEST_1]).toMatchObject({ status: "retryable-error", cacheEligible: false, physicalAttemptOrdinal: 1 });
+
+    const bad = new Events(); bad.base(); bad.started();
+    bad.add("identity_reserved", { kind: "request", id: REQUEST_1, origin: "child-import" });
+    const badIntent = bad.add("request_intent_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: 1, journalEntrySha256: HASH, intent: requestIntent() });
+    bad.add("request_result_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: 2, journalEntrySha256: HASH_B, intentLedgerSeq: badIntent.seq, request: requestResult({ provider: "crossref" }) });
+    expectCorruption(bad.values, "reducer.request-intent-mismatch");
+  });
+
+  test("rejects duplicate journal positions and retry intents without a canonical start", () => {
+    const duplicate = new Events(); duplicate.base(); duplicate.started();
+    duplicate.add("identity_reserved", { kind: "request", id: REQUEST_1, origin: "child-import" });
+    const intent = duplicate.add("request_intent_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: 1, journalEntrySha256: HASH, intent: requestIntent() });
+    duplicate.add("request_result_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: 1, journalEntrySha256: HASH_B, intentLedgerSeq: intent.seq, request: requestResult() });
+    expectCorruption(duplicate.values, "reducer.request-journal-position");
+
+    const missingStart = new Events(); missingStart.base(); missingStart.started();
+    missingStart.add("identity_reserved", { kind: "request", id: REQUEST_2, origin: "child-import" });
+    missingStart.add("request_intent_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: 1, journalEntrySha256: HASH,
+      intent: requestIntent({ requestId: REQUEST_2, physicalAttemptOrdinal: 2, retryOfRequestId: REQUEST_1 }) });
+    expectCorruption(missingStart.values, "reducer.request-start-link");
+  });
+
+  test("keeps a pre-cancel successful request cache-eligible and rejects a late result", () => {
+    const success = new Events(); success.base(); success.started();
+    success.add("identity_reserved", { kind: "request", id: REQUEST_1, origin: "child-import" });
+    const intent = success.add("request_intent_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: 1, journalEntrySha256: HASH, intent: requestIntent() });
+    success.add("request_result_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: 2, journalEntrySha256: HASH_B, intentLedgerSeq: intent.seq, request: {
+      ...requestResult(), status: "success", httpStatus: 200, responseSha256: HASH,
+      responseFile: { relativePath: `.state/request-payloads/${HASH}`, mediaType: "application/json", decodedBytes: 2, sha256: HASH },
+      encodedBytes: 2, decodedBytes: 2, errorClass: null,
+    } });
+    success.add("cancel_requested", { executionEpoch: 0, reason: "user-pause" });
+    expect(reduceLedgerEvents(success.values).cacheEligibleRequestIds).toEqual([REQUEST_1]);
+
+    const late = new Events(); late.base(); late.started();
+    late.add("identity_reserved", { kind: "request", id: REQUEST_1, origin: "child-import" });
+    const lateIntent = late.add("request_intent_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: 1, journalEntrySha256: HASH, intent: requestIntent() });
+    late.add("cancel_requested", { executionEpoch: 0, reason: "user-pause" });
+    late.add("request_result_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: 2, journalEntrySha256: HASH_B, intentLedgerSeq: lateIntent.seq, request: requestResult() });
+    expectCorruption(late.values, "reducer.request-cancelled");
+  });
+
+  test("authorizes a cross-child request retry through one canonical schedule/start", () => {
+    const events = new Events(); events.base(); events.started();
+    events.add("identity_reserved", { kind: "request", id: REQUEST_1, origin: "child-import" });
+    const intent = events.add("request_intent_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: 1, journalEntrySha256: HASH, intent: requestIntent() });
+    events.add("request_result_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: 2, journalEntrySha256: HASH_B, intentLedgerSeq: intent.seq, request: requestResult() });
+    events.add("identity_reserved", { kind: "retry-schedule", id: REQUEST_RETRY, origin: "child-import" });
+    const schedule = events.add("request_retry_scheduled", { scheduleId: REQUEST_RETRY, attemptId: ATTEMPT_1, journalLocalSeq: 3, journalEntrySha256: "c".repeat(64), logicalRequestId: "request-series", failedRequestId: REQUEST_1, nextPhysicalAttemptOrdinal: 2, notBeforeAt: LATER, delayMs: 1, reasonClass: "transient" });
+    events.add("identity_reserved", { kind: "attempt", id: ATTEMPT_2, origin: "parent-generated" });
+    events.add("dispatch_intent", { attempt: attemptRecord({ attemptId: ATTEMPT_2, logicalOperationId: "replacement-child", attemptEnvelopeSha256: "d".repeat(64) }) });
+    events.add("identity_reserved", { kind: "request", id: REQUEST_2, origin: "child-import" });
+    events.add("request_retry_started", { scheduleId: REQUEST_RETRY, attemptId: ATTEMPT_2, journalLocalSeq: 1, journalEntrySha256: "d".repeat(64), logicalRequestId: "request-series", requestId: REQUEST_2, physicalAttemptOrdinal: 2, scheduledFromLedgerSeq: schedule.seq });
+    const retryIntent = requestIntent({ requestId: REQUEST_2, attemptId: ATTEMPT_2, physicalAttemptOrdinal: 2, retryOfRequestId: REQUEST_1 });
+    events.add("request_intent_recorded", { attemptId: ATTEMPT_2, journalLocalSeq: 2, journalEntrySha256: "e".repeat(64), intent: retryIntent });
+    expect(reduceLedgerEvents(events.values).requests[REQUEST_2]).toMatchObject({ attemptId: ATTEMPT_2, physicalAttemptOrdinal: 2 });
+  });
+
+  test("requires paused/recovering lifecycle and forbids resume after abandon", () => {
+    const invalid = new Events(); invalid.base();
+    const cancel = invalid.add("cancel_requested", { executionEpoch: 0, reason: "user-pause" });
+    invalid.add("resume_epoch_started", { priorEpoch: 0, executionEpoch: 1, priorCancelSeq: cancel.seq, checkpointStage: "researching", ownerTokenSha256: HASH });
+    expectCorruption(invalid.values, "reducer.resume-state");
+
+    const wrongAbandon = new Events(); wrongAbandon.base();
+    wrongAbandon.add("cancel_requested", { executionEpoch: 0, reason: "user-abandon" });
+    wrongAbandon.add("state_changed", { from: "researching", to: "paused", blocker: null });
+    expectCorruption(wrongAbandon.values, "reducer.abandon-transition");
+
+    const abandoned = new Events(); abandoned.base();
+    const abandon = abandoned.add("cancel_requested", { executionEpoch: 0, reason: "user-abandon" });
+    abandoned.add("state_changed", { from: "researching", to: "cancelled", blocker: null });
+    abandoned.add("resume_epoch_started", { priorEpoch: 0, executionEpoch: 1, priorCancelSeq: abandon.seq, checkpointStage: "researching", ownerTokenSha256: HASH });
+    expectCorruption(abandoned.values, "reducer.run-terminal");
+  });
+
+  test("rejects task revision, transition, and append-only attempt history violations", () => {
+    const cases: Array<{ next: Partial<TaskRecord>; code: string }> = [
+      { next: { revision: 1, state: "ready" }, code: "reducer.task-revision" },
+      { next: { revision: 2, state: "resolved", resolution: "early" }, code: "reducer.task-resolution" },
+      { next: { revision: 2, state: "open" }, code: "reducer.task-transition" },
+      { next: { revision: 2, attemptIds: [ATTEMPT_1, ATTEMPT_1] }, code: "reducer.task-attempt-history" },
+    ];
+    for (const item of cases) {
+      const events = new Events(); events.base();
+      events.add("task_upserted", { task: taskRecord({ ...item.next }) });
+      expectCorruption(events.values, item.code);
+    }
+  });
+
+  test("enforces task revisions and durable resolution", () => {
+    const revisions = new Events(); revisions.add("run_created", { run: runSnapshot() });
+    revisions.add("task_upserted", { task: taskRecord({ state: "open" }) });
+    revisions.add("task_upserted", { task: taskRecord({ revision: 3, state: "ready" }) });
+    expectCorruption(revisions.values, "reducer.task-revision");
+
+    const premature = new Events(); premature.base();
+    premature.add("task_upserted", { task: taskRecord({ revision: 2, state: "resolved", attemptIds: [ATTEMPT_1], resolution: "done" }) });
+    expectCorruption(premature.values, "reducer.task-resolution");
+
+    const valid = new Events(); valid.base(); valid.started(); const result = valid.result(); valid.records(ATTEMPT_1, TX_1, result.seq);
+    valid.add("task_upserted", { task: taskRecord({ revision: 2, state: "resolved", attemptIds: [ATTEMPT_1], resolution: "done" }) });
+    expect(reduceLedgerEvents(valid.values).runState).toBe("researching");
+  });
+});

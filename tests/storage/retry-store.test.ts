@@ -97,6 +97,13 @@ async function seedFailed(ledger: EventLedger, attempt = attemptRecord(), failur
   await ledger.append("attempt_failed", { attemptId: attempt.attemptId, state: failure, errorClass: "transient", message: "safe" });
 }
 
+async function resumeLedger(ledger: EventLedger, priorEpoch: number, executionEpoch: number, priorCancelSeq: number): Promise<void> {
+  await ledger.append("state_changed", { from: "researching", to: "paused", blocker: null });
+  await ledger.append("resume_epoch_started", { priorEpoch, executionEpoch, priorCancelSeq, checkpointStage: "researching", ownerTokenSha256: HASH });
+  await ledger.append("state_changed", { from: "paused", to: "recovering", blocker: null });
+  await ledger.append("state_changed", { from: "recovering", to: "researching", blocker: null });
+}
+
 async function expectRetryError(action: Promise<unknown>, code: string): Promise<void> {
   await expect(action).rejects.toMatchObject({ name: "RetryStoreError", code });
   await expect(action).rejects.not.toThrow(/capability|secret/i);
@@ -292,7 +299,7 @@ describe("durable retry scheduling", () => {
     const cancel = await cancelRetryEpoch(ledger, 0, "user-pause");
     expect(recoverRetryState(await ledger.readAll()).schedules[RETRY_1]).toMatchObject({ status: "cancelled", startedAttemptId: ATTEMPT_2 });
     expect(await startScheduledRetry(ledger, RETRY_1, AT, policy())).toEqual({ kind: "cancelled", executionEpoch: 0 });
-    await ledger.append("resume_epoch_started", { priorEpoch: 0, executionEpoch: 1, priorCancelSeq: cancel.seq, checkpointStage: "researching", ownerTokenSha256: HASH });
+    await resumeLedger(ledger, 0, 1, cancel.seq);
     expect(recoverRetryState(await ledger.readAll()).schedules[RETRY_1]).toMatchObject({ status: "cancelled", executionEpoch: 0 });
     expect(await startScheduledRetry(ledger, RETRY_1, AT, policy())).toEqual({ kind: "cancelled", executionEpoch: 0 });
     await ledger.close();
@@ -305,7 +312,7 @@ describe("durable retry scheduling", () => {
     const before = (await ledger.readAll()).length;
     expect(await scheduleRetry(ledger, attemptRecord(), policy(), AT, () => 0)).toEqual({ kind: "cancelled", executionEpoch: 0 });
     expect((await ledger.readAll()).length).toBe(before);
-    await ledger.append("resume_epoch_started", { priorEpoch: 0, executionEpoch: 1, priorCancelSeq: cancel.seq, checkpointStage: "researching", ownerTokenSha256: HASH });
+    await resumeLedger(ledger, 0, 1, cancel.seq);
     expect(await scheduleRetry(ledger, attemptRecord(), policy({ scheduleId: () => RETRY_2 }), AT, () => 0)).toMatchObject({ kind: "scheduled", schedule: { scheduleId: RETRY_2 } });
     expect(recoverRetryState(await ledger.readAll()).schedules[RETRY_2]).toMatchObject({ status: "pending", executionEpoch: 1 });
     const started = await startScheduledRetry(ledger, RETRY_2, AT, policy());
@@ -324,7 +331,7 @@ describe("durable retry scheduling", () => {
     await seedFailed(ledger);
     await scheduleRetry(ledger, attemptRecord(), policy(), AT, () => 0);
     const cancel = await cancelRetryEpoch(ledger, 0, "user-pause");
-    await ledger.append("resume_epoch_started", { priorEpoch: 0, executionEpoch: 1, priorCancelSeq: cancel.seq, checkpointStage: "researching", ownerTokenSha256: HASH });
+    await resumeLedger(ledger, 0, 1, cancel.seq);
     expect(await startScheduledRetry(ledger, RETRY_1, AT, policy())).toEqual({ kind: "cancelled", executionEpoch: 0 });
     const replacement = await scheduleRetry(ledger, attemptRecord(), policy({ scheduleId: () => RETRY_2 }), AT, () => 0);
     expect(replacement).toMatchObject({ kind: "scheduled", schedule: { scheduleId: RETRY_2 } });
@@ -356,7 +363,7 @@ describe("durable retry scheduling", () => {
     const eventsAfterCancel = await ledger.readAll();
     expect(eventsAfterCancel).toHaveLength(before + 1);
     const cancel = eventsAfterCancel.at(-1)!;
-    await ledger.append("resume_epoch_started", { priorEpoch: 0, executionEpoch: 1, priorCancelSeq: cancel.seq, checkpointStage: "researching", ownerTokenSha256: HASH });
+    await resumeLedger(ledger, 0, 1, cancel.seq);
     const afterResume = (await ledger.readAll()).length;
     await expect(first.cancel(-1, "user-pause")).rejects.toMatchObject({ code: "retry.cancel-epoch" });
     await expect(second.cancel(0, "user-pause")).rejects.toMatchObject({ code: "retry.cancel-epoch" });
@@ -431,6 +438,8 @@ describe("durable retry scheduling", () => {
   test("large many-epoch recovery visits each event and derives each schedule once", () => {
     const events = new EventBuilder();
     events.add("run_created", { run: runSnapshot() });
+    events.add("state_changed", { from: "created", to: "planning", blocker: null });
+    events.add("state_changed", { from: "planning", to: "researching", blocker: null });
     events.add("task_upserted", { task: taskRecord() });
     const epochs = 12;
     const perEpoch = 20;
@@ -448,7 +457,12 @@ describe("durable retry scheduling", () => {
         events.add("retry_scheduled", { scheduleId, logicalOperationId: attempt.logicalOperationId, failedAttemptId: attemptId, nextAttemptOrdinal: 2, notBeforeAt: AT.toISOString(), delayMs: 0, reasonClass: "transient" });
       }
       const cancel = events.add("cancel_requested", { executionEpoch: epoch, reason: "user-pause" });
-      if (epoch + 1 < epochs) events.add("resume_epoch_started", { priorEpoch: epoch, executionEpoch: epoch + 1, priorCancelSeq: cancel.seq, checkpointStage: "researching", ownerTokenSha256: HASH });
+      if (epoch + 1 < epochs) {
+        events.add("state_changed", { from: "researching", to: "paused", blocker: null });
+        events.add("resume_epoch_started", { priorEpoch: epoch, executionEpoch: epoch + 1, priorCancelSeq: cancel.seq, checkpointStage: "researching", ownerTokenSha256: HASH });
+        events.add("state_changed", { from: "paused", to: "recovering", blocker: null });
+        events.add("state_changed", { from: "recovering", to: "researching", blocker: null });
+      }
     }
     const diagnostics = { eventsVisited: 0, schedulesDerived: 0 };
     const state = recoverRetryState(events.values, diagnostics);

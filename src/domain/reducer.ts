@@ -1,4 +1,5 @@
-import type { FoundationLedgerEvent } from "./events.js";
+import { canonicalJson } from "../crypto/canonical-json.js";
+import type { FoundationLedgerEvent, RequestIntentRecord, RequestRecord } from "./events.js";
 import type { AttemptId, TransactionId } from "./ids.js";
 import type { AttemptRecord, RetrySchedule, RunSnapshot, TaskRecord } from "./records.js";
 
@@ -41,10 +42,23 @@ export interface ReducedOperationState {
   readonly startedRetries: readonly ReducedStartedRetryState[];
 }
 
+export interface ReducedRequestState {
+  readonly requestId: string;
+  readonly attemptId: string;
+  readonly executionEpoch: number;
+  readonly logicalRequestId: string;
+  readonly physicalAttemptOrdinal: number;
+  readonly status: RequestRecord["status"] | "intent";
+  readonly cacheEligible: boolean;
+  readonly quarantined: boolean;
+}
+
 export interface ReducedLedgerState {
   readonly runState: RunSnapshot["state"] | null;
   readonly currentEpoch: number;
   readonly operations: Readonly<Record<string, ReducedOperationState>>;
+  readonly requests: Readonly<Record<string, ReducedRequestState>>;
+  readonly cacheEligibleRequestIds: readonly string[];
   readonly cancelledEpochs: Readonly<Record<string, number>>;
 }
 
@@ -86,6 +100,20 @@ interface MutableOperation {
   readonly schedules: MutableSchedule[];
 }
 
+interface MutableRequest {
+  readonly intent: RequestIntentRecord;
+  readonly intentEvent: Extract<FoundationLedgerEvent, { type: "request_intent_recorded" }>;
+  result: RequestRecord | null;
+  resultSeq: number | null;
+  quarantined: boolean;
+}
+
+interface MutableRequestSchedule {
+  readonly event: Extract<FoundationLedgerEvent, { type: "request_retry_scheduled" }>;
+  readonly executionEpoch: number;
+  startedRequestId: string | null;
+}
+
 interface TransactionState {
   readonly attemptId: string;
   readonly resultSeq: number;
@@ -120,7 +148,18 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
   const transactions = new Map<string, TransactionState>();
   const committedRevisions = new Map<string, { manifestSha256: string; completionCommitId: string }>();
   const cancelledEpochs = new Map<number, number>();
+  const cancelReasons = new Map<number, Extract<FoundationLedgerEvent, { type: "cancel_requested" }>["payload"]["reason"]>();
   const resumedEpochs = new Set<number>();
+  const requests = new Map<string, MutableRequest>();
+  const requestIntentBySeq = new Map<number, MutableRequest>();
+  const requestSchedules = new Map<string, MutableRequestSchedule>();
+  const requestScheduleEdges = new Map<string, MutableRequestSchedule>();
+  const requestStarts = new Map<string, { schedule: MutableRequestSchedule; attemptId: string; ordinal: number }>();
+  const requestSeriesOrdinals = new Map<string, string>();
+  const journalPositions = new Map<string, string>();
+  const journalHashes = new Set<string>();
+  const journalNextSeq = new Map<string, number>();
+  let resumeTransitionPending = false;
   let runId: string | null = null;
   let runOrigin: { record: RunSnapshot; event: FoundationLedgerEvent; index: number } | null = null;
   let runState: RunSnapshot["state"] | null = null;
@@ -138,6 +177,17 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
     return attempt!;
   };
   const reserved = (kind: string, id: string) => reservations.get(kind)?.has(id) === true;
+  const recordJournal = (event: FoundationLedgerEvent & { payload: { attemptId: string; journalLocalSeq: number; journalEntrySha256: string } }, index: number): void => {
+    const key = `${event.payload.attemptId}\0${event.payload.journalLocalSeq}`;
+    const hashKey = `${event.payload.attemptId}\0${event.payload.journalEntrySha256}`;
+    if (journalPositions.has(key)) fail(event, index, "reducer.request-journal-position");
+    if (journalHashes.has(hashKey)) fail(event, index, "reducer.request-journal-hash");
+    const expected = journalNextSeq.get(event.payload.attemptId) ?? 1;
+    if (event.payload.journalLocalSeq !== expected) fail(event, index, "reducer.request-journal-sequence");
+    journalPositions.set(key, event.payload.journalEntrySha256);
+    journalHashes.add(hashKey);
+    journalNextSeq.set(event.payload.attemptId, expected + 1);
+  };
 
   events.forEach((event, index) => {
     if (event.seq !== index + 1) fail(event, index, "reducer.sequence");
@@ -175,16 +225,45 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
         if (!isAllowedRunTransition(currentRunState, event.payload.to, runDepth, lastCheckpoint, runBlocker, event.payload.blocker)) {
           fail(event, index, "reducer.run-transition");
         }
+        const currentCancelReason = cancelReasons.get(currentEpoch);
+        if (currentCancelReason === "user-abandon" && event.payload.to !== "cancelled") fail(event, index, "reducer.abandon-transition");
+        if (currentCancelReason !== undefined && currentCancelReason !== "user-abandon"
+          && event.payload.to !== "paused" && event.payload.to !== "cancelled" && !resumeTransitionPending) {
+          fail(event, index, "reducer.cancel-transition");
+        }
+        if (event.payload.to === "recovering" && currentRunState === "paused") {
+          if (!resumeTransitionPending) fail(event, index, "reducer.resume-transition");
+          resumeTransitionPending = false;
+        } else if (resumeTransitionPending) {
+          fail(event, index, "reducer.resume-transition");
+        }
         runState = event.payload.to;
         runBlocker = event.payload.blocker;
         if (isCheckpointStage(runState)) lastCheckpoint = runState;
         break;
       }
       case "task_upserted": {
-        tasks.set(event.payload.task.taskId, { record: event.payload.task, event, index });
+        const next = event.payload.task;
+        const prior = tasks.get(next.taskId);
+        if (!prior) {
+          if (next.revision !== 1) fail(event, index, "reducer.task-revision");
+        } else {
+          if (next.revision !== prior.record.revision + 1) fail(event, index, "reducer.task-revision");
+          if (prior.record.state === "resolved" || prior.record.state === "cancelled") fail(event, index, "reducer.task-terminal");
+          if (!isAllowedTaskTransition(prior.record.state, next.state)) fail(event, index, "reducer.task-transition");
+          if (next.attemptIds.length < prior.record.attemptIds.length
+            || prior.record.attemptIds.some((id, offset) => next.attemptIds[offset] !== id)) fail(event, index, "reducer.task-attempt-history");
+        }
+        if (new Set(next.attemptIds).size !== next.attemptIds.length) fail(event, index, "reducer.task-attempt-history");
+        if (next.state === "resolved") {
+          const committed = next.attemptIds.some((id) => attempts.get(id)?.phase === "committed" && attempts.get(id)?.record.taskId === next.taskId);
+          if (!committed || next.resolution === null) fail(event, index, "reducer.task-resolution");
+        }
+        tasks.set(next.taskId, { record: next, event, index });
         break;
       }
       case "dispatch_intent": {
+        if (resumeTransitionPending) fail(event, index, "reducer.resume-transition-pending");
         const record = event.payload.attempt;
         if (runId === null || record.runId !== runId) fail(event, index, "reducer.run-not-found");
         if (!tasks.has(record.taskId)) fail(event, index, "reducer.task-not-found");
@@ -327,6 +406,7 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
         break;
       }
       case "retry_scheduled": {
+        if (resumeTransitionPending) fail(event, index, "reducer.resume-transition-pending");
         if (!reserved("retry-schedule", event.payload.scheduleId)) fail(event, index, "reducer.schedule-not-reserved");
         if (schedules.has(event.payload.scheduleId)) fail(event, index, "reducer.duplicate-schedule");
         const predecessor = requireAttempt(event, index, event.payload.failedAttemptId);
@@ -357,6 +437,7 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
         break;
       }
       case "retry_started": {
+        if (resumeTransitionPending) fail(event, index, "reducer.resume-transition-pending");
         const schedule = schedules.get(event.payload.scheduleId);
         if (!schedule) fail(event, index, "reducer.schedule-not-found");
         const startedSchedule = schedule!;
@@ -381,6 +462,7 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
         if (runId === null || event.payload.executionEpoch !== currentEpoch) fail(event, index, "reducer.cancel-epoch");
         if (cancelledEpochs.has(currentEpoch)) fail(event, index, "reducer.duplicate-cancel");
         cancelledEpochs.set(currentEpoch, event.seq);
+        cancelReasons.set(currentEpoch, event.payload.reason);
         for (const schedule of pendingSchedulesByEpoch.get(currentEpoch) ?? []) {
           if (pendingScheduleOperations.get(schedule.schedule.logicalOperationId) === schedule) {
             pendingScheduleOperations.delete(schedule.schedule.logicalOperationId);
@@ -390,21 +472,96 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
         break;
       }
       case "resume_epoch_started": {
+        if (runState === "completed" || runState === "cancelled") fail(event, index, "reducer.run-terminal");
+        if (runState !== "paused") fail(event, index, "reducer.resume-state");
         if (event.payload.priorEpoch !== currentEpoch
           || event.payload.executionEpoch !== currentEpoch + 1) fail(event, index, "reducer.resume-epoch");
         if (resumedEpochs.has(event.payload.executionEpoch)) fail(event, index, "reducer.duplicate-resume");
         const cancelSeq = cancelledEpochs.get(currentEpoch);
+        const reason = cancelReasons.get(currentEpoch);
         if (cancelSeq === undefined || event.payload.priorCancelSeq !== cancelSeq) fail(event, index, "reducer.resume-cancel-link");
+        if (reason === "user-abandon" || reason === undefined) fail(event, index, "reducer.resume-terminal-cancel");
+        if (event.payload.checkpointStage !== lastCheckpoint) fail(event, index, "reducer.resume-checkpoint");
         resumedEpochs.add(event.payload.executionEpoch);
         currentEpoch = event.payload.executionEpoch;
+        resumeTransitionPending = true;
         if (event.payload.checkpointStage !== null) lastCheckpoint = event.payload.checkpointStage;
         break;
       }
-      case "request_intent_recorded":
-      case "request_result_recorded":
-      case "request_retry_scheduled":
-      case "request_retry_started": {
+      case "request_intent_recorded": {
+        if (resumeTransitionPending) fail(event, index, "reducer.resume-transition-pending");
+        const attempt = requireAttempt(event, index, event.payload.attemptId);
+        recordJournal(event, index);
+        const intent = event.payload.intent;
+        if (intent.attemptId !== event.payload.attemptId || intent.executionEpoch !== attempt.record.executionEpoch) fail(event, index, "reducer.request-owner");
+        if (cancelledEpochs.has(intent.executionEpoch)) fail(event, index, "reducer.request-cancelled");
+        if (!reserved("request", intent.requestId) || requests.has(intent.requestId)) fail(event, index, "reducer.request-identity");
+        if (intent.physicalAttemptOrdinal === 1) {
+          if (intent.retryOfRequestId !== null || requestStarts.has(intent.requestId)) fail(event, index, "reducer.request-backlink");
+        } else {
+          const started = requestStarts.get(intent.requestId);
+          const predecessor = intent.retryOfRequestId === null ? undefined : requests.get(intent.retryOfRequestId);
+          if (!started || !predecessor || started.attemptId !== intent.attemptId || started.ordinal !== intent.physicalAttemptOrdinal
+            || started.schedule.event.payload.failedRequestId !== intent.retryOfRequestId
+            || !sameRequestIdentity(predecessor.intent, intent)) fail(event, index, "reducer.request-start-link");
+        }
+        const seriesOrdinal = `${intent.logicalRequestId}\0${intent.physicalAttemptOrdinal}`;
+        if (requestSeriesOrdinals.has(seriesOrdinal)) fail(event, index, "reducer.request-ordinal");
+        const mutable: MutableRequest = { intent, intentEvent: event, result: null, resultSeq: null, quarantined: false };
+        requests.set(intent.requestId, mutable);
+        requestSeriesOrdinals.set(seriesOrdinal, intent.requestId);
+        requestIntentBySeq.set(event.seq, mutable);
+        break;
+      }
+      case "request_result_recorded": {
+        const attempt = requireAttempt(event, index, event.payload.attemptId);
+        recordJournal(event, index);
+        const request = event.payload.request;
+        const linked = requestIntentBySeq.get(event.payload.intentLedgerSeq);
+        if (!linked || linked.result !== null || linked.intent.requestId !== request.requestId) fail(event, index, "reducer.request-intent-link");
+        const matchedIntent = linked!;
+        if (request.attemptId !== event.payload.attemptId || request.executionEpoch !== attempt.record.executionEpoch
+          || !sameRequestIntentResult(matchedIntent.intent, request)) fail(event, index, "reducer.request-intent-mismatch");
+        if (matchedIntent.intentEvent.payload.attemptId !== event.payload.attemptId) fail(event, index, "reducer.request-owner");
+        if (!validRequestOutcome(request)) fail(event, index, "reducer.request-outcome");
+        const cancelSeq = cancelledEpochs.get(request.executionEpoch);
+        if (cancelSeq !== undefined && event.seq > cancelSeq) fail(event, index, "reducer.request-cancelled");
+        matchedIntent.result = request;
+        matchedIntent.resultSeq = event.seq;
+        break;
+      }
+      case "request_retry_scheduled": {
+        if (resumeTransitionPending) fail(event, index, "reducer.resume-transition-pending");
         requireAttempt(event, index, event.payload.attemptId);
+        recordJournal(event, index);
+        if (!reserved("retry-schedule", event.payload.scheduleId) || requestSchedules.has(event.payload.scheduleId)) fail(event, index, "reducer.request-schedule-identity");
+        const predecessor = requests.get(event.payload.failedRequestId);
+        if (!predecessor || (predecessor.result !== null && predecessor.result.status !== "retryable-error") || predecessor.intent.replayPolicy !== "safe-read"
+          || predecessor.intent.logicalRequestId !== event.payload.logicalRequestId
+          || predecessor.intent.physicalAttemptOrdinal + 1 !== event.payload.nextPhysicalAttemptOrdinal) fail(event, index, "reducer.request-schedule-link");
+        const edgeKey = `${event.payload.failedRequestId}\0${event.payload.nextPhysicalAttemptOrdinal}`;
+        const priorEdge = requestScheduleEdges.get(edgeKey);
+        if (priorEdge && !cancelledEpochs.has(priorEdge.executionEpoch)) fail(event, index, "reducer.request-schedule-link");
+        const mutableSchedule = { event, executionEpoch: currentEpoch, startedRequestId: null };
+        requestSchedules.set(event.payload.scheduleId, mutableSchedule);
+        requestScheduleEdges.set(edgeKey, mutableSchedule);
+        break;
+      }
+      case "request_retry_started": {
+        if (resumeTransitionPending) fail(event, index, "reducer.resume-transition-pending");
+        const attempt = requireAttempt(event, index, event.payload.attemptId);
+        recordJournal(event, index);
+        const schedule = requestSchedules.get(event.payload.scheduleId);
+        if (!schedule || schedule.startedRequestId !== null || schedule.event.seq !== event.payload.scheduledFromLedgerSeq
+          || schedule.event.payload.logicalRequestId !== event.payload.logicalRequestId
+          || schedule.event.payload.nextPhysicalAttemptOrdinal !== event.payload.physicalAttemptOrdinal
+          || cancelledEpochs.has(schedule.executionEpoch) || attempt.record.executionEpoch !== currentEpoch
+          || !reserved("request", event.payload.requestId) || requests.has(event.payload.requestId) || requestStarts.has(event.payload.requestId)) {
+          fail(event, index, "reducer.request-retry-start-link");
+        }
+        const matchedSchedule = schedule!;
+        matchedSchedule.startedRequestId = event.payload.requestId;
+        requestStarts.set(event.payload.requestId, { schedule: matchedSchedule, attemptId: event.payload.attemptId, ordinal: event.payload.physicalAttemptOrdinal });
         break;
       }
       case "revision_committed": {
@@ -493,12 +650,32 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
       startedRetries: Object.freeze(startedRetries),
     });
   }
+  const requestOutput = Object.create(null) as Record<string, ReducedRequestState>;
+  const cacheEligibleRequestIds: string[] = [];
+  for (const [requestId, request] of requests) {
+    const cancelSeq = cancelledEpochs.get(request.intent.executionEpoch);
+    const cancelled = cancelSeq !== undefined && (request.resultSeq === null || request.resultSeq > cancelSeq);
+    const cacheEligible = request.result?.status === "success" && !cancelled && !request.quarantined;
+    if (cacheEligible) cacheEligibleRequestIds.push(requestId);
+    requestOutput[requestId] = Object.freeze({
+      requestId,
+      attemptId: request.intent.attemptId,
+      executionEpoch: request.intent.executionEpoch,
+      logicalRequestId: request.intent.logicalRequestId,
+      physicalAttemptOrdinal: request.intent.physicalAttemptOrdinal,
+      status: request.result?.status ?? "intent",
+      cacheEligible,
+      quarantined: cancelled || request.quarantined,
+    });
+  }
   const cancellationOutput = Object.create(null) as Record<string, number>;
   for (const [epoch, seq] of cancelledEpochs) cancellationOutput[String(epoch)] = seq;
   return Object.freeze({
     runState,
     currentEpoch,
     operations: Object.freeze(operationOutput),
+    requests: Object.freeze(requestOutput),
+    cacheEligibleRequestIds: Object.freeze(cacheEligibleRequestIds.sort()),
     cancelledEpochs: Object.freeze(cancellationOutput),
   });
 }
@@ -595,6 +772,49 @@ function isAllowedRunTransition(
 
 function retryEdge(logicalOperationId: string, failedAttemptId: string, nextAttemptOrdinal: number): string {
   return JSON.stringify([logicalOperationId, failedAttemptId, nextAttemptOrdinal]);
+}
+
+function sameRequestIdentity(left: RequestIntentRecord, right: RequestIntentRecord): boolean {
+  return left.logicalRequestId === right.logicalRequestId
+    && left.replayPolicy === right.replayPolicy
+    && left.provider === right.provider
+    && left.operation === right.operation
+    && left.accessPolicySha256 === right.accessPolicySha256
+    && canonicalJson(left.normalizedInput) === canonicalJson(right.normalizedInput);
+}
+
+function sameRequestIntentResult(intent: RequestIntentRecord, result: RequestRecord): boolean {
+  return intent.requestId === result.requestId
+    && intent.attemptId === result.attemptId
+    && intent.executionEpoch === result.executionEpoch
+    && intent.physicalAttemptOrdinal === result.physicalAttemptOrdinal
+    && intent.retryOfRequestId === result.retryOfRequestId
+    && sameRequestIdentity(intent, result as unknown as RequestIntentRecord);
+}
+
+function validRequestOutcome(request: RequestRecord): boolean {
+  if (request.status === "success") {
+    return request.responseSha256 !== null && request.responseFile !== null
+      && request.responseFile.sha256 === request.responseSha256
+      && request.responseFile.relativePath === `.state/request-payloads/${request.responseSha256}`
+      && request.responseFile.decodedBytes === request.decodedBytes
+      && request.errorClass === null;
+  }
+  if (request.status === "partial") return request.errorClass !== null;
+  return request.responseSha256 === null && request.responseFile === null && request.errorClass !== null;
+}
+
+function isAllowedTaskTransition(from: TaskRecord["state"], to: TaskRecord["state"]): boolean {
+  if (from === to) return true;
+  const allowed: Record<TaskRecord["state"], readonly TaskRecord["state"][]> = {
+    open: ["ready", "blocked", "cancelled"],
+    ready: ["running", "blocked", "cancelled"],
+    running: ["ready", "blocked", "resolved", "cancelled"],
+    blocked: ["ready", "cancelled"],
+    resolved: [],
+    cancelled: [],
+  };
+  return allowed[from].includes(to);
 }
 
 function equalField(left: AttemptRecord[keyof AttemptRecord], right: AttemptRecord[keyof AttemptRecord]): boolean {

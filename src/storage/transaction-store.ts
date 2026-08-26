@@ -358,6 +358,7 @@ export async function inspectCanonicalTransactionsReadOnly(
         const verified = await verifyCommittedEvent(root, event, limits, options);
         assertResultManifestLink(result, verified.manifest, ledger.runId, attempt);
         validateCatalogAndReferences(verified.records, catalog, limits);
+        assertCanonicalRequestRecords(verified.records.requests, events);
         verifiedByTransaction.set(event.payload.transactionId, verified);
       }
       if (event.type === "attempt_committed") {
@@ -385,9 +386,12 @@ export async function inspectCanonicalTransactionsReadOnly(
       if (materialized) {
         const verified = await verifyDirectory(root, "committed", transactionId as TransactionId, limits, options);
         assertResultManifestLink(result, verified.manifest, ledger.runId, attempt);
-        validateCatalogAndReferences(verified.records, catalog, limits);
         const decision = recoveryDecisionFor(reduced, attempt.logicalOperationId);
-        if (decision.kind === "finish-transaction" && decision.transactionId === transactionId) pendingCount++;
+        if (decision.kind === "finish-transaction" && decision.transactionId === transactionId) {
+          validateCatalogAndReferences(verified.records, catalog, limits);
+          assertCanonicalRequestRecords(verified.records.requests, events);
+          pendingCount++;
+        }
       } else {
         unmaterializedResultCount++;
       }
@@ -433,6 +437,7 @@ export async function reconcileCanonicalTransactions(
       if (event.type !== "records_committed") continue;
       const verified = await verifyCommittedEvent(root, event, limitsFrom(options), options);
       ledgerCatalog = validateCatalogAndReferences(verified.records, ledgerCatalog, limitsFrom(options));
+      assertCanonicalRequestRecords(verified.records.requests, events);
     }
     const decisions: TransactionReconciliationDecision[] = [];
     for (const [transactionId, result] of results) {
@@ -447,9 +452,10 @@ export async function reconcileCanonicalTransactions(
         if (await pathExists(directory)) {
           const verified = await verifyDirectory(root, "committed", transactionId as TransactionId, limitsFrom(options), options);
           assertResultManifestLink(result, verified.manifest, ledger.runId, attempt);
-          validateCatalogAndReferences(verified.records, ledgerCatalog, limitsFrom(options));
           const decision = recoveryDecisionFor(reduced, attempt.logicalOperationId);
           if (decision.kind === "finish-transaction" && decision.transactionId === transactionId) {
+            validateCatalogAndReferences(verified.records, ledgerCatalog, limitsFrom(options));
+            assertCanonicalRequestRecords(verified.records.requests, events);
             decisions.push(Object.freeze({ kind: "finish-transaction", transactionId: transactionId as TransactionId }));
           }
         }
@@ -774,10 +780,24 @@ function validateCatalogAndReferences(records: Record<CanonicalRecordKind, JsonR
   return catalog;
 }
 
+function assertCanonicalRequestRecords(records: readonly JsonRecord[], events: readonly FoundationLedgerEvent[]): void {
+  const canonicalResults = new Map<string, JsonRecord>();
+  for (const event of events) {
+    if (event.type !== "request_result_recorded") continue;
+    const id = event.payload.request.requestId;
+    if (canonicalResults.has(id)) fail("transaction.invalid-reference");
+    canonicalResults.set(id, event.payload.request as unknown as JsonRecord);
+  }
+  for (const record of records) {
+    const canonical = canonicalResults.get(String(record.requestId));
+    if (!canonical || canonicalJson(canonical) !== canonicalJson(record)) fail("transaction.invalid-reference");
+  }
+}
+
 function sameRequestSeriesIdentity(left: JsonRecord, right: JsonRecord): boolean {
-  return canonicalJson({ attemptId: left.attemptId, executionEpoch: left.executionEpoch, replayPolicy: left.replayPolicy,
+  return canonicalJson({ logicalRequestId: left.logicalRequestId, replayPolicy: left.replayPolicy,
     provider: left.provider, operation: left.operation, normalizedInput: left.normalizedInput, accessPolicySha256: left.accessPolicySha256 })
-    === canonicalJson({ attemptId: right.attemptId, executionEpoch: right.executionEpoch, replayPolicy: right.replayPolicy,
+    === canonicalJson({ logicalRequestId: right.logicalRequestId, replayPolicy: right.replayPolicy,
       provider: right.provider, operation: right.operation, normalizedInput: right.normalizedInput, accessPolicySha256: right.accessPolicySha256 });
 }
 

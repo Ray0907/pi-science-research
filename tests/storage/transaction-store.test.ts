@@ -62,7 +62,7 @@ function request(id = "request-0000000000000001") {
     finalUrl: "https://api.openalex.org/works",
     redirectUrls: [],
     responseSha256: HASH,
-    responseFile: { relativePath: "payloads/a", mediaType: "application/json", decodedBytes: 2, sha256: HASH },
+    responseFile: { relativePath: `.state/request-payloads/${HASH}`, mediaType: "application/json", decodedBytes: 2, sha256: HASH },
     encodedBytes: 2,
     decodedBytes: 2,
     resultSourceIds: ["src-openalex.w1"],
@@ -506,6 +506,13 @@ describe("canonical transaction store", () => {
       retryOfRequestId: "request-0000000000000001", resultSourceIds: ["src-openalex.w1"], ...overrides });
     const retryInput = input({ transactionId: "tx-0000000000000002", sourceResultSeq: 8, sources: [], claims: [], evidence: [], verifications: [], calculations: [], requests: [retry()] });
     await expect(prepareTransaction(firstRoot, retryInput)).resolves.toBeDefined();
+    const crossChildRoot = await root();
+    await committed(crossChildRoot);
+    await expect(prepareTransaction(crossChildRoot, {
+      ...retryInput,
+      attemptId: ATTEMPT_2,
+      requests: [retry({ attemptId: ATTEMPT_2, executionEpoch: 1 })],
+    })).resolves.toBeDefined();
     for (const mutation of [
       { retryOfRequestId: "request-0000000000009999" },
       { retryOfRequestId: "request-0000000000000002" },
@@ -1165,16 +1172,21 @@ function event<T extends FoundationEventType>(type: T, payload: FoundationEventP
 let eventSeq = 1;
 
 function cancelledResultEvents(resumed: boolean): FoundationLedgerEvent[] {
-  const events = baseEvents().slice(0, -1);
+  const events = coreBaseEvents().slice(0, -1);
   eventSeq = 7;
+  events.push(event("state_changed", { from: "created", to: "planning", blocker: null }));
   events.push(event("cancel_requested", { executionEpoch: 0, reason: "user-pause" }));
-  if (resumed) events.push(event("resume_epoch_started", { priorEpoch: 0, executionEpoch: 1, priorCancelSeq: 7, checkpointStage: null, ownerTokenSha256: HASH }));
+  if (resumed) {
+    events.push(event("state_changed", { from: "planning", to: "paused", blocker: null }));
+    events.push(event("resume_epoch_started", { priorEpoch: 0, executionEpoch: 1, priorCancelSeq: 8, checkpointStage: "planning", ownerTokenSha256: HASH }));
+    events.push(event("state_changed", { from: "paused", to: "recovering", blocker: null }));
+  }
   events.push(event("result_recorded", { attemptId: ATTEMPT, resultSha256: HASH, manifestSha256: null, transactionId: TX }));
   return events;
 }
 
 function supersededResultEvents(): FoundationLedgerEvent[] {
-  const events = baseEvents().slice(0, -1);
+  const events = coreBaseEvents().slice(0, -1);
   eventSeq = 7;
   events.push(event("attempt_failed", { attemptId: ATTEMPT, state: "retryable-failed", errorClass: "transient", message: "retry" }));
   events.push(event("identity_reserved", { kind: "retry-schedule", id: RETRY, origin: "parent-generated" }));
@@ -1187,7 +1199,7 @@ function supersededResultEvents(): FoundationLedgerEvent[] {
   return events;
 }
 
-function baseEvents(): FoundationLedgerEvent[] {
+function coreBaseEvents(): FoundationLedgerEvent[] {
   eventSeq = 1;
   return [
     event("run_created", { run: runSnapshot() }),
@@ -1198,4 +1210,18 @@ function baseEvents(): FoundationLedgerEvent[] {
     event("dispatch_started", { attemptId: ATTEMPT, pid: null, requestCorrelation: null }),
     event("result_recorded", { attemptId: ATTEMPT, resultSha256: HASH, manifestSha256: null, transactionId: TX }),
   ];
+}
+
+function baseEvents(): FoundationLedgerEvent[] {
+  const events = coreBaseEvents();
+  const record = request();
+  const { startedAt: _startedAt, endedAt: _endedAt, status: _status, httpStatus: _httpStatus,
+    requestedUrl: _requestedUrl, finalUrl: _finalUrl, redirectUrls: _redirectUrls,
+    responseSha256: _responseSha256, responseFile: _responseFile, encodedBytes: _encodedBytes,
+    decodedBytes: _decodedBytes, resultSourceIds: _resultSourceIds, errorClass: _errorClass, ...identity } = record;
+  events.push(event("identity_reserved", { kind: "request", id: record.requestId, origin: "child-import" }));
+  const intent = event("request_intent_recorded", { attemptId: ATTEMPT, journalLocalSeq: 1, journalEntrySha256: "e".repeat(64), intent: { ...identity, deadlineAt: AT, createdAt: AT } as never });
+  events.push(intent);
+  events.push(event("request_result_recorded", { attemptId: ATTEMPT, journalLocalSeq: 2, journalEntrySha256: "f".repeat(64), intentLedgerSeq: intent.seq, request: record as never }));
+  return events;
 }
