@@ -27,6 +27,7 @@ const TASK_ID = "task-0000000000000001";
 const ATTEMPT_1 = "attempt-0000000000000001";
 const ATTEMPT_2 = "attempt-0000000000000002";
 const RETRY_1 = "retry-0000000000000001";
+const RETRY_2 = "retry-0000000000000002";
 const LOGICAL = "operation-primary";
 const roots: string[] = [];
 
@@ -297,13 +298,74 @@ describe("durable retry scheduling", () => {
     await ledger.close();
   });
 
-  test("schedule after predecessor epoch cancellation appends nothing", async () => {
-    const ledger = await newLedger();
+  test("cancel-before-schedule blocks until resume, then creates an epoch-bound replacement", async () => {
+    const { ledger, path } = await newLedgerWithPath();
     await seedFailed(ledger);
-    await cancelRetryEpoch(ledger, 0, "user-pause");
+    const cancel = await cancelRetryEpoch(ledger, 0, "user-pause");
     const before = (await ledger.readAll()).length;
     expect(await scheduleRetry(ledger, attemptRecord(), policy(), AT, () => 0)).toEqual({ kind: "cancelled", executionEpoch: 0 });
     expect((await ledger.readAll()).length).toBe(before);
+    await ledger.append("resume_epoch_started", { priorEpoch: 0, executionEpoch: 1, priorCancelSeq: cancel.seq, checkpointStage: "researching", ownerTokenSha256: HASH });
+    expect(await scheduleRetry(ledger, attemptRecord(), policy({ scheduleId: () => RETRY_2 }), AT, () => 0)).toMatchObject({ kind: "scheduled", schedule: { scheduleId: RETRY_2 } });
+    expect(recoverRetryState(await ledger.readAll()).schedules[RETRY_2]).toMatchObject({ status: "pending", executionEpoch: 1 });
+    const started = await startScheduledRetry(ledger, RETRY_2, AT, policy());
+    expect(started).toMatchObject({ kind: "started", descriptor: { executionEpoch: 1, retryOfAttemptId: ATTEMPT_1, logicalOperationId: LOGICAL } });
+    await cancelRetryEpoch(ledger, 1, "user-pause");
+    expect(recoverRetryState(await ledger.readAll()).schedules[RETRY_2]).toMatchObject({ status: "cancelled", executionEpoch: 1, startedAttemptId: ATTEMPT_2 });
+    await ledger.close();
+    const reopened = await openEventLedger(path);
+    expect(await startScheduledRetry(reopened, RETRY_2, AT, policy())).toEqual({ kind: "cancelled", executionEpoch: 1 });
+    expect(await scheduleRetry(reopened, attemptRecord(), policy(), AT, () => 0)).toEqual({ kind: "cancelled", executionEpoch: 1 });
+    await reopened.close();
+  });
+
+  test("resume never revives an old schedule and permits one fresh current-epoch edge", async () => {
+    const ledger = await newLedger();
+    await seedFailed(ledger);
+    await scheduleRetry(ledger, attemptRecord(), policy(), AT, () => 0);
+    const cancel = await cancelRetryEpoch(ledger, 0, "user-pause");
+    await ledger.append("resume_epoch_started", { priorEpoch: 0, executionEpoch: 1, priorCancelSeq: cancel.seq, checkpointStage: "researching", ownerTokenSha256: HASH });
+    expect(await startScheduledRetry(ledger, RETRY_1, AT, policy())).toEqual({ kind: "cancelled", executionEpoch: 0 });
+    const replacement = await scheduleRetry(ledger, attemptRecord(), policy({ scheduleId: () => RETRY_2 }), AT, () => 0);
+    expect(replacement).toMatchObject({ kind: "scheduled", schedule: { scheduleId: RETRY_2 } });
+    expect(await scheduleRetry(ledger, attemptRecord(), policy({ scheduleId: () => "retry-0000000000000003" }), AT, () => 0)).toMatchObject({ kind: "already-scheduled", schedule: { scheduleId: RETRY_2 } });
+    expect(recoverRetryState(await ledger.readAll()).schedules).toMatchObject({
+      [RETRY_1]: { status: "cancelled", executionEpoch: 0 },
+      [RETRY_2]: { status: "pending", executionEpoch: 1 },
+    });
+    await ledger.close();
+  });
+
+  test("canonical epoch validation rejects no-run, future, stale, negative, and duplicate cancellation without appending", async () => {
+    const empty = await newLedger();
+    await expect(cancelRetryEpoch(empty, 0, "user-pause")).rejects.toMatchObject({ code: "retry.cancel-epoch" });
+    expect(await empty.readAll()).toEqual([]);
+    await empty.close();
+
+    const ledger = await newLedger();
+    await seedFailed(ledger);
+    const first = createRetryController(ledger);
+    const second = createRetryController(ledger);
+    const before = (await ledger.readAll()).length;
+    const [future, current] = await Promise.allSettled([
+      first.cancel(1, "user-pause"),
+      second.cancel(0, "user-pause"),
+    ]);
+    expect(future).toMatchObject({ status: "rejected", reason: { code: "retry.cancel-epoch" } });
+    expect(current).toMatchObject({ status: "fulfilled", value: { type: "cancel_requested", payload: { executionEpoch: 0 } } });
+    const eventsAfterCancel = await ledger.readAll();
+    expect(eventsAfterCancel).toHaveLength(before + 1);
+    const cancel = eventsAfterCancel.at(-1)!;
+    await ledger.append("resume_epoch_started", { priorEpoch: 0, executionEpoch: 1, priorCancelSeq: cancel.seq, checkpointStage: "researching", ownerTokenSha256: HASH });
+    const afterResume = (await ledger.readAll()).length;
+    await expect(first.cancel(-1, "user-pause")).rejects.toMatchObject({ code: "retry.cancel-epoch" });
+    await expect(second.cancel(0, "user-pause")).rejects.toMatchObject({ code: "retry.cancel-epoch" });
+    await expect(cancelRetryEpoch(ledger, 2, "user-pause")).rejects.toMatchObject({ code: "retry.cancel-epoch" });
+    expect(await ledger.readAll()).toHaveLength(afterResume);
+    await expect(first.cancel(1, "user-pause")).resolves.toMatchObject({ type: "cancel_requested", payload: { executionEpoch: 1 } });
+    const afterLegal = (await ledger.readAll()).length;
+    await expect(second.cancel(1, "user-pause")).rejects.toMatchObject({ code: "retry.cancel-epoch" });
+    expect(await ledger.readAll()).toHaveLength(afterLegal);
     await ledger.close();
   });
 

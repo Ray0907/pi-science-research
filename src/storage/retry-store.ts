@@ -80,6 +80,7 @@ export type RetryStoreErrorCode =
   | "retry.schedule-not-found"
   | "retry.immutable-change"
   | "retry.logical-operation"
+  | "retry.cancel-epoch"
   | "retry.corruption";
 
 export class RetryStoreError extends Error {
@@ -121,8 +122,11 @@ async function scheduleRetryUnlocked(
   if (!sameAttemptSnapshot(canonical, failedAttempt) || failedAttempt.state !== "intent-recorded") throw new RetryStoreError("retry.predecessor");
   if (latestFailure(events, canonical.attemptId) !== "retryable-failed") throw new RetryStoreError("retry.predecessor");
 
-  const cancelledEpochs = collectCancelledEpochs(events);
-  if (cancelledEpochs.has(canonical.executionEpoch)) return Object.freeze({ kind: "cancelled", executionEpoch: canonical.executionEpoch });
+  const epochState = canonicalEpochState(events);
+  if (!epochState.hasRun) throw new RetryStoreError("retry.corruption");
+  if (epochState.cancelledEpochs.has(epochState.currentEpoch)) {
+    return Object.freeze({ kind: "cancelled", executionEpoch: epochState.currentEpoch });
+  }
 
   const operationAttempts = events.flatMap((event) => event.type === "dispatch_intent"
     && event.payload.attempt.logicalOperationId === canonical.logicalOperationId ? [event.payload.attempt] : []);
@@ -140,11 +144,16 @@ async function scheduleRetryUnlocked(
   if (!(activeBudgetMs > 0)) return Object.freeze({ kind: "blocked", code: "retry-budget-exhausted" });
   const availableMs = Math.min(policy.maxDelayMs, activeBudgetMs, deadlineRemainingMs);
 
-  const prior = events.find((event): event is FoundationEventOfType<"retry_scheduled"> => event.type === "retry_scheduled"
-    && event.payload.logicalOperationId === canonical.logicalOperationId
-    && event.payload.failedAttemptId === canonical.attemptId
-    && event.payload.nextAttemptOrdinal === nextAttemptOrdinal);
-  if (prior) return Object.freeze({ kind: "already-scheduled", schedule: scheduleFrom(prior), sourceSeq: prior.seq });
+  const currentSchedule = Object.values(recoverRetryState(events).schedules).find((schedule) =>
+    schedule.executionEpoch === epochState.currentEpoch
+    && schedule.logicalOperationId === canonical.logicalOperationId
+    && schedule.failedAttemptId === canonical.attemptId
+    && schedule.nextAttemptOrdinal === nextAttemptOrdinal);
+  if (currentSchedule) {
+    const source = events[currentSchedule.sourceSeq - 1];
+    if (!source || source.type !== "retry_scheduled") throw new RetryStoreError("retry.corruption");
+    return Object.freeze({ kind: "already-scheduled", schedule: scheduleFrom(source), sourceSeq: source.seq });
+  }
 
   const exponent = Math.max(0, nextAttemptOrdinal - 2);
   const jitterBound = boundedExponential(policy.baseDelayMs, exponent, policy.maxDelayMs);
@@ -281,7 +290,13 @@ export function cancelRetryEpoch(
   return withRetryBoundary(ledger, async () => {
     const events = await ledger.readAll();
     reduceLedgerEvents(events);
-    if (collectCancelledEpochs(events).has(executionEpoch)) throw new RetryStoreError("retry.corruption");
+    const epochState = canonicalEpochState(events);
+    if (!Number.isSafeInteger(executionEpoch) || executionEpoch < 0
+      || !epochState.hasRun
+      || executionEpoch !== epochState.currentEpoch
+      || epochState.cancelledEpochs.has(executionEpoch)) {
+      throw new RetryStoreError("retry.cancel-epoch");
+    }
     return ledger.append("cancel_requested", { executionEpoch, reason });
   });
 }
@@ -328,10 +343,24 @@ function latestFailure(events: readonly FoundationLedgerEvent[], attemptId: stri
   return state;
 }
 
-function collectCancelledEpochs(events: readonly FoundationLedgerEvent[]): Set<number> {
-  const epochs = new Set<number>();
-  for (const event of events) if (event.type === "cancel_requested") epochs.add(event.payload.executionEpoch);
-  return epochs;
+interface CanonicalEpochState {
+  readonly hasRun: boolean;
+  readonly currentEpoch: number;
+  readonly cancelledEpochs: ReadonlySet<number>;
+}
+
+function canonicalEpochState(events: readonly FoundationLedgerEvent[]): CanonicalEpochState {
+  let hasRun = false;
+  let currentEpoch = 0;
+  const cancelledEpochs = new Set<number>();
+  for (const event of events) {
+    if (event.type === "run_created") {
+      hasRun = true;
+      currentEpoch = event.payload.run.executionEpoch;
+    } else if (event.type === "resume_epoch_started") currentEpoch = event.payload.executionEpoch;
+    else if (event.type === "cancel_requested") cancelledEpochs.add(event.payload.executionEpoch);
+  }
+  return { hasRun, currentEpoch, cancelledEpochs };
 }
 
 function canonicalBudget(events: readonly FoundationLedgerEvent[]): RunSnapshot["budget"] {
