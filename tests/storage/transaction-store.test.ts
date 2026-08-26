@@ -531,6 +531,22 @@ describe("canonical transaction store", () => {
     await expectCode(prepareTransaction(cycleRoot, { ...retryInput, requests: [cycleA, cycleB] }), "transaction.invalid-reference");
   });
 
+  test("indexes same-transaction forward request predecessors and discards failed staged additions", async () => {
+    const runRoot = await root();
+    const predecessorId = "request-0000000000000002";
+    const retryId = "request-0000000000000001";
+    const predecessor = { ...request(predecessorId), resultSourceIds: [] };
+    const retryRecord = { ...request(retryId), physicalAttemptOrdinal: 2, retryOfRequestId: predecessorId, resultSourceIds: [] };
+    const value = input({ sources: [], claims: [], evidence: [], verifications: [], calculations: [], requests: [retryRecord, predecessor] });
+    await expect(prepareTransaction(runRoot, value)).resolves.toBeDefined();
+
+    const failedRoot = await root();
+    const duplicateOrdinal = { ...request("request-0000000000000003"), resultSourceIds: [] };
+    await expectCode(prepareTransaction(failedRoot, input({ sources: [], claims: [], evidence: [], verifications: [], calculations: [],
+      requests: [predecessor, duplicateOrdinal] })), "transaction.invalid-reference");
+    await expect(prepareTransaction(failedRoot, input({ sources: [], claims: [], evidence: [], verifications: [], calculations: [], requests: [predecessor] }))).resolves.toBeDefined();
+  });
+
   test("makes duplicate matching commit harmless and different content corruption", async () => {
     const runRoot = await root();
     const first = await committed(runRoot);
@@ -1142,17 +1158,20 @@ describe("read-only transaction race resistance", () => {
       events.push(event("dispatch_started", { attemptId, pid: null, requestCorrelation: null }));
       const result = event("result_recorded", { attemptId, resultSha256: HASH, manifestSha256: null, transactionId });
       events.push(result);
-      const value = input({ schemaVersion: 1, transactionId, attemptId, sourceResultSeq: result.seq, sources: [], claims: [], evidence: [], verifications: [], requests: [], calculations: [] });
+      const sourceId = `src-linear.${suffix}`;
+      const currentSource = { ...source(sourceId, 1, `source-${index}`), retrievalRequestIds: [], metadataProvenance: [],
+        lineage: { studyId: null, cohortIds: [], datasetIds: [], relatedSourceIds: index === 1 ? [] : [`src-linear.${String(index - 1).padStart(16, "0")}`], relationTypes: [] } };
+      const value = input({ schemaVersion: 1, transactionId, attemptId, sourceResultSeq: result.seq, sources: [currentSource], claims: [], evidence: [], verifications: [], requests: [], calculations: [] });
       await prepareTransaction(runRoot, value);
       const ref = await commitTransaction(runRoot, transactionId);
       events.push(event("records_committed", { transactionId, sourceResultSeq: result.seq, transactionManifestPath: ref.relativePath,
-        transactionManifestSha256: ref.sha256, sourceRefs: [], claimRefs: [], evidenceRefs: [], verificationRefs: [], requestIds: [], calculationIds: [] }));
+        transactionManifestSha256: ref.sha256, sourceRefs: [{ sourceId, revision: 1 }], claimRefs: [], evidenceRefs: [], verificationRefs: [], requestIds: [], calculationIds: [] }));
       events.push(event("attempt_committed", { attemptId, transactionId, taskId: TASK, sourceResultSeq: result.seq }));
     }
     const frozen = JSON.stringify(events);
-    const diagnostics = { eventVisits: 0, requestRecordsValidated: 0 };
+    const diagnostics = { eventVisits: 0, requestRecordsValidated: 0, catalogRecordVisits: 0, catalogReferenceVisits: 0, catalogRevisionScans: 0 };
     await expect(inspectCanonicalTransactionsReadOnly(runRoot, events, { requestIndexDiagnostics: diagnostics })).resolves.toMatchObject({ committedCount: count });
-    expect(diagnostics).toEqual({ eventVisits: events.length, requestRecordsValidated: 0 });
+    expect(diagnostics).toEqual({ eventVisits: events.length, requestRecordsValidated: 0, catalogRecordVisits: count, catalogReferenceVisits: count - 1, catalogRevisionScans: 0 });
     expect(JSON.stringify(events)).toBe(frozen);
   });
 

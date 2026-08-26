@@ -99,6 +99,9 @@ export type TransactionProtocolStep =
 export interface RequestIndexDiagnostics {
   eventVisits: number;
   requestRecordsValidated: number;
+  catalogRecordVisits?: number;
+  catalogReferenceVisits?: number;
+  catalogRevisionScans?: number;
 }
 
 export interface TransactionStoreOptions {
@@ -199,8 +202,8 @@ export async function prepareTransaction(
   const snapshot = snapshotTransactionInput(transaction, limits, options);
   const root = await initializeRoot(runRoot, options);
   return withMutationLock(root, options, async () => {
-    const catalog = await loadReferenceCatalog(root, limits, snapshot.transactionId);
-    const built = buildTransaction(snapshot, limits, catalog);
+    const catalog = await loadReferenceCatalog(root, limits, snapshot.transactionId, options.requestIndexDiagnostics);
+    const built = buildTransaction(snapshot, limits, catalog, options.requestIndexDiagnostics);
     const committedPath = transactionDirectory(root, "committed", built.manifest.transactionId);
     if (await pathExists(committedPath)) {
       const verified = await verifyDirectory(root, "committed", built.manifest.transactionId, limits, options);
@@ -267,8 +270,8 @@ export async function commitTransaction(
       if (error instanceof TransactionStoreError && error.code === "transaction.missing-object") fail("transaction.not-prepared");
       throw error;
     });
-    const catalog = await loadReferenceCatalog(root, limits, transactionId);
-    validateCatalogAndReferences(staged.records, catalog, limits);
+    const catalog = await loadReferenceCatalog(root, limits, transactionId, options.requestIndexDiagnostics);
+    validateCatalogAndReferences(staged.records, catalog, limits, options.requestIndexDiagnostics);
     const stagePath = transactionDirectory(root, ".staging", transactionId);
     await protocolStep("before-rename", options);
     await assertPinnedHierarchy(guard, "before-rename", options);
@@ -356,6 +359,7 @@ export async function inspectCanonicalTransactionsReadOnly(
       if (event.type === "attempt_committed") attemptCommits.add(event.payload.transactionId);
     }
     const verifiedByTransaction = new Map<string, VerifiedTransaction>();
+    const acceptedVerified: VerifiedTransaction[] = [];
     const catalog = emptyCatalog();
     for (const event of events) {
       if (event.type === "records_committed") {
@@ -364,15 +368,18 @@ export async function inspectCanonicalTransactionsReadOnly(
         if (!result || !attempt) fail("transaction.corrupt");
         const verified = await verifyCommittedEvent(root, event, limits, options);
         assertResultManifestLink(result, verified.manifest, ledger.runId, attempt);
-        validateCatalogAndReferences(verified.records, catalog, limits);
         assertCanonicalRequestRecords(verified.records.requests, requestIndex, options.requestIndexDiagnostics);
         verifiedByTransaction.set(event.payload.transactionId, verified);
       }
       if (event.type === "attempt_committed") {
         const verified = verifiedByTransaction.get(event.payload.transactionId);
         if (!verified) fail("transaction.corrupt");
-        addRecordsToCatalog(verified.records, catalog, true);
+        acceptedVerified.push(verified);
       }
+    }
+    acceptedVerified.sort((left, right) => left.manifest.sourceResultSeq - right.manifest.sourceResultSeq);
+    for (const verified of acceptedVerified) {
+      validateCatalogAndReferences(verified.records, catalog, limits, options.requestIndexDiagnostics);
     }
     let pendingCount = 0;
     let unmaterializedResultCount = 0;
@@ -395,7 +402,7 @@ export async function inspectCanonicalTransactionsReadOnly(
         assertResultManifestLink(result, verified.manifest, ledger.runId, attempt);
         const decision = recoveryDecisionFor(reduced, attempt.logicalOperationId);
         if (decision.kind === "finish-transaction" && decision.transactionId === transactionId) {
-          validateCatalogAndReferences(verified.records, catalog, limits);
+          validateCatalogAndReferences(verified.records, catalog, limits, options.requestIndexDiagnostics, false);
           assertCanonicalRequestRecords(verified.records.requests, requestIndex, options.requestIndexDiagnostics);
           pendingCount++;
         }
@@ -440,12 +447,18 @@ export async function reconcileCanonicalTransactions(
       if (event.type === "result_recorded") results.set(event.payload.transactionId, event);
       if (event.type === "records_committed") commits.set(event.payload.transactionId, event);
     }
-    let ledgerCatalog = emptyCatalog();
+    const ledgerCatalog = emptyCatalog();
+    const accepted = new Set(events.filter((event) => event.type === "attempt_committed").map((event) => event.payload.transactionId));
+    const committedObjects: VerifiedTransaction[] = [];
     for (const event of events) {
       if (event.type !== "records_committed") continue;
       const verified = await verifyCommittedEvent(root, event, limitsFrom(options), options);
-      ledgerCatalog = validateCatalogAndReferences(verified.records, ledgerCatalog, limitsFrom(options));
       assertCanonicalRequestRecords(verified.records.requests, requestIndex, options.requestIndexDiagnostics);
+      if (accepted.has(event.payload.transactionId)) committedObjects.push(verified);
+    }
+    committedObjects.sort((left, right) => left.manifest.sourceResultSeq - right.manifest.sourceResultSeq);
+    for (const verified of committedObjects) {
+      validateCatalogAndReferences(verified.records, ledgerCatalog, limitsFrom(options), options.requestIndexDiagnostics);
     }
     const decisions: TransactionReconciliationDecision[] = [];
     for (const [transactionId, result] of results) {
@@ -462,7 +475,7 @@ export async function reconcileCanonicalTransactions(
           assertResultManifestLink(result, verified.manifest, ledger.runId, attempt);
           const decision = recoveryDecisionFor(reduced, attempt.logicalOperationId);
           if (decision.kind === "finish-transaction" && decision.transactionId === transactionId) {
-            validateCatalogAndReferences(verified.records, ledgerCatalog, limitsFrom(options));
+            validateCatalogAndReferences(verified.records, ledgerCatalog, limitsFrom(options), options.requestIndexDiagnostics, false);
             assertCanonicalRequestRecords(verified.records.requests, requestIndex, options.requestIndexDiagnostics);
             decisions.push(Object.freeze({ kind: "finish-transaction", transactionId: transactionId as TransactionId }));
           }
@@ -588,7 +601,7 @@ function snapshotTransactionInput(input: CanonicalTransactionInput, limits: Limi
   }
 }
 
-function buildTransaction(input: CanonicalTransactionInput, limits: Limits, catalog: ReferenceCatalog): BuiltTransaction {
+function buildTransaction(input: CanonicalTransactionInput, limits: Limits, catalog: ReferenceCatalog, diagnostics?: RequestIndexDiagnostics): BuiltTransaction {
   validateInputRoot(input);
   const manifestFiles: CanonicalTransactionManifest["files"] = [];
   const recordsByKind = Object.create(null) as Record<CanonicalRecordKind, JsonRecord[]>;
@@ -609,7 +622,7 @@ function buildTransaction(input: CanonicalTransactionInput, limits: Limits, cata
     if (transactionBytes > limits.maxTransactionBytes) fail("transaction.file-too-large");
     manifestFiles.push({ kind, relativePath: `${kind}.jsonl`, recordCount: records.length, decodedBytes, sha256: hash.digest("hex") });
   }
-  validateCatalogAndReferences(recordsByKind, catalog, limits);
+  validateCatalogAndReferences(recordsByKind, catalog, limits, diagnostics);
   const refs = referencesFrom(recordsByKind);
   const manifest: CanonicalTransactionManifest = {
     schemaVersion: 1,
@@ -697,13 +710,28 @@ function referencesFrom(records: Record<CanonicalRecordKind, JsonRecord[]>): Pic
   };
 }
 
-type ReferenceCatalog = Record<CanonicalRecordKind, Map<string, Map<number, string>>>;
-
-function emptyCatalog(): ReferenceCatalog {
-  return Object.fromEntries(KINDS.map((kind) => [kind, new Map()])) as ReferenceCatalog;
+interface ReferenceCatalog {
+  readonly revisions: Record<CanonicalRecordKind, Map<string, Map<number, string>>>;
+  readonly highestRevision: Record<CanonicalRecordKind, Map<string, number>>;
+  readonly requestById: Map<string, JsonRecord>;
+  readonly requestSeriesOrdinal: Map<string, string>;
 }
 
-async function loadReferenceCatalog(root: string, limits: Limits, excludeTransactionId: string): Promise<ReferenceCatalog> {
+function emptyCatalog(): ReferenceCatalog {
+  return {
+    revisions: Object.fromEntries(KINDS.map((kind) => [kind, new Map()])) as ReferenceCatalog["revisions"],
+    highestRevision: Object.fromEntries(KINDS.map((kind) => [kind, new Map()])) as ReferenceCatalog["highestRevision"],
+    requestById: new Map(),
+    requestSeriesOrdinal: new Map(),
+  };
+}
+
+async function loadReferenceCatalog(
+  root: string,
+  limits: Limits,
+  excludeTransactionId: string,
+  diagnostics?: RequestIndexDiagnostics,
+): Promise<ReferenceCatalog> {
   const directory = join(root, ".state/transactions/committed");
   const entries = await readdir(directory, { withFileTypes: true }).catch(() => fail("transaction.io-failed"));
   const transactions: VerifiedTransaction[] = [];
@@ -712,26 +740,54 @@ async function loadReferenceCatalog(root: string, limits: Limits, excludeTransac
     if (entry.name !== excludeTransactionId) transactions.push(await verifyDirectory(root, "committed", entry.name, limits));
   }
   transactions.sort((left, right) => left.manifest.sourceResultSeq - right.manifest.sourceResultSeq);
-  let catalog = emptyCatalog();
-  for (const transaction of transactions) catalog = validateCatalogAndReferences(transaction.records, catalog, limits);
+  const catalog = emptyCatalog();
+  for (const transaction of transactions) validateCatalogAndReferences(transaction.records, catalog, limits, diagnostics);
   return catalog;
 }
 
-function validateCatalogAndReferences(records: Record<CanonicalRecordKind, JsonRecord[]>, prior: ReferenceCatalog, limits: Limits): ReferenceCatalog {
-  const catalog = emptyCatalog();
+function validateCatalogAndReferences(
+  records: Record<CanonicalRecordKind, JsonRecord[]>,
+  catalog: ReferenceCatalog,
+  limits: Limits,
+  diagnostics?: RequestIndexDiagnostics,
+  apply = true,
+): void {
+  const staged = emptyCatalog();
   for (const kind of KINDS) {
-    for (const [id, revisions] of prior[kind]) catalog[kind].set(id, new Map(revisions));
+    const metadata = KIND_ID[kind];
+    for (const record of records[kind]) {
+      if (diagnostics) diagnostics.catalogRecordVisits = (diagnostics.catalogRecordVisits ?? 0) + 1;
+      const id = String(record[metadata.field]);
+      const revision = metadata.revision ? Number(record.revision) : 0;
+      if (catalog.revisions[kind].get(id)?.has(revision) || staged.revisions[kind].get(id)?.has(revision)) fail("transaction.duplicate-record");
+      const priorHighest = staged.highestRevision[kind].get(id) ?? catalog.highestRevision[kind].get(id) ?? 0;
+      if (metadata.revision && revision !== priorHighest + 1) fail("transaction.invalid-reference");
+      if (!metadata.revision && (catalog.revisions[kind].has(id) || staged.revisions[kind].has(id))) fail("transaction.duplicate-record");
+      let revisions = staged.revisions[kind].get(id);
+      if (!revisions) { revisions = new Map(); staged.revisions[kind].set(id, revisions); }
+      revisions.set(revision, canonicalJson(record));
+      staged.highestRevision[kind].set(id, revision);
+      if (kind === "requests") {
+        const seriesOrdinal = `${String(record.logicalRequestId)}\0${String(record.physicalAttemptOrdinal)}`;
+        if (catalog.requestSeriesOrdinal.has(seriesOrdinal) || staged.requestSeriesOrdinal.has(seriesOrdinal)) fail("transaction.invalid-reference");
+        staged.requestById.set(id, record);
+        staged.requestSeriesOrdinal.set(seriesOrdinal, id);
+      }
+    }
   }
-  addRecordsToCatalog(records, catalog, true);
   let referenceCount = 0;
-  const countReference = () => { if (++referenceCount > limits.maxReferences) fail("transaction.too-many-records"); };
+  const countReference = () => {
+    referenceCount += 1;
+    if (diagnostics) diagnostics.catalogReferenceVisits = (diagnostics.catalogReferenceVisits ?? 0) + 1;
+    if (referenceCount > limits.maxReferences) fail("transaction.too-many-records");
+  };
   const exact = (kind: CanonicalRecordKind, id: unknown, revision = 0) => {
     countReference();
-    if (typeof id !== "string" || !catalog[kind].get(id)?.has(revision)) fail("transaction.invalid-reference");
+    if (typeof id !== "string" || !(staged.revisions[kind].get(id)?.has(revision) || catalog.revisions[kind].get(id)?.has(revision))) fail("transaction.invalid-reference");
   };
   const stable = (kind: CanonicalRecordKind, id: unknown) => {
     countReference();
-    if (typeof id !== "string" || !catalog[kind].has(id)) fail("transaction.invalid-reference");
+    if (typeof id !== "string" || !(staged.revisions[kind].has(id) || catalog.revisions[kind].has(id))) fail("transaction.invalid-reference");
   };
   for (const source of records.sources) {
     for (const id of source.retrievalRequestIds as string[]) stable("requests", id);
@@ -750,17 +806,6 @@ function validateCatalogAndReferences(records: Record<CanonicalRecordKind, JsonR
     if (evidence.calculationId !== null) stable("calculations", evidence.calculationId);
     for (const id of evidence.conflictsWith as string[]) stable("evidence", id);
   }
-  const requestsById = new Map<string, JsonRecord>();
-  const requestSeriesOrdinals = new Map<string, string>();
-  for (const [requestId, revisions] of catalog.requests) {
-    const encoded = revisions.get(0);
-    if (!encoded) fail("transaction.invalid-reference");
-    const requestRecord = JSON.parse(encoded) as JsonRecord;
-    requestsById.set(requestId, requestRecord);
-    const seriesOrdinal = `${String(requestRecord.logicalRequestId)}\0${String(requestRecord.physicalAttemptOrdinal)}`;
-    if (requestSeriesOrdinals.has(seriesOrdinal)) fail("transaction.invalid-reference");
-    requestSeriesOrdinals.set(seriesOrdinal, requestId);
-  }
   for (const request of records.requests) {
     for (const sourceId of request.resultSourceIds as string[]) stable("sources", sourceId);
     const ordinal = request.physicalAttemptOrdinal as number;
@@ -771,9 +816,8 @@ function validateCatalogAndReferences(records: Record<CanonicalRecordKind, JsonR
     }
     if (predecessorId === null || predecessorId === request.requestId) fail("transaction.invalid-reference");
     countReference();
-    const predecessor = requestsById.get(predecessorId);
-    if (!predecessor) fail("transaction.invalid-reference");
-    if (predecessor.logicalRequestId !== request.logicalRequestId
+    const predecessor = staged.requestById.get(predecessorId) ?? catalog.requestById.get(predecessorId);
+    if (!predecessor || predecessor.logicalRequestId !== request.logicalRequestId
       || predecessor.physicalAttemptOrdinal !== ordinal - 1
       || !sameRequestSeriesIdentity(predecessor, request)) fail("transaction.invalid-reference");
   }
@@ -785,7 +829,20 @@ function validateCatalogAndReferences(records: Record<CanonicalRecordKind, JsonR
     for (const item of verification.corrections as { claimId: string }[]) stable("claims", item.claimId);
     for (const id of verification.independentEvidenceIds as string[]) stable("evidence", id);
   }
-  return catalog;
+  if (apply) applyCatalogAdditions(catalog, staged);
+}
+
+function applyCatalogAdditions(catalog: ReferenceCatalog, staged: ReferenceCatalog): void {
+  for (const kind of KINDS) {
+    for (const [id, additions] of staged.revisions[kind]) {
+      let revisions = catalog.revisions[kind].get(id);
+      if (!revisions) { revisions = new Map(); catalog.revisions[kind].set(id, revisions); }
+      for (const [revision, encoded] of additions) revisions.set(revision, encoded);
+      catalog.highestRevision[kind].set(id, staged.highestRevision[kind].get(id)!);
+    }
+  }
+  for (const [id, record] of staged.requestById) catalog.requestById.set(id, record);
+  for (const [key, id] of staged.requestSeriesOrdinal) catalog.requestSeriesOrdinal.set(key, id);
 }
 
 interface CanonicalRequestIndex {
@@ -850,26 +907,6 @@ function sameRequestSeriesIdentity(left: JsonRecord, right: JsonRecord): boolean
     provider: left.provider, operation: left.operation, normalizedInput: left.normalizedInput, accessPolicySha256: left.accessPolicySha256 })
     === canonicalJson({ logicalRequestId: right.logicalRequestId, replayPolicy: right.replayPolicy,
       provider: right.provider, operation: right.operation, normalizedInput: right.normalizedInput, accessPolicySha256: right.accessPolicySha256 });
-}
-
-function addRecordsToCatalog(records: Record<CanonicalRecordKind, JsonRecord[]>, catalog: ReferenceCatalog, enforceProgression: boolean): void {
-  for (const kind of KINDS) {
-    const metadata = KIND_ID[kind];
-    for (const record of records[kind]) {
-      const id = String(record[metadata.field]);
-      const revision = metadata.revision ? Number(record.revision) : 0;
-      let revisions = catalog[kind].get(id);
-      if (!revisions) { revisions = new Map(); catalog[kind].set(id, revisions); }
-      if (revisions.has(revision)) fail("transaction.duplicate-record");
-      if (enforceProgression && metadata.revision) {
-        let highest = 0;
-        for (const priorRevision of revisions.keys()) if (priorRevision > highest) highest = priorRevision;
-        if (revision !== highest + 1) fail("transaction.invalid-reference");
-      }
-      if (enforceProgression && !metadata.revision && revisions.size > 0) fail("transaction.duplicate-record");
-      revisions.set(revision, canonicalJson(record));
-    }
-  }
 }
 
 interface PinnedTransactionDirectory {
