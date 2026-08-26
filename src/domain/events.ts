@@ -72,6 +72,65 @@ const RunStateSchema = StringEnum([
 ] as const);
 const CheckpointStageSchema = StringEnum(["planning", "researching", "verifying", "synthesizing"] as const);
 
+export const CalculationFileRecordSchema = Type.Object({
+  relativePath: Type.String({ minLength: 1 }),
+  mediaType: Type.String(),
+  decodedBytes: NonNegativeIntegerSchema,
+  sha256: Sha256Schema,
+}, closed);
+export type CalculationFileRecord = Static<typeof CalculationFileRecordSchema>;
+
+const RequestParameterSchema = Type.Object({ name: Type.String(), value: Type.String() }, closed);
+const NormalizedRequestInputSchema = Type.Object({
+  query: Type.Union([Type.String(), Type.Null()]),
+  identifier: Type.Union([Type.String(), Type.Null()]),
+  url: Type.Union([Type.String(), Type.Null()]),
+  parameters: Type.Array(RequestParameterSchema),
+}, closed);
+const RequestProviderSchema = StringEnum(["openalex", "crossref", "pubmed", "pmc", "semantic-scholar", "unpaywall", "web"] as const);
+const RequestOperationSchema = StringEnum(["search", "fetch", "resolve"] as const);
+const RequestReplayPolicySchema = StringEnum(["safe-read", "never"] as const);
+
+const requestIdentityProperties = {
+  schemaVersion: Type.Literal(1),
+  requestId: RequestIdSchema,
+  attemptId: AttemptIdSchema,
+  executionEpoch: NonNegativeIntegerSchema,
+  logicalRequestId: Type.String(),
+  physicalAttemptOrdinal: PositiveIntegerSchema,
+  retryOfRequestId: Type.Union([RequestIdSchema, Type.Null()]),
+  replayPolicy: RequestReplayPolicySchema,
+  provider: RequestProviderSchema,
+  operation: RequestOperationSchema,
+  normalizedInput: NormalizedRequestInputSchema,
+  accessPolicySha256: Sha256Schema,
+} as const;
+
+export const RequestIntentRecordSchema = Type.Object({
+  ...requestIdentityProperties,
+  deadlineAt: TimestampSchema,
+  createdAt: TimestampSchema,
+}, closed);
+export type RequestIntentRecord = Static<typeof RequestIntentRecordSchema>;
+
+export const RequestRecordSchema = Type.Object({
+  ...requestIdentityProperties,
+  startedAt: TimestampSchema,
+  endedAt: TimestampSchema,
+  status: StringEnum(["success", "partial", "retryable-error", "terminal-error", "cancelled"] as const),
+  httpStatus: Type.Union([NonNegativeIntegerSchema, Type.Null()]),
+  requestedUrl: Type.Union([Type.String(), Type.Null()]),
+  finalUrl: Type.Union([Type.String(), Type.Null()]),
+  redirectUrls: Type.Array(Type.String()),
+  responseSha256: Type.Union([Sha256Schema, Type.Null()]),
+  responseFile: Type.Union([CalculationFileRecordSchema, Type.Null()]),
+  encodedBytes: NonNegativeIntegerSchema,
+  decodedBytes: NonNegativeIntegerSchema,
+  resultSourceIds: Type.Array(SourceIdSchema),
+  errorClass: Type.Union([Type.String(), Type.Null()]),
+}, closed);
+export type RequestRecord = Static<typeof RequestRecordSchema>;
+
 const payloadSchemas = {
   identity_reserved: Type.Object({
     kind: ReservedIdentityKindSchema,
@@ -121,6 +180,41 @@ const payloadSchemas = {
     resultSha256: Sha256Schema,
     manifestSha256: Type.Union([Sha256Schema, Type.Null()]),
     transactionId: TransactionIdSchema,
+  }, closed),
+  request_intent_recorded: Type.Object({
+    attemptId: AttemptIdSchema,
+    journalLocalSeq: PositiveIntegerSchema,
+    journalEntrySha256: Sha256Schema,
+    intent: RequestIntentRecordSchema,
+  }, closed),
+  request_result_recorded: Type.Object({
+    attemptId: AttemptIdSchema,
+    journalLocalSeq: PositiveIntegerSchema,
+    journalEntrySha256: Sha256Schema,
+    intentLedgerSeq: PositiveIntegerSchema,
+    request: RequestRecordSchema,
+  }, closed),
+  request_retry_scheduled: Type.Object({
+    scheduleId: RetryScheduleIdSchema,
+    attemptId: AttemptIdSchema,
+    journalLocalSeq: PositiveIntegerSchema,
+    journalEntrySha256: Sha256Schema,
+    logicalRequestId: Type.String(),
+    failedRequestId: RequestIdSchema,
+    nextPhysicalAttemptOrdinal: PositiveIntegerSchema,
+    notBeforeAt: TimestampSchema,
+    delayMs: NonNegativeNumberSchema,
+    reasonClass: Type.String(),
+  }, closed),
+  request_retry_started: Type.Object({
+    scheduleId: RetryScheduleIdSchema,
+    attemptId: AttemptIdSchema,
+    journalLocalSeq: PositiveIntegerSchema,
+    journalEntrySha256: Sha256Schema,
+    logicalRequestId: Type.String(),
+    requestId: RequestIdSchema,
+    physicalAttemptOrdinal: PositiveIntegerSchema,
+    scheduledFromLedgerSeq: PositiveIntegerSchema,
   }, closed),
   records_committed: Type.Object({
     transactionId: TransactionIdSchema,
@@ -234,6 +328,14 @@ export type FoundationLedgerEvent = {
 export type FoundationEventOfType<T extends FoundationEventType> = Extract<FoundationLedgerEvent, { type: T }>;
 export type FoundationEventPayload<T extends FoundationEventType> = FoundationPayloadMap[T];
 
+registerRefinement(CalculationFileRecordSchema, (input) => {
+  const value = input as CalculationFileRecord;
+  return isPortableRelativePath(value.relativePath) ? [] : [issue("/relativePath", "request.relative-path")];
+});
+
+registerRefinement(RequestIntentRecordSchema, (input) => requestRecordIssues(input as RequestIntentRecord, ["deadlineAt", "createdAt"]));
+registerRefinement(RequestRecordSchema, (input) => requestRecordIssues(input as RequestRecord, ["startedAt", "endedAt"]));
+
 registerRefinement(FoundationLedgerEventSchema, (input) => {
   const event = input as FoundationLedgerEvent;
   const issues = isTimestamp(event.occurredAt) ? [] : [issue("/occurredAt", "ledger.timestamp")];
@@ -249,10 +351,36 @@ registerRefinement(FoundationLedgerEventSchema, (input) => {
   } else if (event.type === "active_time_checkpoint") {
     if (!isTimestamp(event.payload.intervalStartedAt)) issues.push(issue("/payload/intervalStartedAt", "ledger.timestamp"));
     if (!isTimestamp(event.payload.intervalEndedAt)) issues.push(issue("/payload/intervalEndedAt", "ledger.timestamp"));
-  } else if (event.type === "retry_scheduled" && !isTimestamp(event.payload.notBeforeAt)) {
+  } else if ((event.type === "retry_scheduled" || event.type === "request_retry_scheduled") && !isTimestamp(event.payload.notBeforeAt)) {
     issues.push(issue("/payload/notBeforeAt", "ledger.timestamp"));
+  } else if (event.type === "request_intent_recorded" && event.payload.attemptId !== event.payload.intent.attemptId) {
+    issues.push(issue("/payload/intent/attemptId", "request.attempt-mismatch"));
+  } else if (event.type === "request_result_recorded" && event.payload.attemptId !== event.payload.request.attemptId) {
+    issues.push(issue("/payload/request/attemptId", "request.attempt-mismatch"));
   } else if (event.type === "run_completed" && !isTimestamp(event.payload.completedAt)) {
     issues.push(issue("/payload/completedAt", "ledger.timestamp"));
   }
   return issues;
 });
+
+function requestRecordIssues(
+  value: RequestIntentRecord | RequestRecord,
+  timestampKeys: readonly ("deadlineAt" | "createdAt" | "startedAt" | "endedAt")[],
+) {
+  const timestampValues = value as unknown as Record<string, unknown>;
+  const issues = timestampKeys.flatMap((key) => isTimestamp(timestampValues[key]) ? [] : [issue(`/${key}`, "request.timestamp")]);
+  if ((value.physicalAttemptOrdinal === 1) !== (value.retryOfRequestId === null)) {
+    issues.push(issue("/retryOfRequestId", "request.retry-backlink"));
+  }
+  if (value.retryOfRequestId === value.requestId && value.retryOfRequestId !== null) {
+    issues.push(issue("/retryOfRequestId", "request.self-retry"));
+  }
+  return issues;
+}
+
+function isPortableRelativePath(path: string): boolean {
+  return !path.startsWith("/")
+    && !/^[a-z]:/i.test(path)
+    && !path.includes("\\")
+    && path.split("/").every((segment) => segment !== "" && segment !== "." && segment !== "..");
+}

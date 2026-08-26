@@ -1,6 +1,6 @@
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { link, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { canonicalJson } from "../../src/crypto/canonical-json.js";
@@ -10,13 +10,17 @@ import {
   FOUNDATION_EVENT_TYPES,
   openEventLedger,
   type DurabilityReason,
+  type EventLedger,
 } from "../../src/storage/event-ledger.js";
 
 const TIMESTAMP = "2026-08-25T12:00:00.000Z";
 const ZERO_HASH = "0".repeat(64);
+const SHA_A = "a".repeat(64);
+const SHA_B = "b".repeat(64);
 const ids = {
   attempt: "attempt-0000000000000001",
   request: "request-0000000000000001",
+  request2: "request-0000000000000002",
   retry: "retry-0000000000000001",
   transaction: "tx-0000000000000001",
   revision: "rev-20260825T120000000Z-000000000001",
@@ -301,6 +305,26 @@ describe("append-only event ledger", () => {
     await reopened.close();
   });
 
+  test("rejects concurrent opens through hard links and symlinked parent aliases, then releases physical identity", async () => {
+    const path = await ledgerPath();
+    const root = dirname(path);
+    const hardLinkPath = join(root, "hard-link.jsonl");
+    const parentAlias = join(root, "parent-alias");
+    const parentAliasPath = join(parentAlias, "events.jsonl");
+    const first = await openEventLedger(path, deterministicOptions());
+    await link(path, hardLinkPath);
+    await symlink(root, parentAlias, "dir");
+
+    await expect(openEventLedger(hardLinkPath, deterministicOptions())).rejects.toMatchObject({ code: "ledger.already-open" });
+    await expect(openEventLedger(parentAliasPath, deterministicOptions())).rejects.toMatchObject({ code: "ledger.already-open" });
+    await first.close();
+
+    const hardReopen = await openEventLedger(hardLinkPath, deterministicOptions());
+    await hardReopen.close();
+    const parentAliasReopen = await openEventLedger(parentAliasPath, deterministicOptions());
+    await parentAliasReopen.close();
+  });
+
   test("does not follow a symlink ledger leaf", async () => {
     const path = await ledgerPath();
     const target = join(path, "..", "target.jsonl");
@@ -322,11 +346,128 @@ describe("append-only event ledger", () => {
     await ledger.close();
   });
 
+  test("snapshots nested append input before queue and durability awaits", async () => {
+    const path = await ledgerPath();
+    const seed = await openEventLedger(path, deterministicOptions());
+    await seed.reserveIdentity("attempt", ids.attempt, "parent-generated");
+    await seed.reserveIdentity("request", ids.request, "parent-generated");
+    await seed.close();
+
+    let release!: () => void;
+    const waiting = new Promise<void>((resolve) => { release = resolve; });
+    let durabilityReached = false;
+    const ledger = await openEventLedger(path, {
+      now: () => new Date(TIMESTAMP),
+      eventId: () => "snapshot-event",
+      durability: async () => {
+        durabilityReached = true;
+        await waiting;
+      },
+    });
+    const payload = requestIntentEventPayload();
+    const original = structuredClone(payload);
+    const append = ledger.append("request_intent_recorded", payload);
+    payload.intent.normalizedInput.query = "mutated-before-queue";
+    await vi.waitFor(() => expect(durabilityReached).toBe(true));
+    payload.intent.normalizedInput.parameters[0]!.value = "mutated-during-durability";
+    payload.intent.normalizedInput.parameters.push({ name: "secret", value: "changed" });
+
+    release();
+    const returned = await append;
+    expect(returned.payload).toEqual(original);
+    const readBack = await ledger.readAll();
+    expect(readBack.at(-1)?.payload).toEqual(original);
+    await expect(ledger.verify()).resolves.toBeUndefined();
+    await ledger.close();
+
+    const lines = (await readFile(path, "utf8")).trimEnd().split("\n");
+    expect(JSON.parse(lines.at(-1)!).payload).toEqual(original);
+    const reopened = await openEventLedger(path, deterministicOptions());
+    expect((await reopened.readAll()).at(-1)?.payload).toEqual(original);
+    await reopened.close();
+  });
+
+  test("appends and reopens all closed canonical request events", async () => {
+    const path = await ledgerPath();
+    const ledger = await openEventLedger(path, deterministicOptions());
+    await reserveRequestEventIdentities(ledger);
+
+    await ledger.append("request_intent_recorded", requestIntentEventPayload());
+    await ledger.append("request_result_recorded", requestResultEventPayload());
+    await ledger.append("request_retry_scheduled", requestRetryScheduledPayload());
+    await ledger.append("request_retry_started", requestRetryStartedPayload());
+    await ledger.close();
+
+    const reopened = await openEventLedger(path, deterministicOptions({ eventId: () => "reopen-unused" }));
+    const requestEvents = (await reopened.readAll()).slice(-4);
+    expect(requestEvents.map((event) => event.type)).toEqual([
+      "request_intent_recorded",
+      "request_result_recorded",
+      "request_retry_scheduled",
+      "request_retry_started",
+    ]);
+    expect(requestEvents[1]?.type === "request_result_recorded" && requestEvents[1].payload.request.responseFile).toEqual({
+      relativePath: "request-payloads/response.json",
+      mediaType: "application/json",
+      decodedBytes: 128,
+      sha256: SHA_B,
+    });
+    await reopened.close();
+  });
+
+  test("rejects unknown, missing, and nested-extra properties for every request event", async () => {
+    const path = await ledgerPath();
+    const ledger = await openEventLedger(path, deterministicOptions());
+    await reserveRequestEventIdentities(ledger);
+    const cases = [
+      ["request_intent_recorded", requestIntentEventPayload(), "journalLocalSeq"],
+      ["request_result_recorded", requestResultEventPayload(), "intentLedgerSeq"],
+      ["request_retry_scheduled", requestRetryScheduledPayload(), "delayMs"],
+      ["request_retry_started", requestRetryStartedPayload(), "scheduledFromLedgerSeq"],
+    ] as const;
+
+    for (const [type, valid, required] of cases) {
+      await expectLedgerCode(ledger.append(type, { ...valid, unknown: "SECRET" } as never), "event.schema-invalid");
+      const missing = structuredClone(valid) as Record<string, unknown>;
+      delete missing[required];
+      await expectLedgerCode(ledger.append(type, missing as never), "event.schema-invalid");
+    }
+
+    const intentNested = requestIntentEventPayload();
+    (intentNested.intent.normalizedInput.parameters[0] as { name: string; value: string; extra?: boolean }).extra = true;
+    await expectLedgerCode(ledger.append("request_intent_recorded", intentNested), "event.schema-invalid");
+    const resultNested = requestResultEventPayload();
+    (resultNested.request.responseFile as { extra?: boolean }).extra = true;
+    await expectLedgerCode(ledger.append("request_result_recorded", resultNested), "event.schema-invalid");
+    await ledger.close();
+  });
+
+  test("rejects invalid request timestamps, numeric values, and response paths", async () => {
+    const path = await ledgerPath();
+    const ledger = await openEventLedger(path, deterministicOptions());
+    await reserveRequestEventIdentities(ledger);
+
+    const invalidTime = requestIntentEventPayload();
+    invalidTime.intent.deadlineAt = "2026-02-30T00:00:00.000Z";
+    await expectLedgerCode(ledger.append("request_intent_recorded", invalidTime), "event.schema-invalid");
+    const invalidBytes = requestResultEventPayload();
+    invalidBytes.request.decodedBytes = -1;
+    await expectLedgerCode(ledger.append("request_result_recorded", invalidBytes), "event.schema-invalid");
+    const invalidPath = requestResultEventPayload();
+    invalidPath.request.responseFile!.relativePath = "../secret";
+    await expectLedgerCode(ledger.append("request_result_recorded", invalidPath), "event.schema-invalid");
+    const invalidDelay = requestRetryScheduledPayload();
+    invalidDelay.delayMs = Number.POSITIVE_INFINITY;
+    await expectLedgerCode(ledger.append("request_retry_scheduled", invalidDelay), "event.schema-invalid");
+    await ledger.close();
+  });
+
   test("exports the exact closed foundation event type set", () => {
     expect(FONDATION_SORTED()).toEqual([
       "active_time_checkpoint", "attempt_committed", "attempt_failed", "attempt_usage_recorded",
       "budget_amended", "cancel_requested", "dispatch_intent", "dispatch_started", "identity_reserved",
-      "lock_recovered", "records_committed", "result_recorded", "resume_epoch_started", "retry_scheduled",
+      "lock_recovered", "records_committed", "request_intent_recorded", "request_result_recorded",
+      "request_retry_scheduled", "request_retry_started", "result_recorded", "resume_epoch_started", "retry_scheduled",
       "retry_started", "revision_committed", "revision_failed", "revision_prepared", "run_completed",
       "run_created", "state_changed", "task_upserted",
     ]);
@@ -335,4 +476,122 @@ describe("append-only event ledger", () => {
 
 function FONDATION_SORTED(): string[] {
   return [...FOUNDATION_EVENT_TYPES].sort();
+}
+
+function requestIntent() {
+  return {
+    schemaVersion: 1 as const,
+    requestId: ids.request,
+    attemptId: ids.attempt,
+    executionEpoch: 0,
+    logicalRequestId: "literature-search-1",
+    physicalAttemptOrdinal: 1,
+    retryOfRequestId: null,
+    replayPolicy: "safe-read" as const,
+    provider: "openalex" as const,
+    operation: "search" as const,
+    normalizedInput: {
+      query: "durable ledgers",
+      identifier: null,
+      url: null,
+      parameters: [{ name: "per-page", value: "25" }],
+    },
+    accessPolicySha256: SHA_A,
+    deadlineAt: "2026-08-25T12:05:00.000Z",
+    createdAt: TIMESTAMP,
+  };
+}
+
+function requestRecord() {
+  return {
+    schemaVersion: 1 as const,
+    requestId: ids.request,
+    attemptId: ids.attempt,
+    executionEpoch: 0,
+    logicalRequestId: "literature-search-1",
+    physicalAttemptOrdinal: 1,
+    retryOfRequestId: null,
+    replayPolicy: "safe-read" as const,
+    provider: "openalex" as const,
+    operation: "search" as const,
+    normalizedInput: {
+      query: "durable ledgers",
+      identifier: null,
+      url: null,
+      parameters: [{ name: "per-page", value: "25" }],
+    },
+    accessPolicySha256: SHA_A,
+    startedAt: TIMESTAMP,
+    endedAt: "2026-08-25T12:00:01.000Z",
+    status: "success" as const,
+    httpStatus: 200,
+    requestedUrl: "https://api.openalex.org/works",
+    finalUrl: "https://api.openalex.org/works",
+    redirectUrls: [],
+    responseSha256: SHA_B,
+    responseFile: {
+      relativePath: "request-payloads/response.json",
+      mediaType: "application/json",
+      decodedBytes: 128,
+      sha256: SHA_B,
+    },
+    encodedBytes: 96,
+    decodedBytes: 128,
+    resultSourceIds: ["src-00000001"],
+    errorClass: null,
+  };
+}
+
+function requestIntentEventPayload() {
+  return {
+    attemptId: ids.attempt,
+    journalLocalSeq: 1,
+    journalEntrySha256: SHA_A,
+    intent: requestIntent(),
+  };
+}
+
+function requestResultEventPayload() {
+  return {
+    attemptId: ids.attempt,
+    journalLocalSeq: 2,
+    journalEntrySha256: SHA_B,
+    intentLedgerSeq: 5,
+    request: requestRecord(),
+  };
+}
+
+function requestRetryScheduledPayload() {
+  return {
+    scheduleId: ids.retry,
+    attemptId: ids.attempt,
+    journalLocalSeq: 3,
+    journalEntrySha256: SHA_A,
+    logicalRequestId: "literature-search-1",
+    failedRequestId: ids.request,
+    nextPhysicalAttemptOrdinal: 2,
+    notBeforeAt: "2026-08-25T12:00:02.000Z",
+    delayMs: 1_000,
+    reasonClass: "rate-limit",
+  };
+}
+
+function requestRetryStartedPayload() {
+  return {
+    scheduleId: ids.retry,
+    attemptId: ids.attempt,
+    journalLocalSeq: 4,
+    journalEntrySha256: SHA_B,
+    logicalRequestId: "literature-search-1",
+    requestId: ids.request2,
+    physicalAttemptOrdinal: 2,
+    scheduledFromLedgerSeq: 7,
+  };
+}
+
+async function reserveRequestEventIdentities(ledger: EventLedger): Promise<void> {
+  await ledger.reserveIdentity("attempt", ids.attempt, "parent-generated");
+  await ledger.reserveIdentity("request", ids.request, "child-import");
+  await ledger.reserveIdentity("request", ids.request2, "child-import");
+  await ledger.reserveIdentity("retry-schedule", ids.retry, "child-import");
 }

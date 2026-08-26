@@ -33,6 +33,8 @@ const ZERO_HASH = "0".repeat(64);
 export const DEFAULT_MAX_LEDGER_LINE_BYTES = 4 * 1024 * 1024;
 const READ_CHUNK_BYTES = 64 * 1024;
 const openPaths = new Set<string>();
+const openPhysicalFiles = new Set<string>();
+let registryQueue: Promise<void> = Promise.resolve();
 
 export interface EventLedgerOptions {
   now?: () => Date;
@@ -86,24 +88,37 @@ export class EventLedgerError extends Error {
 
 export async function openEventLedger(path: string, options: EventLedgerOptions = {}): Promise<EventLedger> {
   const canonicalPath = resolve(path);
-  if (openPaths.has(canonicalPath)) throw new EventLedgerError("ledger.already-open");
-  openPaths.add(canonicalPath);
-
+  let pathRegistered = false;
+  let physicalIdentity: string | undefined;
+  let physicalRegistered = false;
   let handle: FileHandle | undefined;
+
   try {
+    await withRegistry(() => {
+      if (openPaths.has(canonicalPath)) throw new EventLedgerError("ledger.already-open");
+      openPaths.add(canonicalPath);
+      pathRegistered = true;
+    });
     const maxLineBytes = validateMaxLineBytes(options.maxLineBytes ?? DEFAULT_MAX_LEDGER_LINE_BYTES);
     const durability = options.durability ?? defaultDurability;
     handle = await openLeaf(canonicalPath);
+    const stat = await handle.stat({ bigint: true });
+    physicalIdentity = `${stat.dev}:${stat.ino}`;
+    await withRegistry(() => {
+      if (openPhysicalFiles.has(physicalIdentity!)) throw new EventLedgerError("ledger.already-open");
+      openPhysicalFiles.add(physicalIdentity!);
+      physicalRegistered = true;
+    });
     const events = await scanLedger(handle, maxLineBytes, true, durability);
-    return createLedger(canonicalPath, handle, events, {
+    return createLedger(handle, events, {
       now: options.now ?? (() => new Date()),
       eventId: options.eventId ?? (() => `event-${randomUUID()}`),
       durability,
       maxLineBytes,
-    });
+    }, async () => releaseRegistry(canonicalPath, physicalRegistered ? physicalIdentity : undefined));
   } catch (error) {
     await handle?.close().catch(() => undefined);
-    openPaths.delete(canonicalPath);
+    if (pathRegistered) await releaseRegistry(canonicalPath, physicalRegistered ? physicalIdentity : undefined);
     throw normalizeOpenError(error);
   }
 }
@@ -116,10 +131,10 @@ interface ResolvedOptions {
 }
 
 function createLedger(
-  canonicalPath: string,
   handle: FileHandle,
   initialEvents: FoundationLedgerEvent[],
   options: ResolvedOptions,
+  releaseOpenRegistration: () => Promise<void>,
 ): EventLedger {
   const events = initialEvents.map(cloneEvent);
   const eventIds = new Set(events.map((event) => event.eventId));
@@ -198,10 +213,11 @@ function createLedger(
     append(type, payload) {
       try {
         assertWritable();
+        const snapshot = snapshotAppendPayload(payload);
+        return enqueue(() => appendInternal(type, snapshot));
       } catch (error) {
         return Promise.reject(error);
       }
-      return enqueue(() => appendInternal(type, payload));
     },
     reserveIdentity(kind, id, origin) {
       try {
@@ -237,7 +253,7 @@ function createLedger(
         try {
           await handle.close();
         } finally {
-          openPaths.delete(canonicalPath);
+          await releaseOpenRegistration();
         }
       });
       return closePromise;
@@ -394,6 +410,26 @@ function validateReservedReferences(event: FoundationLedgerEvent, reservations: 
       add("attempt", event.payload.attemptId);
       add("transaction", event.payload.transactionId);
       break;
+    case "request_intent_recorded":
+      add("attempt", event.payload.attemptId);
+      add("request", event.payload.intent.requestId);
+      if (event.payload.intent.retryOfRequestId !== null) add("request", event.payload.intent.retryOfRequestId);
+      break;
+    case "request_result_recorded":
+      add("attempt", event.payload.attemptId);
+      add("request", event.payload.request.requestId);
+      if (event.payload.request.retryOfRequestId !== null) add("request", event.payload.request.retryOfRequestId);
+      break;
+    case "request_retry_scheduled":
+      add("retry-schedule", event.payload.scheduleId);
+      add("attempt", event.payload.attemptId);
+      add("request", event.payload.failedRequestId);
+      break;
+    case "request_retry_started":
+      add("retry-schedule", event.payload.scheduleId);
+      add("attempt", event.payload.attemptId);
+      add("request", event.payload.requestId);
+      break;
     case "records_committed":
       add("transaction", event.payload.transactionId);
       event.payload.requestIds.forEach((id) => add("request", id));
@@ -466,6 +502,27 @@ async function openLeaf(path: string): Promise<FileHandle> {
     if (error instanceof AtomicFileError && error.code === "symlink") throw new EventLedgerError("ledger.symlink");
     throw new EventLedgerError("ledger.open-failed");
   }
+}
+
+function snapshotAppendPayload<T extends FoundationEventType>(payload: FoundationEventPayload<T>): FoundationEventPayload<T> {
+  try {
+    return JSON.parse(canonicalJson(payload)) as FoundationEventPayload<T>;
+  } catch {
+    throw new EventLedgerError("event.schema-invalid");
+  }
+}
+
+function withRegistry<T>(operation: () => T): Promise<T> {
+  const result = registryQueue.then(operation);
+  registryQueue = result.then(() => undefined, () => undefined);
+  return result;
+}
+
+async function releaseRegistry(canonicalPath: string, physicalIdentity: string | undefined): Promise<void> {
+  await withRegistry(() => {
+    openPaths.delete(canonicalPath);
+    if (physicalIdentity !== undefined) openPhysicalFiles.delete(physicalIdentity);
+  });
 }
 
 function validateMaxLineBytes(value: number): number {
