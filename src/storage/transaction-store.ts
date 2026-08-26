@@ -333,6 +333,8 @@ export async function inspectCanonicalTransactionsReadOnly(
   if (await pathExists(committedRoot)) await assertOwnedDirectory(committedRoot);
   const limits = limitsFrom(options);
   const guard = await pinReadOnlyHierarchy(root);
+  let result: ReadOnlyTransactionIntegrity | undefined;
+  let failure: unknown;
   try {
     await assertPinnedHierarchy(guard, "read-only-before", options);
     const results = new Map<string, Extract<FoundationLedgerEvent, { type: "result_recorded" }>>();
@@ -399,10 +401,13 @@ export async function inspectCanonicalTransactionsReadOnly(
       fail("transaction.missing-object");
     }
     await assertPinnedHierarchy(guard, "read-only-after", options);
-    return Object.freeze({ committedCount: attemptCommits.size, pendingCount, unmaterializedResultCount });
-  } finally {
-    await Promise.all(guard.map(({ handle }) => handle.close().catch(() => undefined)));
+    result = Object.freeze({ committedCount: attemptCommits.size, pendingCount, unmaterializedResultCount });
+  } catch (error) {
+    failure = error;
   }
+  for (const item of [...guard].reverse()) failure = await closeForOperation(item.handle, options, failure);
+  if (failure) throw failure;
+  return result!;
 }
 
 export async function reconcileCanonicalTransactions(
@@ -810,9 +815,13 @@ async function verifyDirectory(
 ): Promise<VerifiedTransaction> {
   const directory = transactionDirectory(root, location, transactionId);
   if (!(await pathExists(directory))) fail("transaction.missing-object");
-  const container = await pinTransactionDirectory(dirname(directory));
+  let container: PinnedTransactionDirectory | undefined;
   let pinned: PinnedTransactionDirectory | undefined;
+  const children: PinnedReadFile[] = [];
+  let result: VerifiedTransaction | undefined;
+  let failure: unknown;
   try {
+    container = await pinTransactionDirectory(dirname(directory));
     pinned = await pinTransactionDirectory(directory);
     await assertPinnedTransactionDirectory(container);
     await invokeReadOnlyCheck(options, "transaction-directory-pinned", directory);
@@ -824,7 +833,10 @@ async function verifyDirectory(
     const expected = new Set([...KINDS.map((kind) => `${kind}.jsonl`), MANIFEST_FILE]);
     if (entries.some((entry) => entry.isSymbolicLink())) fail("transaction.unsafe-file");
     if (entries.length !== expected.size || entries.some((entry) => !entry.isFile() || !expected.has(entry.name))) fail("transaction.corrupt");
-    const manifestBytes = await readSafeFile(join(directory, MANIFEST_FILE), Math.min(limits.maxFileBytes, limits.maxLineBytes), limits, pinned, options);
+
+    const manifestFile = await openAndReadPinnedFile(join(directory, MANIFEST_FILE), Math.min(limits.maxFileBytes, limits.maxLineBytes), limits, pinned, options);
+    children.push(manifestFile);
+    const manifestBytes = manifestFile.bytes;
     let transactionBytes = manifestBytes.byteLength;
     const manifestInput = parseCanonicalSingleJson(manifestBytes, limits);
     const parsed = parse(CanonicalTransactionManifestSchema, manifestInput);
@@ -835,7 +847,9 @@ async function verifyDirectory(
     const records = Object.create(null) as Record<CanonicalRecordKind, JsonRecord[]>;
     for (const [index, kind] of KINDS.entries()) {
       const file = manifest.files[index]!;
-      const bytes = await readSafeFile(join(directory, file.relativePath), limits.maxFileBytes, limits, pinned, options);
+      const pinnedFile = await openAndReadPinnedFile(join(directory, file.relativePath), limits.maxFileBytes, limits, pinned, options);
+      children.push(pinnedFile);
+      const bytes = pinnedFile.bytes;
       transactionBytes += bytes.byteLength;
       if (transactionBytes > limits.maxTransactionBytes) fail("transaction.file-too-large");
       if (bytes.byteLength !== file.decodedBytes || sha256Hex(bytes) !== file.sha256) fail("transaction.corrupt");
@@ -855,19 +869,20 @@ async function verifyDirectory(
       requestIds: manifest.requestIds,
       calculationIds: manifest.calculationIds,
     })) fail("transaction.corrupt");
+
     await invokeReadOnlyCheck(options, "transaction-directory-final", directory);
+    for (const child of children) await assertRetainedReadFile(child, pinned);
     await assertPinnedTransactionDirectory(container);
     await assertPinnedTransactionDirectory(pinned);
-    return {
-      manifest: structuredClone(manifest),
-      manifestSha256: sha256Hex(manifestBytes),
-      manifestPath: relativeManifestPath(location, transactionId),
-      records,
-    };
-  } finally {
-    await pinned?.handle.close().catch(() => undefined);
-    await container.handle.close().catch(() => undefined);
+    result = immutableVerifiedTransaction(manifest, manifestBytes, location, transactionId, records);
+  } catch (error) {
+    failure = normalize(error, "transaction.unsafe-file");
   }
+  for (const child of children.reverse()) failure = await closeForOperation(child.handle, options, failure);
+  if (pinned) failure = await closeForOperation(pinned.handle, options, failure);
+  if (container) failure = await closeForOperation(container.handle, options, failure);
+  if (failure) throw failure;
+  return result!;
 }
 
 async function pinTransactionDirectory(path: string): Promise<PinnedTransactionDirectory> {
@@ -1185,6 +1200,86 @@ async function durability(handle: FileHandle, step: TransactionProtocolStep, opt
 
 async function protocolStep(step: TransactionProtocolStep, options: TransactionStoreOptions): Promise<void> {
   try { await options.onStep?.(step); } catch { fail("transaction.io-failed"); }
+}
+
+interface PinnedReadFile {
+  path: string;
+  handle: FileHandle;
+  initial: BigIntStats;
+  bytes: Buffer;
+}
+
+async function openAndReadPinnedFile(
+  path: string,
+  maxBytes: number,
+  limits: Limits,
+  parent: PinnedTransactionDirectory,
+  options: TransactionStoreOptions,
+): Promise<PinnedReadFile> {
+  const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+  let handle: FileHandle | undefined;
+  let failure: unknown;
+  try {
+    await assertPinnedTransactionDirectory(parent);
+    // Darwin/Node has no openat for child reads; the read-only pathname open
+    // remains bracketed by pinned-parent and descriptor/path checks.
+    handle = await open(path, constants.O_RDONLY | noFollow);
+    await assertPinnedTransactionDirectory(parent);
+    const initial = await handle.stat({ bigint: true });
+    const initialPath = await lstat(path, { bigint: true });
+    assertStablePinnedFile(initial, initialPath);
+    if (initial.size > BigInt(maxBytes)) fail("transaction.file-too-large");
+    await invokeReadOnlyCheck(options, "file-pinned", path);
+    await assertStablePinnedFilePath(handle, path, initial, parent);
+    const parts: Buffer[] = [];
+    let total = 0;
+    for (;;) {
+      const remainingProbe = maxBytes + 1 - total;
+      const buffer = Buffer.allocUnsafe(Math.min(READ_CHUNK_BYTES, remainingProbe));
+      const bytesRead = await limits.readChunk(handle, buffer, total);
+      if (!Number.isSafeInteger(bytesRead) || bytesRead < 0 || bytesRead > buffer.byteLength) fail("transaction.unsafe-file");
+      await invokeReadOnlyCheck(options, "file-chunk-read", path);
+      await assertStablePinnedFilePath(handle, path, initial, parent);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+      if (total > maxBytes) fail("transaction.file-too-large");
+      parts.push(Buffer.from(buffer.subarray(0, bytesRead)));
+    }
+    if (initial.size !== BigInt(total)) fail("transaction.unsafe-file");
+    return { path, handle, initial, bytes: Buffer.concat(parts, total) };
+  } catch (error) {
+    failure = normalize(error, "transaction.unsafe-file");
+  }
+  if (handle) failure = await closeForOperation(handle, options, failure);
+  throw failure;
+}
+
+async function assertRetainedReadFile(file: PinnedReadFile, parent: PinnedTransactionDirectory): Promise<void> {
+  await assertStablePinnedFilePath(file.handle, file.path, file.initial, parent);
+}
+
+function immutableVerifiedTransaction(
+  manifest: CanonicalTransactionManifest,
+  manifestBytes: Buffer,
+  location: ".staging" | "committed",
+  transactionId: string,
+  records: Record<CanonicalRecordKind, JsonRecord[]>,
+): VerifiedTransaction {
+  const snapshot = {
+    manifest: structuredClone(manifest),
+    manifestSha256: sha256Hex(manifestBytes),
+    manifestPath: relativeManifestPath(location, transactionId),
+    records: structuredClone(records),
+  } as VerifiedTransaction;
+  return deepFreezeSnapshot(snapshot);
+}
+
+function deepFreezeSnapshot<T>(value: T): T {
+  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const child of Object.values(value as Record<string, unknown>)) deepFreezeSnapshot(child);
+    Object.freeze(value);
+  }
+  return value;
 }
 
 async function readSafeFile(

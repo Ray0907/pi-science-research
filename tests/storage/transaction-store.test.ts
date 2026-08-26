@@ -921,6 +921,76 @@ describe("read-only transaction race resistance", () => {
     expect(await readFile(manifest)).toEqual(original);
     expect((await lstat(manifest)).mtimeMs).toBeCloseTo(before.mtimeMs, 0);
   });
+
+  test.each(["manifest.json", "requests.jsonl"])("keeps %s pinned through the final hook and rejects mutate/restore", async (name) => {
+    const runRoot = await root();
+    await committed(runRoot);
+    const path = join(runRoot, `.state/transactions/committed/${TX}/${name}`);
+    const original = await readFile(path);
+    const before = await lstat(path);
+    let mutated = false;
+    await expectCode(inspectCanonicalTransactionsReadOnly(runRoot, baseEvents(), {
+      onReadOnlyCheck: async (phase) => {
+        if (phase === "transaction-directory-final" && !mutated) {
+          mutated = true;
+          const changed = Buffer.from(original);
+          changed[0] = changed[0]! ^ 1;
+          await writeFile(path, changed);
+          await writeFile(path, original);
+          await utimes(path, before.atime, before.mtime);
+        }
+      },
+    }), "transaction.unsafe-file");
+    expect(await readFile(path)).toEqual(original);
+  });
+
+  test.each(["identical replacement", "symlink swap"])("rejects final-hook %s while preserving source bytes", async (kind) => {
+    const runRoot = await root();
+    await committed(runRoot);
+    const path = join(runRoot, `.state/transactions/committed/${TX}/manifest.json`);
+    const moved = `${path}.final`;
+    const original = await readFile(path);
+    let swapped = false;
+    await expectCode(inspectCanonicalTransactionsReadOnly(runRoot, baseEvents(), {
+      onReadOnlyCheck: async (phase) => {
+        if (phase === "transaction-directory-final" && !swapped) {
+          swapped = true;
+          await rename(path, moved);
+          if (kind === "identical replacement") await writeFile(path, original, { mode: 0o600 });
+          else await symlink(moved, path);
+        }
+      },
+    }), "transaction.unsafe-file");
+    expect(await readFile(moved)).toEqual(original);
+    if (kind === "identical replacement") expect(await readFile(path)).toEqual(original);
+  });
+
+  test("returns an immutable verified snapshot only after final consistency checks", async () => {
+    const runRoot = await root();
+    const ref = await committed(runRoot);
+    const verified = await verifyTransaction(runRoot, ref);
+    expect(Object.isFrozen(verified)).toBe(true);
+    expect(Object.isFrozen(verified.manifest)).toBe(true);
+    expect(Object.isFrozen(verified.records)).toBe(true);
+    expect(Object.isFrozen(verified.records.requests)).toBe(true);
+    expect(Object.isFrozen(verified.records.requests[0])).toBe(true);
+  });
+
+  test("closes every retained verification handle after an injected close failure", async () => {
+    const runRoot = await root();
+    await committed(runRoot);
+    const handles: FileHandle[] = [];
+    const failure = inspectCanonicalTransactionsReadOnly(runRoot, baseEvents(), {
+      close: async (handle) => {
+        handles.push(handle);
+        throw new Error("final-close-secret");
+      },
+    });
+    await expectCode(failure, "transaction.io-failed");
+    await expect(failure.catch((error: Error) => error.message)).resolves.not.toContain("final-close-secret");
+    expect(handles.length).toBeGreaterThanOrEqual(9);
+    for (const handle of handles) await expect(handle.stat()).rejects.toBeDefined();
+  });
 });
 
 function runSnapshot(): RunSnapshot {
