@@ -41,6 +41,12 @@ export interface EvidenceSelection {
   readonly selectedRecordBundleSha256: string; readonly truncated: boolean; readonly nextCursor: string | null;
 }
 export interface EvidenceIndex { readonly recordCount: number; readonly canonicalBytes: number; query(input: EvidenceQuery): EvidenceSelection }
+export interface EvidenceQueryDiagnostics {
+  indexVisits: number;
+  candidateVisits: number;
+  closureVisits: number;
+  normalizedQueryCanonicalizations: number;
+}
 export interface EvidenceIndexOptions {
   readonly maxLedgerEvents?: number; readonly maxTaskRevisions?: number; readonly maxStableTasks?: number; readonly maxAttempts?: number;
   readonly maxMetadataCanonicalBytes?: number; readonly maxFilterValues?: number; readonly maxFilterBytes?: number; readonly maxPageLimit?: number;
@@ -61,7 +67,8 @@ interface NormalizedQuery {
   readonly taskIds?: readonly string[]; readonly roles?: readonly Role[]; readonly attemptIds?: readonly string[];
   readonly stances?: readonly EvidenceRecord["stance"][]; readonly qualities?: readonly EvidenceRecord["quality"][]; readonly lineageIds?: readonly string[];
   readonly accessLevels?: readonly SourceRecord["accessLevel"][]; readonly verificationStatuses?: readonly EvidenceRecord["verificationStatus"][];
-  readonly minimumConfidence?: number; readonly limit: number; readonly maxSelectedBytes: number; readonly cursor: string | null; readonly directSupplied: boolean; readonly hash: string;
+  readonly minimumConfidence?: number; readonly limit: number; readonly maxSelectedBytes: number; readonly cursor: string | null; readonly directSupplied: boolean;
+  readonly canonical: string; readonly canonicalBytes: number; readonly hash: string;
 }
 interface CursorPayload { readonly version: 1; readonly snapshotHash: string; readonly queryHash: string; readonly position: readonly [number, string, number]; readonly checksum: string }
 
@@ -80,32 +87,40 @@ const KINDS: readonly SnapshotRecordKind[] = ["sources", "claims", "evidence", "
 const RANK: Readonly<Record<PrimaryKind, number>> = { sources: 0, claims: 1, evidence: 2, verifications: 3 };
 
 export function buildEvidenceIndex(input: EvidenceIndexInput, options?: EvidenceIndexOptions): EvidenceIndex {
+  return buildEvidenceIndexInternal(input, options);
+}
+/** Package-internal test seam; intentionally absent from the package root. */
+export function buildEvidenceIndexWithDiagnosticsInternal(input: EvidenceIndexInput, options: EvidenceIndexOptions | undefined, diagnostics: EvidenceQueryDiagnostics): EvidenceIndex {
+  validateQueryDiagnostics(diagnostics);
+  return buildEvidenceIndexInternal(input, options, diagnostics);
+}
+function buildEvidenceIndexInternal(input: EvidenceIndexInput, options?: EvidenceIndexOptions, diagnostics?: EvidenceQueryDiagnostics): EvidenceIndex {
   const normalizedOptions = normalizeOptions(options);
   const validatedInput = validateIndexInput(input);
   let indexes: ValidatedSnapshotIndexes;
   try { indexes = getValidatedSnapshotIndexes(validatedInput.snapshot); }
   catch (error) { if (error instanceof EvidenceAdmissionError && error.code === "evidence.snapshot-invalid") fail("query.invalid-input"); return fail("query.invalid-input"); }
   const metadata = buildMetadata(validatedInput.snapshot, validatedInput.ledgerEvents, normalizedOptions);
-  const ownersByKey = buildOwnerIndex(validatedInput.snapshot);
+  const ownersByKey = buildOwnerIndex(validatedInput.snapshot, diagnostics);
   const snapshotHash = sha256Hex(canonicalJson({ snapshotSha256: indexes.snapshotSha256, optionsSha256: indexes.optionsSha256, policySha256: indexes.policySha256, metadataSha256: metadata.hash }));
   const latestEvidence: Primary[] = [];
-  for (const record of validatedInput.snapshot.records.evidence) if (indexes.getLatestRevision("evidence", record.evidenceId) === record.revision)
-    latestEvidence.push(primaryFor("evidence", record, indexes, ownersByKey));
+  for (const record of validatedInput.snapshot.records.evidence) { bumpQuery(diagnostics, "indexVisits"); if (indexes.getLatestRevision("evidence", record.evidenceId) === record.revision)
+    latestEvidence.push(primaryFor("evidence", record, indexes, ownersByKey)); }
   latestEvidence.sort(comparePrimary);
-  const reverse = buildReversePrimaryIndex(latestEvidence, indexes, metadata);
+  const reverse = buildReversePrimaryIndex(latestEvidence, indexes, metadata, diagnostics);
   const api = Object.freeze({
     recordCount: validatedInput.snapshot.recordCount,
     canonicalBytes: validatedInput.snapshot.canonicalBytes,
     query(value: EvidenceQuery): EvidenceSelection {
-      const normalized = normalizeQuery(value, normalizedOptions);
+      const normalized = normalizeQuery(value, normalizedOptions, diagnostics);
       const position = normalized.cursor === null ? null : decodeCursor(normalized.cursor, normalizedOptions, snapshotHash, normalized.hash);
       if (((normalized.taskIds?.length ?? 0) > 0 || (normalized.roles?.length ?? 0) > 0) && !metadata.supplied) fail("query.metadata-required");
       let candidates = normalized.directSupplied ? directCandidates(normalized, indexes, ownersByKey) : indexedEvidenceCandidates(normalized, latestEvidence, reverse);
-      candidates = candidates.filter((item) => matches(item, normalized, metadata, indexes)).sort(comparePrimary);
+      candidates = candidates.filter((item) => { bumpQuery(diagnostics, "candidateVisits"); return matches(item, normalized, metadata, indexes); }).sort(comparePrimary);
       if (position !== null) candidates = candidates.filter((item) => compareTuple(tupleFor(item), position) > 0);
       const primaryPage = candidates.slice(0, normalized.limit);
       preflightPrimaryPage(primaryPage, normalizedOptions);
-      const closure = createClosure(indexes, normalizedOptions, Math.min(normalized.maxSelectedBytes, normalizedOptions.maxSelectedBytes));
+      const closure = createClosure(indexes, normalizedOptions, Math.min(normalized.maxSelectedBytes, normalizedOptions.maxSelectedBytes), diagnostics);
       let accepted = 0; let closureStopped = false;
       for (const item of primaryPage) {
         if (!closure.tryAdd(item.key)) { if (accepted === 0) fail("query.closure-too-large"); closureStopped = true; break; }
@@ -197,7 +212,19 @@ function buildMetadata(snapshot: BoundedValidatedEvidenceSnapshot, input: readon
   return Object.freeze({ supplied: true, attemptTask, taskRole, hash: sha256Hex(canonicalJson(canonical)) });
 }
 
-function normalizeQuery(input: unknown, options: NormalizedOptions): NormalizedQuery {
+type PreflightReference = Readonly<{ id: string; revision: number }>;
+type PreflightFilterValue = string | PreflightReference;
+type PreflightFilters = Readonly<Record<string, readonly PreflightFilterValue[]>>;
+const REF_FILTERS: Readonly<Record<string, readonly [PrimaryKind, string, RegExp]>> = Object.freeze({
+  sourceRefs: ["sources", "sourceId", ID_PATTERNS.source], claimRefs: ["claims", "claimId", ID_PATTERNS.claim],
+  evidenceRefs: ["evidence", "evidenceId", ID_PATTERNS.evidence], verificationRefs: ["verifications", "verificationId", ID_PATTERNS.verification],
+});
+const STRING_FILTERS: Readonly<Record<string, readonly string[] | RegExp | null>> = Object.freeze({
+  taskIds: ID_PATTERNS.task, roles: ROLES, attemptIds: ID_PATTERNS.attempt, stances: STANCES, qualities: QUALITIES,
+  lineageIds: null, accessLevels: ACCESS, verificationStatuses: STATUSES,
+});
+const FILTER_FIELDS = Object.freeze([...Object.keys(REF_FILTERS), ...Object.keys(STRING_FILTERS)].sort());
+function normalizeQuery(input: unknown, options: NormalizedOptions, diagnostics?: EvidenceQueryDiagnostics): NormalizedQuery {
   if (utilTypes.isProxy(input) || !isPlain(input)) fail("query.invalid-input");
   const keys = Reflect.ownKeys(input); if (keys.some((key) => typeof key !== "string" || !QUERY_KEYS.includes(key)) || !keys.includes("limit") || !keys.includes("maxSelectedBytes")) fail("query.invalid-input");
   const raw: Record<string, unknown> = {}; for (const key of keys as string[]) raw[key] = dataValue(input, key, "query.invalid-input");
@@ -205,52 +232,88 @@ function normalizeQuery(input: unknown, options: NormalizedOptions): NormalizedQ
   if (!Number.isSafeInteger(limit) || (limit as number) < 1 || (limit as number) > options.maxPageLimit
     || !Number.isSafeInteger(maxSelectedBytes) || (maxSelectedBytes as number) < 1 || (maxSelectedBytes as number) > options.maxSelectedBytes) fail("query.limit-invalid");
   if (raw.cursor !== undefined && raw.cursor !== null && typeof raw.cursor !== "string") fail("query.invalid-input");
-  const output: Record<string, unknown> = { limit, maxSelectedBytes, cursor: raw.cursor ?? null };
-  preflightFilterCounts(raw, options);
-  const refs: Array<[string, PrimaryKind, string, RegExp]> = [["sourceRefs", "sources", "sourceId", ID_PATTERNS.source], ["claimRefs", "claims", "claimId", ID_PATTERNS.claim], ["evidenceRefs", "evidence", "evidenceId", ID_PATTERNS.evidence], ["verificationRefs", "verifications", "verificationId", ID_PATTERNS.verification]];
-  let filterCount = 0; let directSupplied = false;
-  for (const [field, kind, idField, pattern] of refs) if (Object.hasOwn(raw, field)) { directSupplied = true; const values = normalizeRefs(raw[field], kind, idField, pattern, options); output[field] = values; filterCount = add(filterCount, values.length, "query.filter-too-large"); }
-  const stringFilters: Array<[string, RegExp | readonly string[]]> = [["taskIds", ID_PATTERNS.task], ["roles", ROLES], ["attemptIds", ID_PATTERNS.attempt], ["stances", STANCES], ["qualities", QUALITIES], ["lineageIds", /^(?=.{1,4096}$)[^\u0000]+$/u], ["accessLevels", ACCESS], ["verificationStatuses", STATUSES]];
-  for (const [field, allowed] of stringFilters) if (Object.hasOwn(raw, field)) { const values = normalizeStrings(raw[field], allowed, options); output[field] = values; filterCount = add(filterCount, values.length, "query.filter-too-large"); }
-  if (filterCount > options.maxFilterValues) fail("query.filter-too-large");
+  const preflight = preflightFilters(raw, options);
+  const output: Record<string, unknown> = { limit, maxSelectedBytes }; let directSupplied = false;
+  for (const [field, [kind]] of Object.entries(REF_FILTERS)) if (Object.hasOwn(preflight, field)) { directSupplied = true; output[field] = normalizeRefs(preflight[field]!, kind); }
+  for (const field of Object.keys(STRING_FILTERS)) if (Object.hasOwn(preflight, field)) output[field] = normalizeStrings(preflight[field]! as readonly string[]);
   if (Object.hasOwn(raw, "minimumConfidence")) { if (typeof raw.minimumConfidence !== "number" || !Number.isFinite(raw.minimumConfidence) || raw.minimumConfidence < 0 || raw.minimumConfidence > 1) fail("query.invalid-input"); output.minimumConfidence = raw.minimumConfidence; }
-  const hashInput = { ...output }; delete hashInput.cursor;
-  if (Buffer.byteLength(canonicalJson(hashInput), "utf8") > options.maxFilterBytes) fail("query.filter-too-large");
-  return Object.freeze({ ...output, directSupplied, hash: sha256Hex(canonicalJson(hashInput)) }) as unknown as NormalizedQuery;
+  const normalizedNonCursor = Object.freeze(output); bumpQuery(diagnostics, "normalizedQueryCanonicalizations");
+  let canonical: string; try { canonical = canonicalJson(normalizedNonCursor); } catch { return fail("query.invalid-input"); }
+  const canonicalBytes = Buffer.byteLength(canonical, "utf8"); if (canonicalBytes > options.maxFilterBytes) fail("query.filter-too-large");
+  return Object.freeze({ ...normalizedNonCursor, cursor: raw.cursor ?? null, directSupplied, canonical, canonicalBytes, hash: sha256Hex(canonical) }) as unknown as NormalizedQuery;
 }
-function preflightFilterCounts(raw: Readonly<Record<string, unknown>>, options: NormalizedOptions): void {
-  const fields = ["sourceRefs", "claimRefs", "evidenceRefs", "verificationRefs", "taskIds", "roles", "attemptIds", "stances", "qualities", "lineageIds", "accessLevels", "verificationStatuses"];
+/** Raw filter bytes are the canonical JSON object containing only supplied filter collections, accounted without materializing that string. */
+function preflightFilters(raw: Readonly<Record<string, unknown>>, options: NormalizedOptions): PreflightFilters {
   let total = 0;
-  for (const field of fields) if (Object.hasOwn(raw, field)) {
+  for (const field of FILTER_FIELDS) if (Object.hasOwn(raw, field)) {
     const value = raw[field]; if (utilTypes.isProxy(value) || !Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) fail("query.invalid-input");
     const length = Object.getOwnPropertyDescriptor(value, "length")?.value; if (!Number.isSafeInteger(length) || length < 0) fail("query.invalid-input");
-    if (length > options.maxFilterValues) fail("query.filter-too-large"); total = add(total, length, "query.filter-too-large"); if (total > options.maxFilterValues) fail("query.filter-too-large");
+    total = add(total, length, "query.filter-too-large"); if (total > options.maxFilterValues) fail("query.filter-too-large");
     const keys = Reflect.ownKeys(value); if (keys.length !== length + 1 || !keys.includes("length")) fail("query.invalid-input");
+  }
+  const descriptorSnapshots: Record<string, readonly unknown[]> = {};
+  for (const field of FILTER_FIELDS) if (Object.hasOwn(raw, field)) {
+    const value = raw[field] as unknown[]; const length = Object.getOwnPropertyDescriptor(value, "length")!.value as number; const snapshot: unknown[] = [];
     for (let index = 0; index < length; index += 1) {
       const descriptor = Object.getOwnPropertyDescriptor(value, String(index)); if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) fail("query.invalid-input");
-      if (["sourceRefs", "claimRefs", "evidenceRefs", "verificationRefs"].includes(field) && !utilTypes.isProxy(descriptor.value) && isPlain(descriptor.value)) {
-        const idField = field === "sourceRefs" ? "sourceId" : field === "claimRefs" ? "claimId" : field === "evidenceRefs" ? "evidenceId" : "verificationId";
-        const nestedKeys = Reflect.ownKeys(descriptor.value); if (nestedKeys.some((key) => key !== idField && key !== "revision") || nestedKeys.length > 2) fail("query.invalid-input");
-      }
+      const ref = REF_FILTERS[field];
+      if (ref !== undefined && !utilTypes.isProxy(descriptor.value) && isPlain(descriptor.value)) { const nestedKeys = Reflect.ownKeys(descriptor.value); if (nestedKeys.length !== 2 || !nestedKeys.includes(ref[1]) || !nestedKeys.includes("revision")) fail("query.invalid-input"); }
+      snapshot.push(descriptor.value);
     }
+    descriptorSnapshots[field] = Object.freeze(snapshot);
   }
+  const output: Record<string, readonly PreflightFilterValue[]> = {};
+  for (const field of FILTER_FIELDS) if (Object.hasOwn(descriptorSnapshots, field)) {
+    const preparedValues: PreflightFilterValue[] = []; const ref = REF_FILTERS[field];
+    for (const value of descriptorSnapshots[field]!) {
+      let prepared: PreflightFilterValue;
+      if (ref !== undefined) prepared = preflightReference(value, ref[1], ref[2]);
+      else { const allowed = STRING_FILTERS[field]; if (typeof value !== "string" || (allowed instanceof RegExp ? !allowed.test(value) : allowed !== null && !allowed.includes(value))) fail("query.invalid-input"); prepared = value; }
+      preparedValues.push(prepared);
+    }
+    output[field] = Object.freeze(preparedValues);
+  }
+  let rawBytes = 2; let fieldCount = 0;
+  for (const field of FILTER_FIELDS) if (Object.hasOwn(output, field)) {
+    rawBytes = boundedFilterBytes(rawBytes, (fieldCount === 0 ? 0 : 1) + canonicalStringBytes(field) + 3, options.maxFilterBytes); fieldCount += 1;
+    const ref = REF_FILTERS[field]; let valueCount = 0;
+    for (const value of output[field]!) { rawBytes = boundedFilterBytes(rawBytes, (valueCount === 0 ? 0 : 1) + preflightValueBytes(value, ref?.[1], options.maxFilterBytes), options.maxFilterBytes); valueCount += 1; }
+  }
+  return Object.freeze(output);
 }
-function normalizeRefs(input: unknown, kind: PrimaryKind, idField: string, pattern: RegExp, options: NormalizedOptions): readonly SnapshotRecordKey[] {
-  const values = safeArray(input, options.maxFilterValues, "query.filter-too-large", "query.invalid-input"); const unique = new Map<string, SnapshotRecordKey>();
-  for (const item of values) {
-    if (utilTypes.isProxy(item) || !isPlain(item)) fail("query.reference-invalid"); const keys = Reflect.ownKeys(item);
-    if (keys.length !== 2 || !keys.includes(idField) || !keys.includes("revision")) fail("query.invalid-input");
-    const id = dataValue(item, idField, "query.reference-invalid"); const revision = dataValue(item, "revision", "query.reference-invalid");
-    if (typeof id !== "string" || !pattern.test(id) || !Number.isSafeInteger(revision) || (revision as number) < 1) fail("query.reference-invalid");
-    unique.set(`${id}\0${revision}`, Object.freeze({ kind, id, revision: revision as number }));
+function preflightReference(value: unknown, idField: string, pattern: RegExp): PreflightReference {
+  if (utilTypes.isProxy(value) || !isPlain(value)) fail("query.reference-invalid"); const keys = Reflect.ownKeys(value);
+  if (keys.length !== 2 || !keys.includes(idField) || !keys.includes("revision")) fail("query.invalid-input");
+  const id = dataValue(value, idField, "query.reference-invalid"); const revision = dataValue(value, "revision", "query.reference-invalid");
+  if (typeof id !== "string" || !pattern.test(id) || !Number.isSafeInteger(revision) || (revision as number) < 1) fail("query.reference-invalid");
+  return Object.freeze({ id, revision: revision as number });
+}
+function preflightValueBytes(value: PreflightFilterValue, idField: string | undefined, maximum: number): number {
+  if (typeof value === "string") return canonicalStringBytes(value, maximum);
+  return 5 + canonicalStringBytes(idField!, maximum) + canonicalStringBytes(value.id, maximum) + canonicalStringBytes("revision", maximum) + String(value.revision).length;
+}
+function canonicalStringBytes(value: string, maximum = Number.MAX_SAFE_INTEGER): number {
+  let bytes = 2;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code === 0x22 || code === 0x5c || code === 0x08 || code === 0x09 || code === 0x0a || code === 0x0c || code === 0x0d) bytes = add(bytes, 2, "query.filter-too-large");
+    else if (code <= 0x1f) bytes = add(bytes, 6, "query.filter-too-large");
+    else if (code <= 0x7f) bytes = add(bytes, 1, "query.filter-too-large");
+    else if (code <= 0x7ff) bytes = add(bytes, 2, "query.filter-too-large");
+    else if (code >= 0xd800 && code <= 0xdbff) { const low = value.charCodeAt(index + 1); if (!(low >= 0xdc00 && low <= 0xdfff)) fail("query.invalid-input"); bytes = add(bytes, 4, "query.filter-too-large"); index += 1; }
+    else if (code >= 0xdc00 && code <= 0xdfff) fail("query.invalid-input");
+    else bytes = add(bytes, 3, "query.filter-too-large");
+    if (bytes > maximum) fail("query.filter-too-large");
   }
+  return bytes;
+}
+function boundedFilterBytes(current: number, amount: number, maximum: number): number { const next = add(current, amount, "query.filter-too-large"); if (next > maximum) fail("query.filter-too-large"); return next; }
+function normalizeRefs(values: readonly PreflightFilterValue[], kind: PrimaryKind): readonly SnapshotRecordKey[] {
+  const unique = new Map<string, SnapshotRecordKey>();
+  for (const item of values as readonly PreflightReference[]) unique.set(`${item.id}\0${item.revision}`, Object.freeze({ kind, id: item.id, revision: item.revision }));
   return Object.freeze([...unique.values()].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : (a.revision as number) - (b.revision as number)));
 }
-function normalizeStrings(input: unknown, allowed: RegExp | readonly string[], options: NormalizedOptions): readonly string[] {
-  const values = safeArray(input, options.maxFilterValues, "query.filter-too-large", "query.invalid-input"); const unique = new Set<string>();
-  for (const value of values) if (typeof value !== "string" || (allowed instanceof RegExp ? !allowed.test(value) : !allowed.includes(value))) fail("query.invalid-input"); else unique.add(value);
-  return Object.freeze([...unique].sort());
-}
+function normalizeStrings(values: readonly string[]): readonly string[] { return Object.freeze([...new Set(values)].sort()); }
 
 function directCandidates(query: NormalizedQuery, indexes: ValidatedSnapshotIndexes, ownersByKey: ReadonlyMap<string, readonly string[]>): Primary[] {
   const output = new Map<string, Primary>();
@@ -259,18 +322,20 @@ function directCandidates(query: NormalizedQuery, indexes: ValidatedSnapshotInde
   }
   return [...output.values()];
 }
-function buildOwnerIndex(snapshot: BoundedValidatedEvidenceSnapshot): ReadonlyMap<string, readonly string[]> {
-  const output = new Map<string, readonly string[]>(); const requests = new Map(snapshot.records.requests.map((request) => [request.requestId, request]));
-  for (const record of snapshot.records.sources) output.set(encodedKey({ kind: "sources", id: record.sourceId, revision: record.revision }), Object.freeze([...new Set(record.retrievalRequestIds.flatMap((id) => requests.get(id)?.attemptId ?? []))].sort()));
-  for (const record of snapshot.records.claims) output.set(encodedKey({ kind: "claims", id: record.claimId, revision: record.revision }), Object.freeze([record.createdByAttemptId]));
-  for (const record of snapshot.records.evidence) output.set(encodedKey({ kind: "evidence", id: record.evidenceId, revision: record.revision }), Object.freeze([record.recordedByAttemptId]));
-  for (const record of snapshot.records.verifications) output.set(encodedKey({ kind: "verifications", id: record.verificationId, revision: record.revision }), Object.freeze([record.attemptId]));
+function buildOwnerIndex(snapshot: BoundedValidatedEvidenceSnapshot, diagnostics?: EvidenceQueryDiagnostics): ReadonlyMap<string, readonly string[]> {
+  const output = new Map<string, readonly string[]>(); const requests = new Map<string, RequestRecord>();
+  for (const request of snapshot.records.requests) { bumpQuery(diagnostics, "indexVisits"); requests.set(request.requestId, request); }
+  for (const record of snapshot.records.sources) { bumpQuery(diagnostics, "indexVisits"); output.set(encodedKey({ kind: "sources", id: record.sourceId, revision: record.revision }), Object.freeze([...new Set(record.retrievalRequestIds.flatMap((id) => requests.get(id)?.attemptId ?? []))].sort())); }
+  for (const record of snapshot.records.claims) { bumpQuery(diagnostics, "indexVisits"); output.set(encodedKey({ kind: "claims", id: record.claimId, revision: record.revision }), Object.freeze([record.createdByAttemptId])); }
+  for (const record of snapshot.records.evidence) { bumpQuery(diagnostics, "indexVisits"); output.set(encodedKey({ kind: "evidence", id: record.evidenceId, revision: record.revision }), Object.freeze([record.recordedByAttemptId])); }
+  for (const record of snapshot.records.verifications) { bumpQuery(diagnostics, "indexVisits"); output.set(encodedKey({ kind: "verifications", id: record.verificationId, revision: record.revision }), Object.freeze([record.attemptId])); }
   return output;
 }
-function buildReversePrimaryIndex(values: readonly Primary[], indexes: ValidatedSnapshotIndexes, metadata: Metadata): ReversePrimaryIndex {
+function buildReversePrimaryIndex(values: readonly Primary[], indexes: ValidatedSnapshotIndexes, metadata: Metadata, diagnostics?: EvidenceQueryDiagnostics): ReversePrimaryIndex {
   const byKey = new Map<string, Primary>(); const fields: Record<string, Map<string, Set<string>>> = {};
   const addValue = (field: string, value: string, key: string): void => { const index = fields[field] ?? new Map<string, Set<string>>(); fields[field] = index; const keys = index.get(value) ?? new Set<string>(); keys.add(key); index.set(value, keys); };
   for (const item of values) {
+    bumpQuery(diagnostics, "indexVisits");
     const key = encodedKey(item.key); byKey.set(key, item); const evidence = item.record as EvidenceRecord;
     addValue("stances", evidence.stance, key); addValue("qualities", evidence.quality, key); addValue("verificationStatuses", evidence.verificationStatus, key);
     for (const attemptId of item.owners) { addValue("attemptIds", attemptId, key); const taskId = metadata.attemptTask.get(attemptId); if (taskId !== undefined) { addValue("taskIds", taskId, key); const role = metadata.taskRole.get(taskId); if (role !== undefined) addValue("roles", role, key); } }
@@ -320,7 +385,7 @@ function preflightPrimaryPage(values: readonly Primary[], options: NormalizedOpt
   if (values.length > options.maxPrimaryPageRecords) fail("query.result-too-large");
   let bytes = 2; for (let index = 0; index < values.length; index += 1) { bytes = add(bytes, Buffer.byteLength(values[index]!.canonical, "utf8") + (index === 0 ? 0 : 1), "query.result-too-large"); if (bytes > options.maxPrimaryPageBytes) fail("query.result-too-large"); }
 }
-function createClosure(indexes: ValidatedSnapshotIndexes, options: NormalizedOptions, byteMaximum: number) {
+function createClosure(indexes: ValidatedSnapshotIndexes, options: NormalizedOptions, byteMaximum: number, diagnostics?: EvidenceQueryDiagnostics) {
   const selected = new Map<string, { key: SnapshotRecordKey; record: AnyRecord; canonical: string }>();
   const counts: Record<SnapshotRecordKind, number> = { sources: 0, claims: 0, evidence: 0, verifications: 0, requests: 0, calculations: 0 };
   let bytes = Buffer.byteLength(selectionCanonical([]), "utf8"); let edges = 0;
@@ -331,6 +396,7 @@ function createClosure(indexes: ValidatedSnapshotIndexes, options: NormalizedOpt
     try {
       for (let queueIndex = 0; queueIndex < queue.length; queueIndex += 1) {
         const key = queue[queueIndex]!; const encoded = encodedKey(key); if (selected.has(encoded)) continue;
+        bumpQuery(diagnostics, "closureVisits");
         const record = indexes.getExactRecord(key); const canonical = indexes.getCanonicalRecordString(key); if (!record || canonical === undefined) fail("query.unresolved-ref");
         const refs = indexes.getOutgoingReferences(key); const nextEdges = add(edges, refs.length, "query.closure-too-large");
         const nextKind = add(counts[key.kind], 1, "query.closure-too-large"); const nextTotal = add(selected.size, 1, "query.closure-too-large");
@@ -397,6 +463,13 @@ function safeArray(input: unknown, maximum: number, countCode: EvidenceQueryErro
 function dataValue(input: object, key: string, code: EvidenceQueryErrorCode): unknown { const descriptor = Object.getOwnPropertyDescriptor(input, key); if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) fail(code); return descriptor.value; }
 function optionalDataValue(input: object, key: string, code: EvidenceQueryErrorCode): { present: boolean; value?: unknown } { const descriptor = Object.getOwnPropertyDescriptor(input, key); if (!descriptor) return { present: false }; if (!descriptor.enumerable || !("value" in descriptor)) fail(code); return { present: true, value: descriptor.value }; }
 function pairSort(a: readonly [string, unknown], b: readonly [string, unknown]): number { return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0; }
+function validateQueryDiagnostics(value: unknown): asserts value is EvidenceQueryDiagnostics {
+  const keys = ["indexVisits", "candidateVisits", "closureVisits", "normalizedQueryCanonicalizations"];
+  if (utilTypes.isProxy(value) || !isPlain(value)) fail("query.invalid-options"); const ownKeys = Reflect.ownKeys(value);
+  if (ownKeys.length !== keys.length || ownKeys.some((key) => typeof key !== "string" || !keys.includes(key))) fail("query.invalid-options");
+  for (const key of keys) { const descriptor = Object.getOwnPropertyDescriptor(value, key); if (!descriptor || !("value" in descriptor) || !descriptor.writable) fail("query.invalid-options"); const current = descriptor.value; if (!Number.isSafeInteger(current) || current < 0) fail("query.invalid-options"); }
+}
+function bumpQuery(value: EvidenceQueryDiagnostics | undefined, key: keyof EvidenceQueryDiagnostics): void { if (value) value[key] = add(value[key], 1, "query.input-too-large"); }
 function add(a: number, b: number, code: EvidenceQueryErrorCode): number { const value = a + b; if (!Number.isSafeInteger(value)) fail(code); return value; }
 function isPlain(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype; }
 function deepFreeze<T>(value: T): T { if (value && typeof value === "object" && !Object.isFrozen(value)) { for (const child of Object.values(value as object)) deepFreeze(child); Object.freeze(value); } return value; }

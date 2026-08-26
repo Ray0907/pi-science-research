@@ -7,8 +7,8 @@ import type { AttemptRecord, RunSnapshot, TaskRecord } from "../../src/domain/re
 import type { CalculationRecord, ClaimRecord, EvidenceRecord, SourceRecord, VerificationRecord } from "../../src/domain/research-records.js";
 import { EvidenceAdmissionError, buildBoundedValidatedEvidenceSnapshot, type CanonicalEvidenceSet, type EvidenceSnapshotDiagnostics } from "../../src/evidence/admission.js";
 import {
-  EvidenceQueryError, buildEvidenceIndex, buildEvidenceIndexFromRecords,
-  type EvidenceIndexOptions, type EvidenceQuery,
+  EvidenceQueryError, buildEvidenceIndex, buildEvidenceIndexFromRecords, buildEvidenceIndexWithDiagnosticsInternal,
+  type EvidenceIndexOptions, type EvidenceQuery, type EvidenceQueryDiagnostics,
 } from "../../src/evidence/query.js";
 
 const AT = "2026-08-25T12:00:00.000Z";
@@ -72,6 +72,7 @@ function errorCode(action: () => unknown): string | undefined { try { action(); 
   expect((error as Error).message).not.toMatch(/quote|doi\.org|SECRET|logical-/u); return (error as EvidenceQueryError).code;
 } return undefined; }
 function diagnostics(): EvidenceSnapshotDiagnostics { return { canonicalRecordVisits: 0, referenceVisits: 0, revisionIndexInsertions: 0, sourceIdentityVisits: 0, lineageVisits: 0, requestRecordsIndexed: 0, requestUrlVisits: 0, metadataStepVisits: 0 }; }
+function queryDiagnostics(): EvidenceQueryDiagnostics { return { indexVisits: 0, candidateVisits: 0, closureVisits: 0, normalizedQueryCanonicalizations: 0 }; }
 function runSnapshot(): RunSnapshot { return { schemaVersion: 1, runId: RUN, revision: 1, question: "q", language: "en", depth: "standard", reproducible: false, allowCalculations: false, calculationPolicySha256: null, state: "created", checkpointStage: null, executionEpoch: 0, outputRoot: "research/run", roleModels: { coordinator: "p/m", researcher: "p/m", verifier: "p/m" }, roleThinking: { coordinator: "medium", researcher: "medium", verifier: "medium" }, budget: { activeTimeLimitMs: 600_000, activeTimeUsedMs: 0, finalizationReserveMs: 120_000, maxSources: 10, admittedSources: 0, maxWaves: 1, waveOrdinal: 0 }, taskRefs: [], attemptRefs: [], acceptedVerificationRef: null, currentRevisionId: null, blocker: null, createdAt: AT, updatedAt: AT, completedAt: null }; }
 function taskRecord(): TaskRecord { return { schemaVersion: 1, taskId: TASK, revision: 1, description: "task", evidenceRule: claim().evidenceRule, role: "literature-searcher", state: "running", attemptIds: [ATTEMPT_A], blocker: null, resolution: null }; }
 function attemptRecord(): AttemptRecord { return { schemaVersion: 1, attemptId: ATTEMPT_A, revision: 1, runId: RUN, taskId: TASK, executionEpoch: 0, logicalOperationId: "operation", attemptOrdinal: 1, retryOfAttemptId: null, attemptKind: "research", replayPolicy: "safe-read", state: "intent-recorded", providerModel: "p/m", thinkingLevel: "medium", promptTemplateSha256: HASH, renderedPromptSha256: HASH, logicalInputSha256: HASH, attemptEnvelopeSha256: HASH_B, toolAllowlist: [], deadlineAt: AT, capabilityId: "cap", resultSha256: null, billingStatus: "unknown", reportedUsage: null, error: null, createdAt: AT, updatedAt: AT }; }
@@ -147,6 +148,20 @@ describe("bounded evidence queries", () => {
     expect(errorCode(() => buildEvidenceIndex({ snapshot: snapshot(), ledgerEvents: stableOverflow }, { maxStableTasks: 1 }))).toBe("query.metadata-too-large");
   });
   test("filters exact lineage IDs without substring matches", () => { const i = index(); expect(i.query(query({ lineageIds: ["study-src-query"] })).evidence).toHaveLength(0); expect(i.query(query({ lineageIds: [source().lineage.studyId!] })).evidence).toHaveLength(1); });
+  test("accepts schema-valid lineage IDs beyond 4096 code units subject only to filter bytes", () => {
+    const lineageId = "lineage-" + "x".repeat(5_000); const s = source(undefined, { lineage: { ...source().lineage, studyId: lineageId } });
+    const i = index(records({ sources: [s], evidence: [evidence(undefined, { sourceRef: { sourceId: s.sourceId, revision: 1 } })] }), { maxFilterBytes: 20_000 });
+    expect(i.query(query({ lineageIds: [lineageId] })).evidence).toHaveLength(1);
+  });
+  test("preflights raw filter bytes before deduplication and canonicalizes normalized query once", () => {
+    const d = queryDiagnostics(); const i = buildEvidenceIndexWithDiagnosticsInternal({ snapshot: snapshot() }, { maxFilterBytes: 200 }, d);
+    const repeated = "x".repeat(80); expect(errorCode(() => i.query(query({ lineageIds: [repeated, repeated, repeated] })))).toBe("query.filter-too-large");
+    const accessor: string[] = []; Object.defineProperty(accessor, "0", { enumerable: true, get() { throw new Error("SECRET-FILTER"); } });
+    expect(errorCode(() => i.query(query({ lineageIds: accessor })))).toBe("query.invalid-input");
+    expect(errorCode(() => i.query(query({ lineageIds: new Proxy(["id"], { ownKeys() { throw new Error("SECRET-FILTER"); } }) })))).toBe("query.invalid-input");
+    expect(errorCode(() => i.query(query({ lineageIds: [new String("id") as never] })))).toBe("query.invalid-input");
+    i.query(query({ stances: ["supporting", "supporting"] })); expect(d.normalizedQueryCanonicalizations).toBe(1);
+  });
   test("orders selections deterministically and hashes the closed bundle", () => {
     const s1 = source(); const s2 = source("src-query.00000002"); const e1 = evidence(); const e2 = evidence("ev-0000000000000002", { sourceRef: { sourceId: s2.sourceId, revision: 1 } });
     const c = claim(undefined, { evidenceRefs: [{ evidenceId: e1.evidenceId, revision: 1 }, { evidenceId: e2.evidenceId, revision: 1 }] });
@@ -231,5 +246,9 @@ describe("bounded evidence queries", () => {
   });
   test("enforces per-kind total record byte and reference bounds without partial closure", () => { const i = index(connectedRecords(), { maxSelectedPerKind: { sources: 1, claims: 1, evidence: 1, verifications: 1, requests: 1, calculations: 1 }, maxTotalSelectedRecords: 6 }); expect(i.query(query()).sources).toHaveLength(1); });
   test("returns immutable snapshots with no cross-query aliasing", () => { const i = index(); const a = i.query(query()); const b = i.query(query()); expect(Object.isFrozen(a)).toBe(true); expect(Object.isFrozen(a.evidence)).toBe(true); expect(a.evidence[0]).not.toBe(b.evidence[0]); expect(() => ((a.evidence[0] as { confidence: number }).confidence = 0)).toThrow(); });
-  test("uses indexes rather than full corpus scans for selective queries", () => { const many = Array.from({ length: 50 }, (_, n) => evidence(`ev-${String(n + 1).padStart(16, "0")}`)); const c = claim(undefined, { evidenceRefs: many.map(({ evidenceId, revision }) => ({ evidenceId, revision })) }); const i = index(records({ claims: [c], evidence: many })); expect(i.query(query({ evidenceRefs: [{ evidenceId: many[25]!.evidenceId, revision: 1 }] })).evidence.some((e) => e.evidenceId === many[25]!.evidenceId)).toBe(true); });
+  test("uses indexes rather than full corpus scans for selective queries", () => {
+    const corpus = (count: number): CanonicalEvidenceSet => { const claims = Array.from({ length: count }, (_, n) => claim(`claim-${String(n + 1).padStart(16, "0")}`, { evidenceRefs: [{ evidenceId: `ev-${String(n + 1).padStart(16, "0")}`, revision: 1 }] })); const evidenceValues = claims.map((item, n) => evidence(`ev-${String(n + 1).padStart(16, "0")}`, { claimRef: { claimId: item.claimId, revision: 1 } })); return records({ claims, evidence: evidenceValues }); };
+    const run = (count: number) => { const d = queryDiagnostics(); const set = corpus(count); const i = buildEvidenceIndexWithDiagnosticsInternal({ snapshot: snapshot(set) }, undefined, d); i.query(query({ evidenceRefs: [{ evidenceId: set.evidence[0]!.evidenceId, revision: 1 }] })); return d; };
+    const n = run(8); const twice = run(16); expect(twice.indexVisits).toBeGreaterThan(n.indexVisits); expect(twice.candidateVisits).toBe(n.candidateVisits); expect(twice.closureVisits).toBe(n.closureVisits); expect(n.candidateVisits).toBe(1); expect(n.closureVisits).toBeLessThanOrEqual(3); expect([n.normalizedQueryCanonicalizations, twice.normalizedQueryCanonicalizations]).toEqual([1, 1]);
+  });
 });
