@@ -303,30 +303,65 @@ export function validateRetrySeries(attemptInputs: readonly unknown[], scheduleI
   for (const [index, input] of scheduleInputs.entries()) collectParsed(parse(RetryScheduleSchema, input), `/schedules/${index}`, schedules, issues);
   if (issues.length > 0) return { success: false, issues };
 
+  const groups = new Map<string, AttemptGroup>();
   const attemptIds = new Set<string>();
-  const attemptEnvelopeHashes = new Set<string>();
-  attempts.forEach((attempt, index) => {
-    if (attemptIds.has(attempt.attemptId)) issues.push(issue(`/attempts/${index}/attemptId`, "retry.duplicate-attempt-id"));
-    if (attemptEnvelopeHashes.has(attempt.attemptEnvelopeSha256)) issues.push(issue(`/attempts/${index}/attemptEnvelopeSha256`, "retry.duplicate-envelope"));
-    attemptIds.add(attempt.attemptId);
-    attemptEnvelopeHashes.add(attempt.attemptEnvelopeSha256);
-  });
-
-  const scheduleIds = new Set<string>();
-  schedules.forEach((schedule, index) => {
-    if (scheduleIds.has(schedule.scheduleId)) issues.push(issue(`/schedules/${index}/scheduleId`, "retry.duplicate-schedule-id"));
-    scheduleIds.add(schedule.scheduleId);
-  });
-
-  const groups = new Map<string, IndexedAttempt[]>();
+  const envelopeHashes = new Set<string>();
   attempts.forEach((attempt, inputIndex) => {
     const indexed = { attempt, inputIndex };
-    groups.set(attempt.logicalOperationId, [...(groups.get(attempt.logicalOperationId) ?? []), indexed]);
+    if (attemptIds.has(attempt.attemptId)) issues.push(issue(`/attempts/${inputIndex}/attemptId`, "retry.duplicate-attempt-id"));
+    if (envelopeHashes.has(attempt.attemptEnvelopeSha256)) issues.push(issue(`/attempts/${inputIndex}/attemptEnvelopeSha256`, "retry.duplicate-envelope"));
+    attemptIds.add(attempt.attemptId);
+    envelopeHashes.add(attempt.attemptEnvelopeSha256);
+    let group = groups.get(attempt.logicalOperationId);
+    if (!group) {
+      group = { attempts: [], byOrdinal: new Map(), attemptIds: new Set(), minimum: indexed, maximum: indexed };
+      groups.set(attempt.logicalOperationId, group);
+    }
+    group.attempts.push(indexed);
+    group.attemptIds.add(attempt.attemptId);
+    if (group.byOrdinal.has(attempt.attemptOrdinal)) issues.push(issue(`/attempts/${inputIndex}/attemptOrdinal`, "retry.duplicate-ordinal"));
+    else group.byOrdinal.set(attempt.attemptOrdinal, indexed);
+    if (attempt.attemptOrdinal < group.minimum.attempt.attemptOrdinal) group.minimum = indexed;
+    if (attempt.attemptOrdinal > group.maximum.attempt.attemptOrdinal) group.maximum = indexed;
   });
-  for (const [logicalOperationId, group] of groups) validateGroup(logicalOperationId, group, schedules.filter((schedule) => schedule.logicalOperationId === logicalOperationId), issues);
-  schedules.forEach((schedule, index) => {
-    if (!groups.has(schedule.logicalOperationId)) issues.push(issue(`/schedules/${index}`, "retry.orphan-logical-operation"));
+
+  const indexedSchedules: IndexedSchedule[] = [];
+  const schedulesByLogical = new Map<string, IndexedSchedule[]>();
+  const schedulesByEdge = new Map<string, IndexedSchedule[]>();
+  const scheduleIds = new Set<string>();
+  schedules.forEach((schedule, inputIndex) => {
+    const indexed = { schedule, inputIndex };
+    indexedSchedules.push(indexed);
+    if (scheduleIds.has(schedule.scheduleId)) issues.push(issue(`/schedules/${inputIndex}/scheduleId`, "retry.duplicate-schedule-id"));
+    scheduleIds.add(schedule.scheduleId);
+    pushIndexed(schedulesByLogical, schedule.logicalOperationId, indexed);
+    pushIndexed(schedulesByEdge, retryEdgeKey(schedule.logicalOperationId, schedule.failedAttemptId, schedule.nextAttemptOrdinal), indexed);
   });
+
+  const consumedScheduleIndices = new Set<number>();
+  for (const [logicalOperationId, group] of groups) {
+    validateAttemptGroup(logicalOperationId, group, schedulesByEdge, consumedScheduleIndices, issues);
+    const groupSchedules = schedulesByLogical.get(logicalOperationId) ?? [];
+    if (group.byOrdinal.get(1)?.attempt.replayPolicy === "never") {
+      for (const { inputIndex } of groupSchedules) issues.push(issue(`/schedules/${inputIndex}`, "retry.never-scheduled"));
+    }
+    const pending: IndexedSchedule[] = [];
+    for (const indexed of groupSchedules) if (!consumedScheduleIndices.has(indexed.inputIndex)) pending.push(indexed);
+    if (pending.length > 1) for (const { inputIndex } of pending) issues.push(issue(`/schedules/${inputIndex}`, "retry.multiple-pending"));
+    if (pending.length === 1) {
+      const { schedule, inputIndex } = pending[0]!;
+      const last = group.maximum.attempt;
+      if (schedule.failedAttemptId !== last.attemptId || schedule.nextAttemptOrdinal !== last.attemptOrdinal + 1 || last.state !== "retryable-failed") {
+        issues.push(issue(`/schedules/${inputIndex}`, "retry.non-immediate-pending"));
+      }
+    }
+    for (const { schedule, inputIndex } of groupSchedules) {
+      if (!group.attemptIds.has(schedule.failedAttemptId)) issues.push(issue(`/schedules/${inputIndex}/failedAttemptId`, "retry.orphan-failed-attempt"));
+    }
+  }
+  for (const { schedule, inputIndex } of indexedSchedules) {
+    if (!groups.has(schedule.logicalOperationId)) issues.push(issue(`/schedules/${inputIndex}/logicalOperationId`, "retry.orphan-logical-operation"));
+  }
   return issues.length === 0 ? { success: true, value: { attempts, schedules } } : { success: false, issues };
 }
 
@@ -335,47 +370,52 @@ function collectParsed<T>(result: ParseResult<T>, prefix: string, output: T[], i
   else issues.push(...result.issues.map((item) => issue(`${prefix}${item.path === "/" ? "" : item.path}`, item.code)));
 }
 
-interface IndexedAttempt {
-  attempt: AttemptRecord;
-  inputIndex: number;
+interface IndexedAttempt { attempt: AttemptRecord; inputIndex: number }
+interface IndexedSchedule { schedule: RetrySchedule; inputIndex: number }
+interface AttemptGroup {
+  attempts: IndexedAttempt[];
+  byOrdinal: Map<number, IndexedAttempt>;
+  attemptIds: Set<string>;
+  minimum: IndexedAttempt;
+  maximum: IndexedAttempt;
 }
 
-function validateGroup(logicalOperationId: string, unsorted: IndexedAttempt[], schedules: RetrySchedule[], issues: ValidationIssue[]): void {
-  const group = [...unsorted].sort((a, b) => a.attempt.attemptOrdinal - b.attempt.attemptOrdinal);
-  const first = group[0]?.attempt;
-  if (!first) return;
-  const immutable: (keyof AttemptRecord)[] = ["runId", "taskId", "attemptKind", "providerModel", "promptTemplateSha256", "logicalInputSha256", "toolAllowlist", "deadlineAt", "replayPolicy"];
-  group.forEach(({ attempt, inputIndex }, index) => {
-    const inputPath = `/attempts/${inputIndex}`;
-    if (attempt.attemptOrdinal !== index + 1) issues.push(issue(`${inputPath}/attemptOrdinal`, "retry.nonconsecutive-ordinal"));
-    for (const key of immutable) if (JSON.stringify(attempt[key]) !== JSON.stringify(first[key])) issues.push(issue(`${inputPath}/${String(key)}`, "retry.immutable-change"));
-    if (index > 0) {
-      const predecessor = group[index - 1]!.attempt;
-      if (attempt.retryOfAttemptId !== predecessor.attemptId) issues.push(issue(`${inputPath}/retryOfAttemptId`, "retry.wrong-backlink"));
-      if (predecessor.state !== "retryable-failed") issues.push(issue(inputPath, "retry.invalid-predecessor-state"));
-      const edge = schedules.filter((schedule) => schedule.failedAttemptId === predecessor.attemptId && schedule.nextAttemptOrdinal === attempt.attemptOrdinal);
-      if (edge.length !== 1) issues.push(issue(inputPath, "retry.schedule-edge-count"));
-    }
-  });
-  if (first.replayPolicy === "never" && schedules.length > 0) issues.push(issue("/schedules", "retry.never-scheduled"));
+const RETRY_IMMUTABLE_FIELDS: readonly (keyof AttemptRecord)[] = ["runId", "taskId", "attemptKind", "providerModel", "promptTemplateSha256", "logicalInputSha256", "toolAllowlist", "deadlineAt", "replayPolicy"];
 
-  const consumed = new Set<string>();
-  for (let index = 1; index < group.length; index += 1) {
-    const predecessor = group[index - 1]!.attempt;
-    const attempt = group[index]!.attempt;
-    for (const schedule of schedules.filter((candidate) => candidate.failedAttemptId === predecessor.attemptId && candidate.nextAttemptOrdinal === attempt.attemptOrdinal)) consumed.add(schedule.scheduleId);
+function validateAttemptGroup(logicalOperationId: string, group: AttemptGroup, schedulesByEdge: Map<string, IndexedSchedule[]>, consumed: Set<number>, issues: ValidationIssue[]): void {
+  const first = (group.byOrdinal.get(1) ?? group.minimum).attempt;
+  for (const indexed of group.attempts) {
+    const { attempt, inputIndex } = indexed;
+    const inputPath = `/attempts/${inputIndex}`;
+    const uniqueOrdinal = group.byOrdinal.get(attempt.attemptOrdinal) === indexed;
+    if ((attempt.attemptOrdinal === group.minimum.attempt.attemptOrdinal && !group.byOrdinal.has(1)) || (uniqueOrdinal && attempt.attemptOrdinal > group.attempts.length)) {
+      issues.push(issue(`${inputPath}/attemptOrdinal`, "retry.nonconsecutive-ordinal"));
+    }
+    for (const key of RETRY_IMMUTABLE_FIELDS) {
+      if (JSON.stringify(attempt[key]) !== JSON.stringify(first[key])) issues.push(issue(`${inputPath}/${String(key)}`, "retry.immutable-change"));
+    }
+    if (attempt.attemptOrdinal === 1) continue;
+    const predecessor = group.byOrdinal.get(attempt.attemptOrdinal - 1)?.attempt;
+    if (!predecessor) continue;
+    if (attempt.retryOfAttemptId !== predecessor.attemptId) issues.push(issue(`${inputPath}/retryOfAttemptId`, "retry.wrong-backlink"));
+    if (predecessor.state !== "retryable-failed") issues.push(issue(inputPath, "retry.invalid-predecessor-state"));
+    const edge = schedulesByEdge.get(retryEdgeKey(logicalOperationId, predecessor.attemptId, attempt.attemptOrdinal)) ?? [];
+    if (edge.length !== 1) issues.push(issue(inputPath, "retry.schedule-edge-count"));
+    edge.forEach(({ inputIndex: scheduleIndex }, edgeIndex) => {
+      consumed.add(scheduleIndex);
+      if (edgeIndex > 0) issues.push(issue(`/schedules/${scheduleIndex}`, "retry.duplicate-schedule-edge"));
+    });
   }
-  const pending = schedules.filter((schedule) => !consumed.has(schedule.scheduleId));
-  if (pending.length > 1) issues.push(issue("/schedules", "retry.multiple-pending"));
-  if (pending.length === 1) {
-    const schedule = pending[0]!;
-    const last = group.at(-1)!.attempt;
-    if (schedule.failedAttemptId !== last.attemptId || schedule.nextAttemptOrdinal !== last.attemptOrdinal + 1 || last.state !== "retryable-failed") issues.push(issue("/schedules", "retry.non-immediate-pending"));
-  }
-  for (const schedule of schedules) {
-    if (!group.some(({ attempt }) => attempt.attemptId === schedule.failedAttemptId)) issues.push(issue("/schedules", "retry.orphan-failed-attempt"));
-  }
-  void logicalOperationId;
+}
+
+function retryEdgeKey(logicalOperationId: string, failedAttemptId: string, nextAttemptOrdinal: number): string {
+  return JSON.stringify([logicalOperationId, failedAttemptId, nextAttemptOrdinal]);
+}
+
+function pushIndexed<T>(index: Map<string, T[]>, key: string, value: T): void {
+  const values = index.get(key);
+  if (values) values.push(value);
+  else index.set(key, [value]);
 }
 
 export { parse } from "./schema.js";

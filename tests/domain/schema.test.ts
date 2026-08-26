@@ -1,3 +1,4 @@
+import { Type } from "typebox";
 import { describe, expect, test } from "vitest";
 import {
   AttemptKindSchema,
@@ -314,12 +315,62 @@ describe("closed record schemas", () => {
     expectValid(RetryScheduleSchema, scheduleFixture({ logicalOperationId: "", reasonClass: "" }));
   });
 
-  test("enforces task state matrix", () => {
-    expectValid(TaskRecordSchema, { ...taskFixture(), state: "blocked", blocker });
-    expectValid(TaskRecordSchema, { ...taskFixture(), state: "resolved", resolution: "done" });
-    expectInvalid(TaskRecordSchema, { ...taskFixture(), state: "blocked" });
-    expectInvalid(TaskRecordSchema, { ...taskFixture(), state: "resolved" });
-    expectInvalid(TaskRecordSchema, { ...taskFixture(), state: "open", blocker });
+  test("enforces every task state matrix row", () => {
+    const rows = [
+      ["open", null, null],
+      ["ready", null, null],
+      ["running", null, null],
+      ["blocked", blocker, null],
+      ["resolved", null, "done"],
+      ["cancelled", null, null],
+    ] as const;
+    for (const [state, stateBlocker, resolution] of rows) {
+      expectValid(TaskRecordSchema, { ...taskFixture(), state, blocker: stateBlocker, resolution });
+      if (state === "blocked") {
+        expectInvalid(TaskRecordSchema, { ...taskFixture(), state, blocker: null });
+        expectInvalid(TaskRecordSchema, { ...taskFixture(), state, blocker, resolution: "done" });
+      } else if (state === "resolved") {
+        expectInvalid(TaskRecordSchema, { ...taskFixture(), state, resolution: null });
+        expectInvalid(TaskRecordSchema, { ...taskFixture(), state, blocker, resolution: "done" });
+      } else {
+        expectInvalid(TaskRecordSchema, { ...taskFixture(), state, blocker });
+        expectInvalid(TaskRecordSchema, { ...taskFixture(), state, resolution: "done" });
+      }
+    }
+  });
+
+  test("runs refinements inside arrays and nested objects with stable prefixed issues", () => {
+    const CompositeSchema = Type.Object({
+      attempts: Type.Array(AttemptRecordSchema),
+      nested: Type.Object({
+        task: TaskRecordSchema,
+        run: RunSnapshotSchema,
+        schedule: RetryScheduleSchema,
+        manifest: CanonicalTransactionManifestSchema,
+      }, { additionalProperties: false }),
+    }, { additionalProperties: false });
+    const secret = "sk-must-not-appear";
+    const result = parse(CompositeSchema, {
+      attempts: [attemptFixture({ deadlineAt: "2026-02-31T12:34:56.789Z" })],
+      nested: {
+        task: { ...taskFixture(), state: "blocked", blocker: null },
+        run: { ...runFixture(), state: "failed", blocker: null },
+        schedule: scheduleFixture({ notBeforeAt: "2026-02-31T12:34:56.789Z", reasonClass: secret }),
+        manifest: { ...manifestFixture(), createdAt: "2026-02-31T12:34:56.789Z", files: [{ ...manifestFixture().files[0], relativePath: "C:secret" }] },
+      },
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.issues).toEqual([
+        { path: "/attempts/0/deadlineAt", code: "schema.timestamp" },
+        { path: "/nested/task/blocker", code: "task.blocker-state" },
+        { path: "/nested/run/blocker", code: "run.state-blocker" },
+        { path: "/nested/schedule/notBeforeAt", code: "schedule.timestamp" },
+        { path: "/nested/manifest/createdAt", code: "schema.timestamp" },
+        { path: "/nested/manifest/files/0/relativePath", code: "manifest.relative-path" },
+      ]);
+      expect(JSON.stringify(result.issues)).not.toContain(secret);
+    }
   });
 
   test("rejects syntactically shaped but impossible timestamps", () => {
@@ -346,6 +397,54 @@ describe("closed record schemas", () => {
     expectInvalid(AttemptRecordSchema, attemptFixture({ reportedUsage: usage }));
     expectInvalid(AttemptRecordSchema, attemptFixture({ billingStatus: "reported", reportedUsage: { ...usage, currency: null } }));
     expectInvalid(AttemptRecordSchema, attemptFixture({ billingStatus: "reported", reportedUsage: { ...usage, inputTokens: -1 } }));
+  });
+
+  test("accepts all superseded result and error combinations", () => {
+    const failure = { class: "late", message: "diagnostic" };
+    for (const resultSha256 of [null, H]) {
+      for (const error of [null, failure]) expectValid(AttemptRecordSchema, attemptFixture({ state: "superseded", resultSha256, error }));
+    }
+  });
+
+  test("rejects non-finite and negative budget and usage numbers", () => {
+    const invalidNumbers = [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY];
+    const budgetFields = ["activeTimeLimitMs", "activeTimeUsedMs", "finalizationReserveMs", "maxSources", "admittedSources", "maxWaves", "waveOrdinal"] as const;
+    for (const field of budgetFields) {
+      for (const value of invalidNumbers) expectInvalid(RunSnapshotSchema, runFixture({ budget: { ...runFixture().budget, [field]: value } }), `/budget/${field}`);
+      expectInvalid(RunSnapshotSchema, runFixture({ budget: { ...runFixture().budget, [field]: -1 } }), `/budget/${field}`);
+    }
+    const usageFields = ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "reasoningTokens", "cost"] as const;
+    for (const field of usageFields) {
+      for (const value of invalidNumbers) expectInvalid(AttemptRecordSchema, attemptFixture({ billingStatus: "reported", reportedUsage: { ...usage, [field]: value } }), `/reportedUsage/${field}`);
+      expectInvalid(AttemptRecordSchema, attemptFixture({ billingStatus: "reported", reportedUsage: { ...usage, [field]: -1 } }), `/reportedUsage/${field}`);
+    }
+  });
+
+  test("enforces every run state matrix row", () => {
+    const rows = [
+      ["created", null, null, null, null],
+      ["planning", "planning", null, null, null],
+      ["researching", "researching", null, null, null],
+      ["verifying", "verifying", null, null, null],
+      ["synthesizing", "synthesizing", null, null, null],
+      ["recovering", "researching", null, null, null],
+      ["paused", null, null, null, null],
+      ["failed", null, blocker, null, null],
+      ["cancelled", null, null, null, null],
+      ["completed", "synthesizing", null, NOW, ids.revision],
+    ] as const;
+    for (const [state, checkpointStage, stateBlocker, completedAt, currentRevisionId] of rows) {
+      const valid = { ...runFixture(), state, checkpointStage, blocker: stateBlocker, completedAt, currentRevisionId };
+      expectValid(RunSnapshotSchema, valid);
+      if (state === "failed") expectInvalid(RunSnapshotSchema, { ...valid, blocker: null });
+      else if (state === "paused") expectValid(RunSnapshotSchema, { ...valid, blocker });
+      else expectInvalid(RunSnapshotSchema, { ...valid, blocker });
+      if (state === "created") expectInvalid(RunSnapshotSchema, { ...valid, checkpointStage: "planning" });
+      if (["planning", "researching", "verifying", "synthesizing"].includes(state)) expectInvalid(RunSnapshotSchema, { ...valid, checkpointStage: state === "planning" ? "researching" : "planning" });
+      if (state === "recovering") expectInvalid(RunSnapshotSchema, { ...valid, checkpointStage: null });
+      if (state === "completed") expectInvalid(RunSnapshotSchema, { ...valid, checkpointStage: "planning", completedAt: null, currentRevisionId: null });
+      else expectInvalid(RunSnapshotSchema, { ...valid, completedAt: NOW, currentRevisionId: ids.revision });
+    }
   });
 
   test("enforces run budget, lifecycle, and calculation matrices", () => {
@@ -445,6 +544,31 @@ describe("retry series", () => {
       logicalOperationId: "logical-2",
     });
     expect(validateRetrySeries([attemptFixture(), distinctIdentity], []).success).toBe(false);
+  });
+
+  test("reports unsorted pending, orphan, and duplicate schedules at original indices", () => {
+    const pendingLate = scheduleFixture({ scheduleId: "retry-bcdefghijklmnopq", nextAttemptOrdinal: 3 });
+    const pendingImmediate = scheduleFixture({ scheduleId: "retry-cdefghijklmnopqr", nextAttemptOrdinal: 2 });
+    const pending = validateRetrySeries([failed], [pendingLate, pendingImmediate]);
+    expect(pending.success).toBe(false);
+    if (!pending.success) {
+      expect(pending.issues).toContainEqual({ path: "/schedules/0", code: "retry.multiple-pending" });
+      expect(pending.issues).toContainEqual({ path: "/schedules/1", code: "retry.multiple-pending" });
+    }
+
+    const orphan = validateRetrySeries([failed], [
+      scheduleFixture({ scheduleId: "retry-bcdefghijklmnopq", logicalOperationId: "missing" }),
+      scheduleFixture({ scheduleId: "retry-cdefghijklmnopqr", failedAttemptId: ids.attempt2 }),
+    ]);
+    expect(orphan.success).toBe(false);
+    if (!orphan.success) {
+      expect(orphan.issues).toContainEqual({ path: "/schedules/0/logicalOperationId", code: "retry.orphan-logical-operation" });
+      expect(orphan.issues).toContainEqual({ path: "/schedules/1/failedAttemptId", code: "retry.orphan-failed-attempt" });
+    }
+
+    const duplicate = validateRetrySeries([failed], [scheduleFixture(), scheduleFixture({ nextAttemptOrdinal: 3 })]);
+    expect(duplicate.success).toBe(false);
+    if (!duplicate.success) expect(duplicate.issues).toContainEqual({ path: "/schedules/1/scheduleId", code: "retry.duplicate-schedule-id" });
   });
 
   test("rejects duplicate, orphan, non-immediate, and never schedules", () => {
