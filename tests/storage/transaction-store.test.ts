@@ -9,6 +9,7 @@ import type { FoundationEventPayload, FoundationEventType, FoundationLedgerEvent
 import type { AttemptRecord, RunSnapshot, TaskRecord } from "../../src/domain/records.js";
 import {
   commitTransaction,
+  inspectCanonicalTransactionsReadOnly,
   listCommittedTransactions,
   prepareTransaction,
   reconcileCanonicalTransactions,
@@ -851,6 +852,74 @@ describe("canonical transaction store", () => {
     await expectCode(reconcileCanonicalTransactions(runRoot, [...base, badRecords]), "transaction.missing-object");
     const badAttempt = event("attempt_committed", { attemptId: ATTEMPT, transactionId: TX, taskId: TASK, sourceResultSeq: 7 });
     await expect(reconcileCanonicalTransactions(runRoot, [...base, badAttempt])).rejects.toMatchObject({ name: "LedgerReducerCorruptionError" });
+  });
+});
+
+describe("read-only transaction race resistance", () => {
+  test("rejects committed-directory replacement with identical bytes", async () => {
+    const runRoot = await root();
+    await committed(runRoot);
+    const directory = join(runRoot, `.state/transactions/committed/${TX}`);
+    const moved = `${directory}.moved`;
+    const manifestBefore = await readFile(join(directory, "manifest.json"));
+    let swapped = false;
+    await expectCode(inspectCanonicalTransactionsReadOnly(runRoot, baseEvents(), {
+      onReadOnlyCheck: async (phase) => {
+        if (phase === "transaction-directory-pinned" && !swapped) {
+          swapped = true;
+          await rename(directory, moved);
+          await cp(moved, directory, { recursive: true });
+        }
+      },
+    }), "transaction.unsafe-file");
+    expect(await readFile(join(directory, "manifest.json"))).toEqual(manifestBefore);
+    expect(await readFile(join(moved, "manifest.json"))).toEqual(manifestBefore);
+  });
+
+  test("rejects identical file replacement and symlink swap after pinning", async () => {
+    for (const swap of ["file", "symlink"] as const) {
+      const runRoot = await root();
+      await committed(runRoot);
+      const manifest = join(runRoot, `.state/transactions/committed/${TX}/manifest.json`);
+      const moved = `${manifest}.${swap}`;
+      const original = await readFile(manifest);
+      let swapped = false;
+      await expectCode(inspectCanonicalTransactionsReadOnly(runRoot, baseEvents(), {
+        onReadOnlyCheck: async (phase, path) => {
+          if (phase === "file-pinned" && path === manifest && !swapped) {
+            swapped = true;
+            await rename(manifest, moved);
+            if (swap === "file") await writeFile(manifest, original, { mode: 0o600 });
+            else await symlink(moved, manifest);
+          }
+        },
+      }), "transaction.unsafe-file");
+      expect(await readFile(moved)).toEqual(original);
+      if (swap === "file") expect(await readFile(manifest)).toEqual(original);
+    }
+  });
+
+  test("rejects in-place mutation restored to identical bytes and mtime", async () => {
+    const runRoot = await root();
+    await committed(runRoot);
+    const manifest = join(runRoot, `.state/transactions/committed/${TX}/manifest.json`);
+    const original = await readFile(manifest);
+    const before = await lstat(manifest);
+    let mutated = false;
+    await expectCode(inspectCanonicalTransactionsReadOnly(runRoot, baseEvents(), {
+      onReadOnlyCheck: async (phase, path) => {
+        if (phase === "file-chunk-read" && path === manifest && !mutated) {
+          mutated = true;
+          const changed = Buffer.from(original);
+          changed[0] = changed[0]! ^ 1;
+          await writeFile(manifest, changed);
+          await writeFile(manifest, original);
+          await utimes(manifest, before.atime, before.mtime);
+        }
+      },
+    }), "transaction.unsafe-file");
+    expect(await readFile(manifest)).toEqual(original);
+    expect((await lstat(manifest)).mtimeMs).toBeCloseTo(before.mtimeMs, 0);
   });
 });
 

@@ -54,6 +54,7 @@ export async function readFoundationStatus(request: FoundationStatusRequest): Pr
       earliestNotBeforeAt,
       uncertainNeverBlockers,
       pendingTransactions: transactions.pendingCount,
+      unmaterializedResults: transactions.unmaterializedResultCount,
       committedTransactions: transactions.committedCount,
       executionEpoch: reduced.currentEpoch,
       integrity: "verified",

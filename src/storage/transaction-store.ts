@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { constants } from "node:fs";
+import { constants, type BigIntStats } from "node:fs";
 import {
   lstat,
   mkdir,
@@ -10,7 +10,7 @@ import {
   unlink,
   type FileHandle,
 } from "node:fs/promises";
-import { join, resolve, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { TextDecoder, types as utilTypes } from "node:util";
 
 import { canonicalJson } from "../crypto/canonical-json.js";
@@ -120,6 +120,7 @@ export interface TransactionStoreOptions {
   isProcessAlive?: (pid: number) => boolean | Promise<boolean>;
   lockTrashMinAgeMs?: number;
   onAncestorCheck?: (phase: string) => void | Promise<void>;
+  onReadOnlyCheck?: (phase: string, path: string) => void | Promise<void>;
 }
 
 export interface TransactionManifestRef {
@@ -146,6 +147,7 @@ export type TransactionReconciliationDecision = Readonly<{
 export interface ReadOnlyTransactionIntegrity {
   readonly committedCount: number;
   readonly pendingCount: number;
+  readonly unmaterializedResultCount: number;
 }
 
 export type TransactionStoreErrorCode =
@@ -192,7 +194,7 @@ export async function prepareTransaction(
     const built = buildTransaction(snapshot, limits, catalog);
     const committedPath = transactionDirectory(root, "committed", built.manifest.transactionId);
     if (await pathExists(committedPath)) {
-      const verified = await verifyDirectory(root, "committed", built.manifest.transactionId, limits);
+      const verified = await verifyDirectory(root, "committed", built.manifest.transactionId, limits, options);
       if (verified.manifestSha256 !== built.manifestSha256) fail("transaction.id-conflict");
       return preparedResult(built.manifest, built.manifestSha256, "committed");
     }
@@ -206,7 +208,7 @@ export async function prepareTransaction(
       } else {
         let verified: VerifiedTransaction;
         try {
-          verified = await verifyDirectory(root, ".staging", built.manifest.transactionId, limits);
+          verified = await verifyDirectory(root, ".staging", built.manifest.transactionId, limits, options);
         } catch {
           fail("transaction.staging-corrupt");
         }
@@ -241,7 +243,7 @@ export async function commitTransaction(
     const limits = limitsFrom(options);
     const committedPath = transactionDirectory(root, "committed", transactionId);
     if (await pathExists(committedPath)) {
-      const existing = await verifyDirectory(root, "committed", transactionId, limits);
+      const existing = await verifyDirectory(root, "committed", transactionId, limits, options);
       const stagePath = transactionDirectory(root, ".staging", transactionId);
       if (await pathExists(stagePath)) {
         await cleanupMatchingStaging(root, transactionId, existing, limits, options, guard);
@@ -252,7 +254,7 @@ export async function commitTransaction(
       return manifestRef(existing.manifest, existing.manifestSha256);
     }
 
-    const staged = await verifyDirectory(root, ".staging", transactionId, limits).catch((error) => {
+    const staged = await verifyDirectory(root, ".staging", transactionId, limits, options).catch((error) => {
       if (error instanceof TransactionStoreError && error.code === "transaction.missing-object") fail("transaction.not-prepared");
       throw error;
     });
@@ -269,7 +271,7 @@ export async function commitTransaction(
     await assertPinnedHierarchy(guard, "after-rename", options);
     await protocolStep("renamed", options);
     await syncRenameParents(root, options);
-    const verified = await verifyDirectory(root, "committed", transactionId, limits);
+    const verified = await verifyDirectory(root, "committed", transactionId, limits, options);
     if (verified.manifestSha256 !== staged.manifestSha256) fail("transaction.corrupt");
     return manifestRef(verified.manifest, verified.manifestSha256);
   });
@@ -284,7 +286,7 @@ export async function verifyTransaction(
   const root = await initializeRoot(runRoot, options);
   assertManifestRef(snapshot);
   return withRootLock(root, async () => {
-    const verified = await verifyDirectory(root, "committed", snapshot.transactionId, limitsFrom(options));
+    const verified = await verifyDirectory(root, "committed", snapshot.transactionId, limitsFrom(options), options);
     if (snapshot.relativePath !== manifestRef(verified.manifest, verified.manifestSha256).relativePath
       || snapshot.sha256 !== verified.manifestSha256) fail("transaction.corrupt");
     return verified;
@@ -304,7 +306,7 @@ export async function listCommittedTransactions(
       return entry.name as TransactionId;
     }).sort();
     const output: VerifiedTransaction[] = [];
-    for (const transactionId of names) output.push(await verifyDirectory(root, "committed", transactionId, limitsFrom(options)));
+    for (const transactionId of names) output.push(await verifyDirectory(root, "committed", transactionId, limitsFrom(options), options));
     return output;
   });
 }
@@ -348,7 +350,7 @@ export async function inspectCanonicalTransactionsReadOnly(
         const result = results.get(event.payload.transactionId);
         const attempt = result ? ledger.attempts.get(result.payload.attemptId) : undefined;
         if (!result || !attempt) fail("transaction.corrupt");
-        const verified = await verifyCommittedEvent(root, event, limits);
+        const verified = await verifyCommittedEvent(root, event, limits, options);
         assertResultManifestLink(result, verified.manifest, ledger.runId, attempt);
         validateCatalogAndReferences(verified.records, catalog, limits);
         verifiedByTransaction.set(event.payload.transactionId, verified);
@@ -360,21 +362,30 @@ export async function inspectCanonicalTransactionsReadOnly(
       }
     }
     let pendingCount = 0;
+    let unmaterializedResultCount = 0;
     for (const [transactionId, result] of results) {
       if (recordCommits.has(transactionId)) {
-        if (!attemptCommits.has(transactionId)) pendingCount++;
+        if (!attemptCommits.has(transactionId)) {
+          const attempt = ledger.attempts.get(result.payload.attemptId);
+          if (!attempt) fail("transaction.corrupt");
+          const decision = recoveryDecisionFor(reduced, attempt.logicalOperationId);
+          if (decision.kind === "finish-transaction" && decision.transactionId === transactionId) pendingCount++;
+        }
         continue;
       }
       const attempt = ledger.attempts.get(result.payload.attemptId);
       if (!attempt) fail("transaction.corrupt");
       const directory = transactionDirectory(root, "committed", transactionId as TransactionId);
-      if (await pathExists(directory)) {
-        const verified = await verifyDirectory(root, "committed", transactionId as TransactionId, limits);
+      const materialized = await pathExists(directory);
+      if (materialized) {
+        const verified = await verifyDirectory(root, "committed", transactionId as TransactionId, limits, options);
         assertResultManifestLink(result, verified.manifest, ledger.runId, attempt);
         validateCatalogAndReferences(verified.records, catalog, limits);
+        const decision = recoveryDecisionFor(reduced, attempt.logicalOperationId);
+        if (decision.kind === "finish-transaction" && decision.transactionId === transactionId) pendingCount++;
+      } else {
+        unmaterializedResultCount++;
       }
-      const decision = recoveryDecisionFor(reduced, attempt.logicalOperationId);
-      if (decision.kind === "finish-transaction" && decision.transactionId === transactionId) pendingCount++;
     }
     const committedDirectory = join(root, ".state/transactions/committed");
     if (await pathExists(committedDirectory)) {
@@ -388,7 +399,7 @@ export async function inspectCanonicalTransactionsReadOnly(
       fail("transaction.missing-object");
     }
     await assertPinnedHierarchy(guard, "read-only-after", options);
-    return Object.freeze({ committedCount: attemptCommits.size, pendingCount });
+    return Object.freeze({ committedCount: attemptCommits.size, pendingCount, unmaterializedResultCount });
   } finally {
     await Promise.all(guard.map(({ handle }) => handle.close().catch(() => undefined)));
   }
@@ -412,7 +423,7 @@ export async function reconcileCanonicalTransactions(
     let ledgerCatalog = emptyCatalog();
     for (const event of events) {
       if (event.type !== "records_committed") continue;
-      const verified = await verifyCommittedEvent(root, event, limitsFrom(options));
+      const verified = await verifyCommittedEvent(root, event, limitsFrom(options), options);
       ledgerCatalog = validateCatalogAndReferences(verified.records, ledgerCatalog, limitsFrom(options));
     }
     const decisions: TransactionReconciliationDecision[] = [];
@@ -421,12 +432,12 @@ export async function reconcileCanonicalTransactions(
       const attempt = ledger.attempts.get(result.payload.attemptId);
       if (!attempt) fail("transaction.corrupt");
       if (commit) {
-        const verified = await verifyCommittedEvent(root, commit, limitsFrom(options));
+        const verified = await verifyCommittedEvent(root, commit, limitsFrom(options), options);
         assertResultManifestLink(result, verified.manifest, ledger.runId, attempt);
       } else {
         const directory = transactionDirectory(root, "committed", transactionId as TransactionId);
         if (await pathExists(directory)) {
-          const verified = await verifyDirectory(root, "committed", transactionId as TransactionId, limitsFrom(options));
+          const verified = await verifyDirectory(root, "committed", transactionId as TransactionId, limitsFrom(options), options);
           assertResultManifestLink(result, verified.manifest, ledger.runId, attempt);
           validateCatalogAndReferences(verified.records, ledgerCatalog, limitsFrom(options));
           const decision = recoveryDecisionFor(reduced, attempt.logicalOperationId);
@@ -438,7 +449,7 @@ export async function reconcileCanonicalTransactions(
     }
     for (const commit of commits.values()) {
       if (!results.has(commit.payload.transactionId)) fail("transaction.corrupt");
-      await verifyCommittedEvent(root, commit, limitsFrom(options));
+      await verifyCommittedEvent(root, commit, limitsFrom(options), options);
     }
     const committedEntries = await readdir(join(root, ".state/transactions/committed"), { withFileTypes: true })
       .catch(() => fail("transaction.io-failed"));
@@ -466,7 +477,7 @@ export async function reconstructCanonicalRecords(
     const identities = new Set<string>();
     for (const event of events) {
       if (event.type !== "records_committed" || !accepted.has(event.payload.transactionId)) continue;
-      const verified = await verifyCommittedEvent(root, event, limitsFrom(options));
+      const verified = await verifyCommittedEvent(root, event, limitsFrom(options), options);
       for (const kind of KINDS) {
         const metadata = KIND_ID[kind];
         for (const record of verified.records[kind]) {
@@ -782,49 +793,116 @@ function addRecordsToCatalog(records: Record<CanonicalRecordKind, JsonRecord[]>,
   }
 }
 
-async function verifyDirectory(root: string, location: ".staging" | "committed", transactionId: string, limits: Limits): Promise<VerifiedTransaction> {
+interface PinnedTransactionDirectory {
+  path: string;
+  handle: FileHandle;
+  dev: bigint;
+  ino: bigint;
+  ctimeNs: bigint;
+}
+
+async function verifyDirectory(
+  root: string,
+  location: ".staging" | "committed",
+  transactionId: string,
+  limits: Limits,
+  options: TransactionStoreOptions = {},
+): Promise<VerifiedTransaction> {
   const directory = transactionDirectory(root, location, transactionId);
   if (!(await pathExists(directory))) fail("transaction.missing-object");
-  await assertOwnedDirectory(directory);
-  const entries = await readdir(directory, { withFileTypes: true }).catch(() => fail("transaction.corrupt"));
-  const expected = new Set([...KINDS.map((kind) => `${kind}.jsonl`), MANIFEST_FILE]);
-  if (entries.some((entry) => entry.isSymbolicLink())) fail("transaction.unsafe-file");
-  if (entries.length !== expected.size || entries.some((entry) => !entry.isFile() || !expected.has(entry.name))) fail("transaction.corrupt");
-  const manifestBytes = await readSafeFile(join(directory, MANIFEST_FILE), Math.min(limits.maxFileBytes, limits.maxLineBytes), limits);
-  let transactionBytes = manifestBytes.byteLength;
-  const manifestInput = parseCanonicalSingleJson(manifestBytes, limits);
-  const parsed = parse(CanonicalTransactionManifestSchema, manifestInput);
-  if (!parsed.success) fail("transaction.corrupt");
-  const manifest = parsed.value;
-  if (manifest.transactionId !== transactionId || manifest.files.length !== KINDS.length
-    || manifest.files.some((file, index) => file.kind !== KINDS[index] || file.relativePath !== `${file.kind}.jsonl`)) fail("transaction.corrupt");
-  const records = Object.create(null) as Record<CanonicalRecordKind, JsonRecord[]>;
-  for (const [index, kind] of KINDS.entries()) {
-    const file = manifest.files[index]!;
-    const bytes = await readSafeFile(join(directory, file.relativePath), limits.maxFileBytes, limits);
-    transactionBytes += bytes.byteLength;
-    if (transactionBytes > limits.maxTransactionBytes) fail("transaction.file-too-large");
-    if (bytes.byteLength !== file.decodedBytes || sha256Hex(bytes) !== file.sha256) fail("transaction.corrupt");
-    const parsedRecords = parseJsonLines(bytes, limits);
-    if (parsedRecords.length !== file.recordCount) fail("transaction.corrupt");
-    records[kind] = validateAndSortRecords(kind, parsedRecords, manifest.attemptId, limits);
-    if (!Buffer.from(records[kind].map((record) => `${canonicalJson(record)}\n`).join(""), "utf8").equals(bytes)) fail("transaction.corrupt");
+  const container = await pinTransactionDirectory(dirname(directory));
+  let pinned: PinnedTransactionDirectory | undefined;
+  try {
+    pinned = await pinTransactionDirectory(directory);
+    await assertPinnedTransactionDirectory(container);
+    await invokeReadOnlyCheck(options, "transaction-directory-pinned", directory);
+    await assertPinnedTransactionDirectory(container);
+    await assertPinnedTransactionDirectory(pinned);
+    const entries = await readdir(directory, { withFileTypes: true }).catch(() => fail("transaction.corrupt"));
+    await assertPinnedTransactionDirectory(container);
+    await assertPinnedTransactionDirectory(pinned);
+    const expected = new Set([...KINDS.map((kind) => `${kind}.jsonl`), MANIFEST_FILE]);
+    if (entries.some((entry) => entry.isSymbolicLink())) fail("transaction.unsafe-file");
+    if (entries.length !== expected.size || entries.some((entry) => !entry.isFile() || !expected.has(entry.name))) fail("transaction.corrupt");
+    const manifestBytes = await readSafeFile(join(directory, MANIFEST_FILE), Math.min(limits.maxFileBytes, limits.maxLineBytes), limits, pinned, options);
+    let transactionBytes = manifestBytes.byteLength;
+    const manifestInput = parseCanonicalSingleJson(manifestBytes, limits);
+    const parsed = parse(CanonicalTransactionManifestSchema, manifestInput);
+    if (!parsed.success) fail("transaction.corrupt");
+    const manifest = parsed.value;
+    if (manifest.transactionId !== transactionId || manifest.files.length !== KINDS.length
+      || manifest.files.some((file, index) => file.kind !== KINDS[index] || file.relativePath !== `${file.kind}.jsonl`)) fail("transaction.corrupt");
+    const records = Object.create(null) as Record<CanonicalRecordKind, JsonRecord[]>;
+    for (const [index, kind] of KINDS.entries()) {
+      const file = manifest.files[index]!;
+      const bytes = await readSafeFile(join(directory, file.relativePath), limits.maxFileBytes, limits, pinned, options);
+      transactionBytes += bytes.byteLength;
+      if (transactionBytes > limits.maxTransactionBytes) fail("transaction.file-too-large");
+      if (bytes.byteLength !== file.decodedBytes || sha256Hex(bytes) !== file.sha256) fail("transaction.corrupt");
+      const parsedRecords = parseJsonLines(bytes, limits);
+      if (parsedRecords.length !== file.recordCount) fail("transaction.corrupt");
+      records[kind] = validateAndSortRecords(kind, parsedRecords, manifest.attemptId, limits);
+      if (!Buffer.from(records[kind].map((record) => `${canonicalJson(record)}\n`).join(""), "utf8").equals(bytes)) fail("transaction.corrupt");
+      await assertPinnedTransactionDirectory(container);
+      await assertPinnedTransactionDirectory(pinned);
+    }
+    const expectedRefs = referencesFrom(records);
+    if (canonicalJson(expectedRefs) !== canonicalJson({
+      sourceRefs: manifest.sourceRefs,
+      claimRefs: manifest.claimRefs,
+      evidenceRefs: manifest.evidenceRefs,
+      verificationRefs: manifest.verificationRefs,
+      requestIds: manifest.requestIds,
+      calculationIds: manifest.calculationIds,
+    })) fail("transaction.corrupt");
+    await invokeReadOnlyCheck(options, "transaction-directory-final", directory);
+    await assertPinnedTransactionDirectory(container);
+    await assertPinnedTransactionDirectory(pinned);
+    return {
+      manifest: structuredClone(manifest),
+      manifestSha256: sha256Hex(manifestBytes),
+      manifestPath: relativeManifestPath(location, transactionId),
+      records,
+    };
+  } finally {
+    await pinned?.handle.close().catch(() => undefined);
+    await container.handle.close().catch(() => undefined);
   }
-  const expectedRefs = referencesFrom(records);
-  if (canonicalJson(expectedRefs) !== canonicalJson({
-    sourceRefs: manifest.sourceRefs,
-    claimRefs: manifest.claimRefs,
-    evidenceRefs: manifest.evidenceRefs,
-    verificationRefs: manifest.verificationRefs,
-    requestIds: manifest.requestIds,
-    calculationIds: manifest.calculationIds,
-  })) fail("transaction.corrupt");
-  return {
-    manifest: structuredClone(manifest),
-    manifestSha256: sha256Hex(manifestBytes),
-    manifestPath: relativeManifestPath(location, transactionId),
-    records,
-  };
+}
+
+async function pinTransactionDirectory(path: string): Promise<PinnedTransactionDirectory> {
+  const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+  const directoryFlag = typeof constants.O_DIRECTORY === "number" ? constants.O_DIRECTORY : 0;
+  let handle: FileHandle | undefined;
+  try {
+    handle = await open(path, constants.O_RDONLY | noFollow | directoryFlag);
+    const descriptor = await handle.stat({ bigint: true });
+    const pathname = await lstat(path, { bigint: true });
+    if (!descriptor.isDirectory() || pathname.isSymbolicLink() || !pathname.isDirectory()
+      || descriptor.dev !== pathname.dev || descriptor.ino !== pathname.ino || descriptor.ctimeNs !== pathname.ctimeNs) fail("transaction.unsafe-file");
+    return { path, handle, dev: descriptor.dev, ino: descriptor.ino, ctimeNs: descriptor.ctimeNs };
+  } catch (error) {
+    await handle?.close().catch(() => undefined);
+    throw normalize(error, "transaction.unsafe-file");
+  }
+}
+
+async function assertPinnedTransactionDirectory(pinned: PinnedTransactionDirectory): Promise<void> {
+  try {
+    const [descriptor, pathname] = await Promise.all([
+      pinned.handle.stat({ bigint: true }),
+      lstat(pinned.path, { bigint: true }),
+    ]);
+    if (!descriptor.isDirectory() || pathname.isSymbolicLink() || !pathname.isDirectory()
+      || descriptor.dev !== pinned.dev || descriptor.ino !== pinned.ino || descriptor.ctimeNs !== pinned.ctimeNs
+      || pathname.dev !== pinned.dev || pathname.ino !== pinned.ino || pathname.ctimeNs !== pinned.ctimeNs) fail("transaction.unsafe-file");
+  } catch (error) {
+    throw normalize(error, "transaction.unsafe-file");
+  }
+}
+
+async function invokeReadOnlyCheck(options: TransactionStoreOptions, phase: string, path: string): Promise<void> {
+  try { await options.onReadOnlyCheck?.(phase, path); } catch { fail("transaction.unsafe-file"); }
 }
 
 function parseCanonicalSingleJson(bytes: Buffer, limits: Limits): unknown {
@@ -856,8 +934,13 @@ function parseJsonLines(bytes: Buffer, limits: Limits): JsonRecord[] {
   });
 }
 
-async function verifyCommittedEvent(root: string, event: Extract<FoundationLedgerEvent, { type: "records_committed" }>, limits: Limits): Promise<VerifiedTransaction> {
-  const verified = await verifyDirectory(root, "committed", event.payload.transactionId, limits).catch((error) => {
+async function verifyCommittedEvent(
+  root: string,
+  event: Extract<FoundationLedgerEvent, { type: "records_committed" }>,
+  limits: Limits,
+  options: TransactionStoreOptions = {},
+): Promise<VerifiedTransaction> {
+  const verified = await verifyDirectory(root, "committed", event.payload.transactionId, limits, options).catch((error) => {
     if (error instanceof TransactionStoreError && error.code === "transaction.missing-object") fail("transaction.missing-object");
     throw error;
   });
@@ -1104,36 +1187,79 @@ async function protocolStep(step: TransactionProtocolStep, options: TransactionS
   try { await options.onStep?.(step); } catch { fail("transaction.io-failed"); }
 }
 
-async function readSafeFile(path: string, maxBytes: number, limits: Limits): Promise<Buffer> {
+async function readSafeFile(
+  path: string,
+  maxBytes: number,
+  limits: Limits,
+  parent?: PinnedTransactionDirectory,
+  options: TransactionStoreOptions = {},
+): Promise<Buffer> {
   const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
   let handle: FileHandle | undefined;
-  let initial: Awaited<ReturnType<FileHandle["stat"]>> | undefined;
+  let initial: BigIntStats | undefined;
+  let initialPath: BigIntStats | undefined;
   const parts: Buffer[] = [];
   let total = 0;
   try {
+    if (parent) await assertPinnedTransactionDirectory(parent);
+    // Darwin/Node has no openat for child reads; O_NOFOLLOW pathname open is
+    // therefore bracketed by pinned-parent and descriptor/path identity checks.
     handle = await open(path, constants.O_RDONLY | noFollow);
-    initial = await handle.stat();
-    if (!initial.isFile() || initial.nlink !== 1) fail("transaction.unsafe-file");
-    if (initial.size > maxBytes) fail("transaction.file-too-large");
+    if (parent) await assertPinnedTransactionDirectory(parent);
+    initial = await handle.stat({ bigint: true });
+    initialPath = await lstat(path, { bigint: true });
+    assertStablePinnedFile(initial, initialPath);
+    if (initial.size > BigInt(maxBytes)) fail("transaction.file-too-large");
+    await invokeReadOnlyCheck(options, "file-pinned", path);
+    await assertStablePinnedFilePath(handle, path, initial, parent);
     for (;;) {
       const remainingProbe = maxBytes + 1 - total;
       const buffer = Buffer.allocUnsafe(Math.min(READ_CHUNK_BYTES, remainingProbe));
       const bytesRead = await limits.readChunk(handle, buffer, total);
       if (!Number.isSafeInteger(bytesRead) || bytesRead < 0 || bytesRead > buffer.byteLength) fail("transaction.unsafe-file");
+      await invokeReadOnlyCheck(options, "file-chunk-read", path);
+      await assertStablePinnedFilePath(handle, path, initial, parent);
       if (bytesRead === 0) break;
       total += bytesRead;
       if (total > maxBytes) fail("transaction.file-too-large");
       parts.push(Buffer.from(buffer.subarray(0, bytesRead)));
     }
-    const after = await handle.stat();
-    if (!after.isFile() || after.nlink !== 1 || after.dev !== initial.dev || after.ino !== initial.ino
-      || after.size !== total || after.size !== initial.size || after.mtimeMs !== initial.mtimeMs) fail("transaction.unsafe-file");
+    const after = await handle.stat({ bigint: true });
+    const afterPath = await lstat(path, { bigint: true });
+    assertStablePinnedFile(after, afterPath);
+    if (after.dev !== initial.dev || after.ino !== initial.ino || after.size !== initial.size
+      || after.mtimeNs !== initial.mtimeNs || after.ctimeNs !== initial.ctimeNs || after.size !== BigInt(total)) fail("transaction.unsafe-file");
+    if (parent) await assertPinnedTransactionDirectory(parent);
     return Buffer.concat(parts, total);
   } catch (error) {
     throw normalize(error, "transaction.unsafe-file");
   } finally {
     await handle?.close().catch(() => undefined);
   }
+}
+
+function assertStablePinnedFile(
+  descriptor: BigIntStats,
+  pathname: BigIntStats,
+): void {
+  if (!descriptor.isFile() || !pathname.isFile() || pathname.isSymbolicLink()
+    || descriptor.nlink !== 1n || pathname.nlink !== 1n
+    || descriptor.dev !== pathname.dev || descriptor.ino !== pathname.ino || descriptor.size !== pathname.size
+    || descriptor.mtimeNs !== pathname.mtimeNs || descriptor.ctimeNs !== pathname.ctimeNs) fail("transaction.unsafe-file");
+}
+
+async function assertStablePinnedFilePath(
+  handle: FileHandle,
+  path: string,
+  initial: BigIntStats,
+  parent?: PinnedTransactionDirectory,
+): Promise<void> {
+  const descriptor = await handle.stat({ bigint: true });
+  const pathname = await lstat(path, { bigint: true });
+  assertStablePinnedFile(descriptor, pathname);
+  if (descriptor.dev !== initial.dev || descriptor.ino !== initial.ino || descriptor.size !== initial.size
+    || descriptor.mtimeNs !== initial.mtimeNs || descriptor.ctimeNs !== initial.ctimeNs) fail("transaction.unsafe-file");
+  if (parent) await assertPinnedTransactionDirectory(parent);
 }
 
 function preparedResult(manifest: CanonicalTransactionManifest, sha256: string, location: ".staging" | "committed"): PreparedTransaction {

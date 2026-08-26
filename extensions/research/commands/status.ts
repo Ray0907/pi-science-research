@@ -19,6 +19,7 @@ export interface FoundationStatus {
   earliestNotBeforeAt: string | null;
   uncertainNeverBlockers: number;
   pendingTransactions: number;
+  unmaterializedResults: number;
   committedTransactions: number;
   executionEpoch: number;
   integrity: "verified";
@@ -49,7 +50,7 @@ export function createResearchStatusHandler(readStatus: ResearchStatusReader) {
       }
       assertSafeStatus(status);
       const warning = status.pendingSafeReadSchedules > 0 || status.uncertainNeverBlockers > 0
-        || status.pendingTransactions > 0 || status.tasksByState.blocked > 0;
+        || status.pendingTransactions > 0 || status.unmaterializedResults > 0 || status.tasksByState.blocked > 0;
       context.ui.notify(renderFoundationStatus(status), warning ? "warning" : "info");
     } catch {
       context.ui.notify(INTEGRITY_ERROR, "error");
@@ -83,7 +84,7 @@ function assertSafeStatus(status: FoundationStatus): void {
   const runStates = new Set<RunState>(["created", "planning", "researching", "verifying", "synthesizing", "recovering", "paused", "failed", "cancelled", "completed"]);
   if (!/^run-[a-z0-9]{16,64}$/.test(status.runId) || !runStates.has(status.state) || status.integrity !== "verified") throw new Error("invalid status");
   const counts = [status.taskTotal, status.attemptTotal, status.pendingSafeReadSchedules, status.uncertainNeverBlockers,
-    status.pendingTransactions, status.committedTransactions, status.executionEpoch, ...TASK_STATES.map((state) => status.tasksByState[state])];
+    status.pendingTransactions, status.unmaterializedResults, status.committedTransactions, status.executionEpoch, ...TASK_STATES.map((state) => status.tasksByState[state])];
   if (counts.some((count) => !Number.isSafeInteger(count) || count < 0)
     || TASK_STATES.reduce((sum, state) => sum + status.tasksByState[state], 0) !== status.taskTotal) throw new Error("invalid status");
   if (status.pendingSafeReadSchedules === 0 ? status.earliestNotBeforeAt !== null
@@ -93,5 +94,5 @@ function assertSafeStatus(status: FoundationStatus): void {
 export function renderFoundationStatus(status: FoundationStatus): string {
   const tasks = TASK_STATES.flatMap((state) => status.tasksByState[state] > 0 ? [`${state}=${status.tasksByState[state]}`] : []);
   const earliest = status.earliestNotBeforeAt === null ? "" : ` (earliest ${status.earliestNotBeforeAt})`;
-  return `Research run ${status.runId}: state=${status.state}; tasks=${status.taskTotal} (${tasks.join(", ")}); attempts=${status.attemptTotal}; safe-read pending=${status.pendingSafeReadSchedules}${earliest}; never blockers=${status.uncertainNeverBlockers}; transactions=${status.committedTransactions} committed/${status.pendingTransactions} pending; epoch=${status.executionEpoch}; integrity=${status.integrity}.`;
+  return `Research run ${status.runId}: state=${status.state}; tasks=${status.taskTotal} (${tasks.join(", ")}); attempts=${status.attemptTotal}; safe-read pending=${status.pendingSafeReadSchedules}${earliest}; never blockers=${status.uncertainNeverBlockers}; transactions=${status.committedTransactions} committed/${status.pendingTransactions} pending-finish; unmaterialized results=${status.unmaterializedResults}; epoch=${status.executionEpoch}; integrity=${status.integrity}.`;
 }

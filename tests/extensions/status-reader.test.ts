@@ -85,7 +85,7 @@ describe("readFoundationStatus", () => {
     expect(status).toEqual({
       runId: RUN, state: "created", tasksByState: { open: 0, ready: 0, running: 0, blocked: 0, resolved: 0, cancelled: 0 },
       taskTotal: 0, attemptTotal: 0, pendingSafeReadSchedules: 0, earliestNotBeforeAt: null,
-      uncertainNeverBlockers: 0, pendingTransactions: 0, committedTransactions: 0, executionEpoch: 0, integrity: "verified",
+      uncertainNeverBlockers: 0, pendingTransactions: 0, unmaterializedResults: 0, committedTransactions: 0, executionEpoch: 0, integrity: "verified",
     });
     expect(await snapshotTree(root)).toEqual(before);
     expect(JSON.stringify(status)).not.toContain("SECRET");
@@ -123,7 +123,26 @@ describe("readFoundationStatus", () => {
     expect((await readFoundationStatus({ cwd: cancelled.project, rootPath: cancelled.root }))?.pendingSafeReadSchedules).toBe(0);
   });
 
-  test("reports a valid committed object without records_committed as pending and verifies committed links", async () => {
+  test("separates absent and staging-only results from pending-finish committed objects", async () => {
+    const absent = await fixture(); await addAttempt(absent.ledger, "research");
+    await absent.ledger.reserveIdentity("transaction", TX, "parent-generated");
+    await absent.ledger.append("result_recorded", { attemptId: ATTEMPT, resultSha256: HASH, manifestSha256: null, transactionId: TX });
+    await absent.ledger.close();
+    const absentStatus = await readFoundationStatus({ cwd: absent.project, rootPath: absent.root });
+    expect(absentStatus?.pendingTransactions).toBe(0);
+    expect(absentStatus?.unmaterializedResults).toBe(1);
+
+    const staging = await fixture(); await addAttempt(staging.ledger, "research");
+    await staging.ledger.reserveIdentity("transaction", TX, "parent-generated");
+    const stagingResult = await staging.ledger.append("result_recorded", { attemptId: ATTEMPT, resultSha256: HASH, manifestSha256: null, transactionId: TX });
+    await staging.ledger.close();
+    await prepareTransaction(staging.root, { schemaVersion: 1, transactionId: TX, runId: RUN, attemptId: ATTEMPT, sourceResultSeq: stagingResult.seq, createdAt: AT, sources: [], claims: [], evidence: [], verifications: [], requests: [], calculations: [] });
+    const stagingBefore = await snapshotTree(staging.root);
+    const stagingStatus = await readFoundationStatus({ cwd: staging.project, rootPath: staging.root });
+    expect(await snapshotTree(staging.root)).toEqual(stagingBefore);
+    expect(stagingStatus?.pendingTransactions).toBe(0);
+    expect(stagingStatus?.unmaterializedResults).toBe(1);
+
     const pending = await fixture(); await addAttempt(pending.ledger, "research");
     await pending.ledger.reserveIdentity("transaction", TX, "parent-generated");
     const result = await pending.ledger.append("result_recorded", { attemptId: ATTEMPT, resultSha256: HASH, manifestSha256: null, transactionId: TX });
@@ -131,7 +150,9 @@ describe("readFoundationStatus", () => {
     const prepared = await prepareTransaction(pending.root, { schemaVersion: 1, transactionId: TX, runId: RUN, attemptId: ATTEMPT, sourceResultSeq: result.seq, createdAt: AT, sources: [], claims: [], evidence: [], verifications: [], requests: [], calculations: [] });
     const ref = await commitTransaction(pending.root, TX);
     const pendingBefore = await snapshotTree(pending.root);
-    expect((await readFoundationStatus({ cwd: pending.project, rootPath: pending.root }))?.pendingTransactions).toBe(1);
+    const pendingStatus = await readFoundationStatus({ cwd: pending.project, rootPath: pending.root });
+    expect(pendingStatus?.pendingTransactions).toBe(1);
+    expect(pendingStatus?.unmaterializedResults).toBe(0);
     expect(await snapshotTree(pending.root)).toEqual(pendingBefore);
     await writeFile(join(pending.root, ref.relativePath), "{}\n", "utf8");
     await expect(readFoundationStatus({ cwd: pending.project, rootPath: pending.root }))
@@ -144,11 +165,15 @@ describe("readFoundationStatus", () => {
     const committedRef = await commitTransaction(committed.root, TX);
     const records = await committed.ledger.append("records_committed", { transactionId: TX, sourceResultSeq: committedResult.seq, transactionManifestPath: committedRef.relativePath, transactionManifestSha256: committedRef.sha256, sourceRefs: [], claimRefs: [], evidenceRefs: [], verificationRefs: [], requestIds: [], calculationIds: [] });
     expect(records.seq).toBeGreaterThan(committedResult.seq);
+    const recordsOnlyStatus = await readFoundationStatus({ cwd: committed.project, rootPath: committed.root });
+    expect(recordsOnlyStatus?.pendingTransactions).toBe(1);
+    expect(recordsOnlyStatus?.committedTransactions).toBe(0);
     await committed.ledger.append("attempt_committed", { attemptId: ATTEMPT, transactionId: TX, taskId: TASK, sourceResultSeq: committedResult.seq });
     await committed.ledger.close();
     const status = await readFoundationStatus({ cwd: committed.project, rootPath: committed.root });
     expect(status?.committedTransactions).toBe(1);
     expect(status?.pendingTransactions).toBe(0);
+    expect(status?.unmaterializedResults).toBe(0);
     expect(prepared.manifestSha256).toBe(ref.sha256);
     expect(committedPrepared.manifestSha256).toBe(committedRef.sha256);
   });

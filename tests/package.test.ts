@@ -15,6 +15,7 @@ const healthyStatus = {
   earliestNotBeforeAt: null,
   uncertainNeverBlockers: 0,
   pendingTransactions: 0,
+  unmaterializedResults: 0,
   committedTransactions: 0,
   executionEpoch: 0,
   integrity: "verified" as const,
@@ -105,6 +106,7 @@ describe("research-status command", () => {
       earliestNotBeforeAt: "2026-08-25T00:01:00.000Z",
       uncertainNeverBlockers: 1,
       pendingTransactions: 1,
+      unmaterializedResults: 1,
     }));
     const handler = await loadCommand(readStatus);
     await handler('"/tmp/research root"', { cwd: "/project", hasUI: true, mode: "rpc", ui: { notify } });
@@ -112,7 +114,7 @@ describe("research-status command", () => {
     expect(notify).toHaveBeenCalledTimes(1);
     expect(notify.mock.calls[0]![1]).toBe("warning");
     expect(notify.mock.calls[0]![0]).toBe(
-      "Research run run-1234567890abcdef: state=paused; tasks=1 (blocked=1); attempts=1; safe-read pending=1 (earliest 2026-08-25T00:01:00.000Z); never blockers=1; transactions=0 committed/1 pending; epoch=0; integrity=verified.",
+      "Research run run-1234567890abcdef: state=paused; tasks=1 (blocked=1); attempts=1; safe-read pending=1 (earliest 2026-08-25T00:01:00.000Z); never blockers=1; transactions=0 committed/1 pending-finish; unmaterialized results=1; epoch=0; integrity=verified.",
     );
   });
 
