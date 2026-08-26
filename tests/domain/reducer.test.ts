@@ -527,19 +527,27 @@ describe("pure ledger recovery reduction", () => {
     expect(state.currentEpoch).toBe(1);
   });
 
-  test("keeps the started retry resumable when its predecessor result arrives late", () => {
+  test("rejects a late predecessor result before the started retry has an exact dispatch intent", () => {
     const events = scheduledRetryEvents();
     events.add("identity_reserved", { kind: "attempt", id: ATTEMPT_2, origin: "parent-generated" });
     const scheduledSeq = events.values.find((event) => event.type === "retry_scheduled")!.seq;
     events.add("retry_started", { scheduleId: RETRY_1, logicalOperationId: LOGICAL, attemptId: ATTEMPT_2, attemptOrdinal: 2, scheduledFromSeq: scheduledSeq });
     events.result(ATTEMPT_1);
 
-    expect(recoveryDecisionFor(reduceLedgerEvents(events.values), LOGICAL)).toMatchObject({
-      kind: "resume-started-retry",
-      attemptId: ATTEMPT_2,
-      attemptOrdinal: 2,
-      schedule: { scheduleId: RETRY_1 },
-    });
+    expectCorruption(events.values, "reducer.attempt-transition");
+  });
+
+  test("accepts a late predecessor diagnostic only after the exact retry dispatch intent", () => {
+    const events = scheduledRetryEvents();
+    events.add("identity_reserved", { kind: "attempt", id: ATTEMPT_2, origin: "parent-generated" });
+    const scheduledSeq = events.values.find((event) => event.type === "retry_scheduled")!.seq;
+    events.add("retry_started", { scheduleId: RETRY_1, logicalOperationId: LOGICAL, attemptId: ATTEMPT_2, attemptOrdinal: 2, scheduledFromSeq: scheduledSeq });
+    events.add("dispatch_intent", { attempt: attemptRecord({ attemptId: ATTEMPT_2, attemptOrdinal: 2, retryOfAttemptId: ATTEMPT_1, attemptEnvelopeSha256: "c".repeat(64) }) });
+    events.result(ATTEMPT_1);
+
+    const state = reduceLedgerEvents(events.values);
+    expect(state.operations[LOGICAL]!.attempts[0]).toMatchObject({ phase: "quarantined", quarantineReason: "superseded" });
+    expect(recoveryDecisionFor(state, LOGICAL)).toMatchObject({ kind: "needs-retry-schedule", failedAttemptId: ATTEMPT_2 });
   });
 
   test("a committed retry is never replaced by its late superseded predecessor", () => {
@@ -764,7 +772,40 @@ describe("semantic corruption", () => {
     for (const item of cases) expectCorruption(item.build(), item.code);
   });
 
-  test("rejects direct supersession without a durably started distinct replacement", () => {
+  test("rejects retry-started attempt identity theft by unrelated or mismatched dispatch intents", () => {
+    const cases = [
+      attemptRecord({ attemptId: ATTEMPT_2, logicalOperationId: "operation-identity-theft", attemptOrdinal: 1, retryOfAttemptId: null, attemptEnvelopeSha256: "c".repeat(64) }),
+      attemptRecord({ attemptId: ATTEMPT_2, attemptOrdinal: 3, retryOfAttemptId: ATTEMPT_1, attemptEnvelopeSha256: "c".repeat(64) }),
+      attemptRecord({ attemptId: ATTEMPT_2, attemptOrdinal: 2, retryOfAttemptId: ATTEMPT_3, attemptEnvelopeSha256: "c".repeat(64) }),
+    ];
+    for (const stolen of cases) {
+      const events = scheduledRetryEvents();
+      events.add("identity_reserved", { kind: "attempt", id: ATTEMPT_2, origin: "parent-generated" });
+      const scheduledSeq = events.values.find((event) => event.type === "retry_scheduled")!.seq;
+      events.add("retry_started", { scheduleId: RETRY_1, logicalOperationId: LOGICAL, attemptId: ATTEMPT_2, attemptOrdinal: 2, scheduledFromSeq: scheduledSeq });
+      events.add("dispatch_intent", { attempt: stolen });
+      expectCorruption(events.values, "reducer.retry-dispatch-link");
+    }
+  });
+
+  test("rejects duplicate retry_started attempt identities across schedules", () => {
+    const events = scheduledRetryEvents();
+    const secondOperation = "operation-secondary";
+    events.add("identity_reserved", { kind: "attempt", id: ATTEMPT_2, origin: "parent-generated" });
+    events.add("dispatch_intent", { attempt: attemptRecord({ attemptId: ATTEMPT_2, logicalOperationId: secondOperation, attemptEnvelopeSha256: "c".repeat(64) }) });
+    events.started(ATTEMPT_2);
+    events.add("attempt_failed", { attemptId: ATTEMPT_2, state: "retryable-failed", errorClass: "timeout", message: "redacted" });
+    events.add("identity_reserved", { kind: "retry-schedule", id: RETRY_2, origin: "parent-generated" });
+    events.add("retry_scheduled", { scheduleId: RETRY_2, logicalOperationId: secondOperation, failedAttemptId: ATTEMPT_2, nextAttemptOrdinal: 2, notBeforeAt: LATER, delayMs: 1, reasonClass: "transient" });
+    events.add("identity_reserved", { kind: "attempt", id: ATTEMPT_3, origin: "parent-generated" });
+    const firstSeq = events.values.find((event) => event.type === "retry_scheduled" && event.payload.scheduleId === RETRY_1)!.seq;
+    const secondSeq = events.values.find((event) => event.type === "retry_scheduled" && event.payload.scheduleId === RETRY_2)!.seq;
+    events.add("retry_started", { scheduleId: RETRY_1, logicalOperationId: LOGICAL, attemptId: ATTEMPT_3, attemptOrdinal: 2, scheduledFromSeq: firstSeq });
+    events.add("retry_started", { scheduleId: RETRY_2, logicalOperationId: secondOperation, attemptId: ATTEMPT_3, attemptOrdinal: 2, scheduledFromSeq: secondSeq });
+    expectCorruption(events.values, "reducer.duplicate-retry-start");
+  });
+
+  test("rejects direct supersession without a durably started and exactly dispatched replacement", () => {
     for (const started of [false, true]) {
       const events = new Events();
       events.base();
@@ -772,6 +813,13 @@ describe("semantic corruption", () => {
       events.add("attempt_failed", { attemptId: ATTEMPT_1, state: "superseded", errorClass: "invalid", message: "invalid" });
       expectCorruption(events.values, "reducer.superseded-without-replacement");
     }
+
+    const crashPrefix = scheduledRetryEvents();
+    crashPrefix.add("identity_reserved", { kind: "attempt", id: ATTEMPT_2, origin: "parent-generated" });
+    const scheduledSeq = crashPrefix.values.find((event) => event.type === "retry_scheduled")!.seq;
+    crashPrefix.add("retry_started", { scheduleId: RETRY_1, logicalOperationId: LOGICAL, attemptId: ATTEMPT_2, attemptOrdinal: 2, scheduledFromSeq: scheduledSeq });
+    crashPrefix.add("attempt_failed", { attemptId: ATTEMPT_1, state: "superseded", errorClass: "invalid", message: "invalid" });
+    expectCorruption(crashPrefix.values, "reducer.superseded-without-replacement");
   });
 
   test("rejects a second durable schedule for an already consumed retry edge", () => {
@@ -797,7 +845,7 @@ describe("semantic corruption", () => {
     const sourceSeq = backlink.values.find((event) => event.type === "retry_scheduled")!.seq;
     backlink.add("retry_started", { scheduleId: RETRY_1, logicalOperationId: LOGICAL, attemptId: ATTEMPT_2, attemptOrdinal: 2, scheduledFromSeq: sourceSeq });
     backlink.add("dispatch_intent", { attempt: attemptRecord({ attemptId: ATTEMPT_2, attemptOrdinal: 2, retryOfAttemptId: ATTEMPT_3, attemptEnvelopeSha256: "c".repeat(64) }) });
-    expectCorruption(backlink.values, "reducer.retry-backlink");
+    expectCorruption(backlink.values, "reducer.retry-dispatch-link");
   });
 });
 

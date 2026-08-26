@@ -193,6 +193,20 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
         if (record.state !== "intent-recorded") fail(event, index, "reducer.attempt-initial-state");
         if (record.executionEpoch !== currentEpoch || cancelledEpochs.has(currentEpoch)) fail(event, index, "reducer.attempt-epoch");
 
+        const declaredRetry = retryStartsByAttempt.get(record.attemptId);
+        if (declaredRetry) {
+          const linkedOperation = operations.get(declaredRetry.schedule.logicalOperationId)!;
+          const linkedPredecessor = attempts.get(declaredRetry.schedule.failedAttemptId)!;
+          const frozenBaseline = linkedOperation.attempts[0]!.record;
+          const linked = record.logicalOperationId === declaredRetry.schedule.logicalOperationId
+            && record.attemptOrdinal === declaredRetry.schedule.nextAttemptOrdinal
+            && record.retryOfAttemptId === linkedPredecessor.record.attemptId
+            && record.replayPolicy === "safe-read"
+            && declaredRetry.executionEpoch === record.executionEpoch
+            && immutableAttemptFields.every((field) => equalField(record[field], frozenBaseline[field]));
+          if (!linked) fail(event, index, "reducer.retry-dispatch-link");
+        }
+
         let operation = operations.get(record.logicalOperationId);
         if (!operation) {
           operation = { attempts: [], attemptOrdinals: new Set(), schedules: [] };
@@ -208,7 +222,7 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
           for (const field of immutableAttemptFields) {
             if (!equalField(record[field], operation.attempts[0]!.record[field])) fail(event, index, "reducer.retry-immutable");
           }
-          const startedSchedule = retryStartsByAttempt.get(record.attemptId);
+          const startedSchedule = declaredRetry;
           if (!startedSchedule
             || startedSchedule.executionEpoch !== record.executionEpoch
             || startedSchedule.schedule.logicalOperationId !== record.logicalOperationId
@@ -221,6 +235,7 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
         attempts.set(record.attemptId, attempt);
         operation.attempts.push(attempt);
         operation.attemptOrdinals.add(record.attemptOrdinal);
+        if (declaredRetry) startedRetryPredecessors.add(declaredRetry.schedule.failedAttemptId);
         break;
       }
       case "dispatch_started": {
@@ -359,7 +374,6 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
           pendingScheduleOperations.delete(startedSchedule.schedule.logicalOperationId);
         }
         pendingSchedulesByEpoch.get(startedSchedule.executionEpoch)?.delete(startedSchedule);
-        startedRetryPredecessors.add(startedSchedule.schedule.failedAttemptId);
         retryStartsByAttempt.set(event.payload.attemptId, startedSchedule);
         break;
       }
