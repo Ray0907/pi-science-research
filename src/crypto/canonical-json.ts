@@ -66,6 +66,10 @@ function serializeObject(value: object, ancestors: WeakSet<object>): string {
 }
 
 function serializeArray(value: unknown[], ancestors: WeakSet<object>): string {
+  if (Object.getPrototypeOf(value) !== Array.prototype) {
+    fail("non-plain-object");
+  }
+
   const ownKeys = Reflect.ownKeys(value);
   if (
     ownKeys.some(

@@ -53,6 +53,32 @@ describe("canonicalJson", () => {
     expectCanonicalFailure([null, Number.NaN]);
   });
 
+  it("accepts normal dense arrays", () => {
+    expect(canonicalJson([1, "two", null])).toBe('[1,"two",null]');
+  });
+
+  it("rejects Array subclasses", () => {
+    class DerivedArray extends Array<number> {}
+    expectCanonicalFailure(new DerivedArray(1, 2));
+  });
+
+  it("rejects arrays whose prototype differs without invoking prototype getters", () => {
+    let getterCalls = 0;
+    const changedPrototype = Object.create(Array.prototype, {
+      secret: {
+        get: () => {
+          getterCalls += 1;
+          return "secret-value";
+        },
+      },
+    });
+    const value = [1, 2];
+    Object.setPrototypeOf(value, changedPrototype);
+
+    expectCanonicalFailure(value);
+    expect(getterCalls).toBe(0);
+  });
+
   it("rejects sparse arrays and arrays with extra properties", () => {
     const sparse = new Array(2);
     sparse[1] = "value";
