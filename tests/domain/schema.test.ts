@@ -20,6 +20,7 @@ import {
   parse,
   validateRetrySeries,
 } from "../../src/domain/records.js";
+import { issue, registerRefinement } from "../../src/domain/schema.js";
 import {
   ID_PATTERNS,
   createIdGenerator,
@@ -339,6 +340,36 @@ describe("closed record schemas", () => {
     }
   });
 
+  test("evaluates union refinements independent of member order", () => {
+    const invalidTask = { ...taskFixture(), state: "blocked", blocker: null };
+    for (const schema of [Type.Union([Type.Unknown(), TaskRecordSchema]), Type.Union([TaskRecordSchema, Type.Unknown()])]) {
+      expectValid(schema, invalidTask);
+    }
+
+    const RejectingSchema = Type.Object({ value: Type.String() }, { additionalProperties: false });
+    const AcceptingSchema = Type.Object({ value: Type.String() }, { additionalProperties: false });
+    registerRefinement(RejectingSchema, () => [issue("/value", "branch.rejected")]);
+    registerRefinement(AcceptingSchema, () => []);
+    for (const schema of [Type.Union([RejectingSchema, AcceptingSchema]), Type.Union([AcceptingSchema, RejectingSchema])]) {
+      expectValid(schema, { value: "ok" });
+    }
+  });
+
+  test("chooses deterministic best union issues and requires every intersect branch", () => {
+    const BetterSchema = Type.Object({ value: Type.String() }, { additionalProperties: false });
+    const WorseSchema = Type.Object({ value: Type.String() }, { additionalProperties: false });
+    registerRefinement(BetterSchema, () => [issue("/value", "branch.best")]);
+    registerRefinement(WorseSchema, () => [issue("/value", "branch.worse"), issue("/", "branch.extra")]);
+    for (const union of [Type.Union([WorseSchema, BetterSchema]), Type.Union([BetterSchema, WorseSchema])]) {
+      const result = parse(Type.Object({ nested: union }, { additionalProperties: false }), { nested: { value: "x" } });
+      expect(result).toEqual({ success: false, issues: [{ path: "/nested/value", code: "branch.best" }] });
+    }
+    for (const intersection of [Type.Intersect([BetterSchema, Type.Unknown()]), Type.Intersect([Type.Unknown(), BetterSchema])]) {
+      const result = parse(Type.Object({ nested: intersection }, { additionalProperties: false }), { nested: { value: "x" } });
+      expect(result).toEqual({ success: false, issues: [{ path: "/nested/value", code: "branch.best" }] });
+    }
+  });
+
   test("runs refinements inside arrays and nested objects with stable prefixed issues", () => {
     const CompositeSchema = Type.Object({
       attempts: Type.Array(AttemptRecordSchema),
@@ -395,6 +426,8 @@ describe("closed record schemas", () => {
     expectValid(AttemptRecordSchema, attemptFixture({ billingStatus: "reported", reportedUsage: usage }));
     expectInvalid(AttemptRecordSchema, attemptFixture({ billingStatus: "reported" }));
     expectInvalid(AttemptRecordSchema, attemptFixture({ reportedUsage: usage }));
+    expectValid(AttemptRecordSchema, attemptFixture({ billingStatus: "reported", reportedUsage: { ...usage, cost: null, currency: null } }));
+    expectInvalid(AttemptRecordSchema, attemptFixture({ billingStatus: "reported", reportedUsage: { ...usage, cost: null, currency: "USD" } }));
     expectInvalid(AttemptRecordSchema, attemptFixture({ billingStatus: "reported", reportedUsage: { ...usage, currency: null } }));
     expectInvalid(AttemptRecordSchema, attemptFixture({ billingStatus: "reported", reportedUsage: { ...usage, inputTokens: -1 } }));
   });
@@ -442,13 +475,16 @@ describe("closed record schemas", () => {
       if (state === "created") expectInvalid(RunSnapshotSchema, { ...valid, checkpointStage: "planning" });
       if (["planning", "researching", "verifying", "synthesizing"].includes(state)) expectInvalid(RunSnapshotSchema, { ...valid, checkpointStage: state === "planning" ? "researching" : "planning" });
       if (state === "recovering") expectInvalid(RunSnapshotSchema, { ...valid, checkpointStage: null });
-      if (state === "completed") expectInvalid(RunSnapshotSchema, { ...valid, checkpointStage: "planning", completedAt: null, currentRevisionId: null });
-      else expectInvalid(RunSnapshotSchema, { ...valid, completedAt: NOW, currentRevisionId: ids.revision });
+      if (state === "completed") {
+        expectInvalid(RunSnapshotSchema, { ...valid, checkpointStage: "planning" }, "/checkpointStage");
+        expectInvalid(RunSnapshotSchema, { ...valid, completedAt: null }, "/completedAt");
+        expectInvalid(RunSnapshotSchema, { ...valid, currentRevisionId: null }, "/currentRevisionId");
+      } else expectInvalid(RunSnapshotSchema, { ...valid, completedAt: NOW, currentRevisionId: ids.revision });
     }
   });
 
   test("enforces run budget, lifecycle, and calculation matrices", () => {
-    for (const [limit, reserve] of [[300_000, 60_000], [600_000, 120_000], [3_600_000, 600_000]]) {
+    for (const [limit, reserve] of [[100_000, 50_000], [300_000, 60_000], [600_000, 120_000], [3_600_000, 600_000]]) {
       expectValid(RunSnapshotSchema, runFixture({ budget: { ...runFixture().budget, activeTimeLimitMs: limit, finalizationReserveMs: reserve } }));
     }
     expectInvalid(RunSnapshotSchema, runFixture({ budget: { ...runFixture().budget, finalizationReserveMs: 119_999 } }));
@@ -544,6 +580,24 @@ describe("retry series", () => {
       logicalOperationId: "logical-2",
     });
     expect(validateRetrySeries([attemptFixture(), distinctIdentity], []).success).toBe(false);
+  });
+
+  test("bounds duplicate-edge diagnostics under large invalid input", () => {
+    const duplicateAttempts = Array.from({ length: 200 }, (_, index) => attemptFixture({
+      attemptId: `attempt-${(index + 10).toString(36).padStart(16, "0")}`,
+      attemptOrdinal: 2,
+      retryOfAttemptId: ids.attempt,
+      attemptEnvelopeSha256: (index + 10).toString(16).padStart(64, "0"),
+    }));
+    const duplicateEdges = Array.from({ length: 200 }, (_, index) => scheduleFixture({
+      scheduleId: `retry-${(index + 10).toString(36).padStart(16, "0")}`,
+    }));
+    const result = validateRetrySeries([failed, ...duplicateAttempts], duplicateEdges);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.issues.filter(({ code }) => code === "retry.duplicate-schedule-edge")).toHaveLength(199);
+      expect(result.issues.filter(({ code }) => code === "retry.schedule-edge-count")).toHaveLength(1);
+    }
   });
 
   test("reports unsorted pending, orphan, and duplicate schedules at original indices", () => {

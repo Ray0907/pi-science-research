@@ -384,6 +384,7 @@ const RETRY_IMMUTABLE_FIELDS: readonly (keyof AttemptRecord)[] = ["runId", "task
 
 function validateAttemptGroup(logicalOperationId: string, group: AttemptGroup, schedulesByEdge: Map<string, IndexedSchedule[]>, consumed: Set<number>, issues: ValidationIssue[]): void {
   const first = (group.byOrdinal.get(1) ?? group.minimum).attempt;
+  const immutableBaseline = new Map(RETRY_IMMUTABLE_FIELDS.map((key) => [key, JSON.stringify(first[key])] as const));
   for (const indexed of group.attempts) {
     const { attempt, inputIndex } = indexed;
     const inputPath = `/attempts/${inputIndex}`;
@@ -392,9 +393,9 @@ function validateAttemptGroup(logicalOperationId: string, group: AttemptGroup, s
       issues.push(issue(`${inputPath}/attemptOrdinal`, "retry.nonconsecutive-ordinal"));
     }
     for (const key of RETRY_IMMUTABLE_FIELDS) {
-      if (JSON.stringify(attempt[key]) !== JSON.stringify(first[key])) issues.push(issue(`${inputPath}/${String(key)}`, "retry.immutable-change"));
+      if (JSON.stringify(attempt[key]) !== immutableBaseline.get(key)) issues.push(issue(`${inputPath}/${String(key)}`, "retry.immutable-change"));
     }
-    if (attempt.attemptOrdinal === 1) continue;
+    if (!uniqueOrdinal || attempt.attemptOrdinal === 1) continue;
     const predecessor = group.byOrdinal.get(attempt.attemptOrdinal - 1)?.attempt;
     if (!predecessor) continue;
     if (attempt.retryOfAttemptId !== predecessor.attemptId) issues.push(issue(`${inputPath}/retryOfAttemptId`, "retry.wrong-backlink"));
