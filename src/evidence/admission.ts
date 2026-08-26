@@ -43,6 +43,8 @@ export type EvidenceAdmissionErrorCode =
   | "evidence.source-url-unattributed"
   | "evidence.source-url-request-mismatch"
   | "evidence.source-url-metadata-mismatch"
+  | "evidence.source-semantic-invalid"
+  | "evidence.lineage-invalid"
   | "evidence.asymmetric-conflict"
   | "evidence.invalid-prospective-record";
 export class EvidenceAdmissionError extends Error {

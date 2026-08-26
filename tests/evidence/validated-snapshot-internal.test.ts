@@ -189,6 +189,11 @@ describe("validated evidence snapshot internals", () => {
       redirectUrls: [], responseSha256: null, responseFile: null, encodedBytes: 0, decodedBytes: 0, resultSourceIds: [], errorClass: null,
     };
     expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ requests: [request, { ...request }] })))).toBe("evidence.duplicate-request");
+    const semantic = source({ lineage: { ...source().lineage, cohortIds: ["duplicate", "duplicate"] } });
+    expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: [semantic] })))).toBe("evidence.source-semantic-invalid");
+    const a = source({ sourceId: "src-internal.cyclea", identifiers: { doi: "10.1234/cycle-a", pmid: null, pmcid: null }, canonicalUrl: "https://doi.org/10.1234/cycle-a", lineage: { ...source().lineage, studyId: "study-a", relatedSourceIds: ["src-internal.cycleb"], relationTypes: ["version-of"] } });
+    const b = source({ sourceId: "src-internal.cycleb", identifiers: { doi: "10.1234/cycle-b", pmid: null, pmcid: null }, canonicalUrl: "https://doi.org/10.1234/cycle-b", lineage: { ...source().lineage, studyId: "study-b", relatedSourceIds: [a.sourceId], relationTypes: ["version-of"] } });
+    expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: [a, b] })))).toBe("evidence.lineage-invalid");
   });
   test("audits complete strong identity and URL components deterministically", () => {
     const first = source();

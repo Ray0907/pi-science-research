@@ -22,6 +22,7 @@ import {
 export type SourceIdentityErrorCode =
   | "source.invalid-options"
   | "source.invalid-input"
+  | "source.semantic-invalid"
   | "source.too-many-records"
   | "source.too-many-provenance-steps"
   | "source.record-too-large"
@@ -276,7 +277,7 @@ function buildRequestProvenanceIndexInternal(
   if (steps > normalized.maxProvenanceSteps) fail("source.too-many-provenance-steps");
   if (beforeSemantic) for (const { record } of validatedSources) {
     try { validatePreparedSourceIdentityFieldsInternal(record, normalized.sourceUrlPolicy, normalized.maxCanonicalScalarBytes); }
-    catch (error) { if (error instanceof ScholarlyIdentifierError) translateIdentifierError(error); return fail("source.invalid-input"); }
+    catch (error) { if (error instanceof ScholarlyIdentifierError) translateIdentifierErrorForEvidenceSnapshot(error); return fail("source.invalid-input"); }
   }
   for (const { record } of validatedSources) validateSourceSemantics(record);
   const sourceChains = revisionChains(validatedSources, true);
@@ -1109,6 +1110,12 @@ function deepFreeze<T>(value: T): T {
     Object.freeze(value);
   }
   return value;
+}
+function translateIdentifierErrorForEvidenceSnapshot(error: ScholarlyIdentifierError): never {
+  if (error.code === "identifier.invalid-options" || error.code === "url.http-context-invalid") fail("source.invalid-options");
+  if (error.code === "identifier.record-too-large") fail("source.record-too-large");
+  if (error.code.startsWith("url.")) fail("source.url-policy-invalid");
+  return fail("source.semantic-invalid");
 }
 function translateIdentifierError(error: ScholarlyIdentifierError): never {
   if (error.code === "identifier.invalid-options" || error.code === "url.http-context-invalid") fail("source.invalid-options");
