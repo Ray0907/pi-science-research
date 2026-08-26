@@ -98,6 +98,30 @@ function errorCode(action: () => unknown): string | undefined {
 
 function canonicalResult(value: unknown): string { return canonicalJson(value); }
 
+function hostileProxy<T extends object>(target: T): { proxy: T; trapCount: () => number } {
+  let count = 0;
+  const reject = () => { count += 1; throw new Error("SECRET_PROXY_SENTINEL"); };
+  return {
+    proxy: new Proxy(target, {
+      get: reject, getOwnPropertyDescriptor: reject, ownKeys: reject, getPrototypeOf: reject,
+    }),
+    trapCount: () => count,
+  };
+}
+
+function expectProxyRejection(action: () => unknown, code: "source.invalid-input" | "source.invalid-options", trapCount: () => number): void {
+  try {
+    action();
+    throw new Error("expected proxy rejection");
+  } catch (error) {
+    expect(error).toBeInstanceOf(SourceIdentityError);
+    expect((error as SourceIdentityError).code).toBe(code);
+    expect((error as Error).message).toBe(`Source identity rejected (${code})`);
+    expect((error as Error).message).not.toContain("SECRET_PROXY_SENTINEL");
+  }
+  expect(trapCount()).toBe(0);
+}
+
 const DOI = "10.1234/shared";
 const PMID = "123456";
 
@@ -589,6 +613,54 @@ describe("source identity and provenance", () => {
       .toBe("source.url-request-mismatch");
     expect(errorCode(() => validateSourceCanonicalUrlProvenance({ ...source, title: "changed" }, index))).toBe("source.provenance-index-mismatch");
     expect(errorCode(() => validateSourceCanonicalUrlProvenance(source, Object.freeze({ ...index, optionsSha256: "b".repeat(64) })))).toBe("source.provenance-index-mismatch");
+  });
+
+  test("rejects every public Proxy entry before invoking user traps", () => {
+    const source = src("src-hostile.0000001");
+    const request = req(REQUEST_A, source.sourceId);
+    const hostileExisting = hostileProxy([source]);
+    expectProxyRejection(() => mergeSourceRecords(hostileExisting.proxy, []), "source.invalid-input", hostileExisting.trapCount);
+    const hostileIncoming = hostileProxy([source]);
+    expectProxyRejection(() => mergeSourceRecords([], hostileIncoming.proxy), "source.invalid-input", hostileIncoming.trapCount);
+    const hostileSources = hostileProxy([source]);
+    expectProxyRejection(() => buildRequestProvenanceIndex(hostileSources.proxy, []), "source.invalid-input", hostileSources.trapCount);
+    const hostileRequests = hostileProxy([request]);
+    expectProxyRejection(() => buildRequestProvenanceIndex([], hostileRequests.proxy), "source.invalid-input", hostileRequests.trapCount);
+
+    const hostileSourceRecord = hostileProxy(source);
+    expectProxyRejection(() => mergeSourceRecords([hostileSourceRecord.proxy], []), "source.invalid-input", hostileSourceRecord.trapCount);
+    expectProxyRejection(() => buildRequestProvenanceIndex([hostileSourceRecord.proxy], []), "source.invalid-input", hostileSourceRecord.trapCount);
+    const hostileLookupSource = hostileProxy(source);
+    const lookupIndex = buildRequestProvenanceIndex([source], []);
+    expectProxyRejection(
+      () => validateSourceCanonicalUrlProvenance(hostileLookupSource.proxy, lookupIndex),
+      "source.invalid-input", hostileLookupSource.trapCount,
+    );
+    const hostileRequestRecord = hostileProxy(request);
+    expectProxyRejection(() => buildRequestProvenanceIndex([], [hostileRequestRecord.proxy]), "source.invalid-input", hostileRequestRecord.trapCount);
+
+    const hostileOptions = hostileProxy({});
+    expectProxyRejection(() => sourceIdentityKeys(source, hostileOptions.proxy), "source.invalid-options", hostileOptions.trapCount);
+    const hostilePolicy = hostileProxy({});
+    expectProxyRejection(
+      () => sourceIdentityKeys(source, { sourceUrlPolicy: hostilePolicy.proxy }), "source.invalid-options", hostilePolicy.trapCount,
+    );
+    const hostileDiagnostics = hostileProxy(diagnostics());
+    expectProxyRejection(
+      () => buildRequestProvenanceIndex([source], [], undefined, hostileDiagnostics.proxy),
+      "source.invalid-input", hostileDiagnostics.trapCount,
+    );
+
+    for (const action of [
+      (value: unknown) => mergeSourceRecords(value as never, []),
+      (value: unknown) => mergeSourceRecords([], value as never),
+      (value: unknown) => buildRequestProvenanceIndex(value as never, []),
+      (value: unknown) => buildRequestProvenanceIndex([], value as never),
+    ]) {
+      const revoked = Proxy.revocable([], {});
+      revoked.revoke();
+      expectProxyRejection(() => action(revoked.proxy), "source.invalid-input", () => 0);
+    }
   });
 
   test("rejects invalid merge key and byte limits with source.invalid-options", () => {

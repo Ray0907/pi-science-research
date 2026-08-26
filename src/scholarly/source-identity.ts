@@ -248,6 +248,7 @@ export function validatedProvenanceRecordsForSnapshot(index: RequestProvenanceIn
 export function validateSourceCanonicalUrlProvenance(source: SourceRecord, index: RequestProvenanceIndex): SourceUrlProvenance {
   const state = indexState.get(index as object);
   if (!state) fail("source.provenance-index-mismatch");
+  if (utilTypes.isProxy(source)) fail("source.invalid-input");
   let prepared: ReturnType<typeof prepareProspectiveSourceIdentityFields>;
   try {
     prepared = prepareProspectiveSourceIdentityFields(source, state.sourceUrlPolicy, {
@@ -300,6 +301,7 @@ export function mergeSourceRecords(
 }
 
 function validateSource(source: SourceRecord, options: NormalizedOptions): ValidatedSource {
+  if (utilTypes.isProxy(source)) fail("source.invalid-input");
   let prepared: ReturnType<typeof prepareProspectiveSourceIdentityFields>;
   try {
     prepared = prepareProspectiveSourceIdentityFields(source, options.sourceUrlPolicy, {
@@ -335,6 +337,7 @@ function validateSourceSemantics(record: SourceRecord): void {
 }
 
 function validateRequest(input: unknown, options: NormalizedOptions): ValidatedRequest {
+  if (utilTypes.isProxy(input)) fail("source.invalid-input");
   let json: string;
   try {
     assertBoundedStructure(input, {
@@ -719,6 +722,7 @@ function strongKeys(identifiers: SourceRecord["identifiers"]): string[] {
 }
 function normalizeOptions(input?: SourceIdentityOptions): NormalizedOptions {
   if (input === undefined) return finishOptions({}, undefined);
+  if (utilTypes.isProxy(input)) fail("source.invalid-options");
   let snapshot: Record<string, unknown>;
   let originalPolicy: SourceUrlPolicyContext | undefined;
   try {
@@ -819,10 +823,9 @@ function validateDiagnostics(diagnostics: RequestProvenanceDiagnostics | undefin
 }
 
 function safeArray(input: unknown, max: number, countCode: SourceIdentityErrorCode): readonly unknown[] {
-  if (!Array.isArray(input) || utilTypes.isProxy(input) || Object.getPrototypeOf(input) !== Array.prototype || input.length > max) {
-    if (Array.isArray(input) && input.length > max) fail(countCode);
-    return fail("source.invalid-input");
-  }
+  if (utilTypes.isProxy(input)) fail("source.invalid-input");
+  if (!Array.isArray(input) || Object.getPrototypeOf(input) !== Array.prototype) fail("source.invalid-input");
+  if (input.length > max) fail(countCode);
   const keys = Reflect.ownKeys(input);
   if (keys.some((key) => typeof key !== "string" || (key !== "length" && !/^(0|[1-9][0-9]*)$/u.test(key)))) fail("source.invalid-input");
   const output: unknown[] = [];
