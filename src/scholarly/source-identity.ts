@@ -101,13 +101,7 @@ const PROVENANCE_FIELDS = new Set([
 ]);
 const ACCESS_ORDER = ["metadata-only", "abstract-only", "partial-text", "full-text"] as const;
 const indexState = new WeakMap<object, ProvenanceState>();
-const validatedSourceRecordsState = new WeakMap<object, ProvenanceState>();
-declare const validatedSourceRecordsBrand: unique symbol;
-
-/** @internal Opaque handle to Task 2 validated records. */
-export interface ValidatedSourceRecords {
-  readonly [validatedSourceRecordsBrand]: true;
-}
+const validatedSourceRecordsState = new WeakMap<readonly SourceRecord[], ProvenanceState>();
 /** @internal Read-only package lookup; never exported from the package root. */
 export interface ValidatedSourceRecordsInternal {
   readonly sources: readonly SourceRecord[];
@@ -284,21 +278,32 @@ function buildRequestProvenanceIndexInternal(
     optionsSha256: normalized.optionsSha256, policySha256: normalized.policySha256,
   });
   indexState.set(view, state);
+  validatedSourceRecordsState.set(state.sources, state);
   return view;
 }
 
-export function validatedProvenanceRecordsForSnapshot(index: RequestProvenanceIndex): ValidatedSourceRecords {
+export function validatedProvenanceRecordsForSnapshot(index: RequestProvenanceIndex): Readonly<{
+  sources: readonly SourceRecord[];
+  requests: readonly RequestRecord[];
+  sourceCanonicalJson: readonly string[];
+  requestCanonicalJson: readonly string[];
+}> {
   const state = indexState.get(index as object);
   if (!state) fail("source.provenance-index-mismatch");
-  const handle = Object.freeze({}) as ValidatedSourceRecords;
-  validatedSourceRecordsState.set(handle, state);
-  return handle;
+  return Object.freeze({
+    sources: state.sources,
+    requests: state.requests,
+    sourceCanonicalJson: state.sourceCanonicalJson,
+    requestCanonicalJson: state.requestCanonicalJson,
+  });
 }
 
-/** @internal Brand-checks an opaque Task 2 handle for dependent package modules. */
-export function getValidatedSourceRecordsInternal(handle: ValidatedSourceRecords): ValidatedSourceRecordsInternal {
-  const state = validatedSourceRecordsState.get(handle as object);
-  if (!state) fail("source.provenance-index-mismatch");
+/** @internal Brand-checks the exact aligned arrays issued by Task 2. */
+export function getValidatedSourceRecordsInternal(
+  sources: readonly SourceRecord[], sourceCanonicalJson: readonly string[],
+): ValidatedSourceRecordsInternal {
+  const state = validatedSourceRecordsState.get(sources);
+  if (!state || state.sourceCanonicalJson !== sourceCanonicalJson) fail("source.provenance-index-mismatch");
   return Object.freeze({
     sources: state.sources,
     requests: state.requests,

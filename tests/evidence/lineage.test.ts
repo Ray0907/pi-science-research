@@ -160,12 +160,12 @@ describe("source lineage", () => {
       status: "dependent", reasons: [expected[relation], "dependency-component"],
     });
 
-    const article = withLineage(source("src-mixed.article001"), { studyId: "study-article" });
-    const preprint = edge(withLineage(source("src-mixed.preprint01"), { studyId: "study-preprint" }), article, "version-of");
+    const preprint = withLineage(source("src-mixed.preprint01"), { studyId: "study-preprint" });
+    const article = edge(withLineage(source("src-mixed.article001"), { studyId: "study-article" }), preprint, "version-of");
     const correction = edge(withLineage(source("src-mixed.correct001"), { studyId: "study-correction" }), article, "correction-of");
     const publicationChain = buildLineageGraph([correction, article, preprint]);
     expect(publicationChain.edgeCount).toBe(2);
-    expect(decision(publicationChain, preprint, article)).toEqual({
+    expect(decision(publicationChain, article, preprint)).toEqual({
       status: "dependent", reasons: ["version-relation", "dependency-component"],
     });
     expect(decision(publicationChain, correction, article)).toEqual({
@@ -176,17 +176,17 @@ describe("source lineage", () => {
     });
 
     const original = withLineage(source("src-mixed.original01"), { studyId: "study-original" });
-    const report = edge(withLineage(source("src-mixed.report0001"), { studyId: "study-report" }), original, "reports");
     const reanalysis = edge(withLineage(source("src-mixed.reanalyse1"), { studyId: "study-reanalysis" }), original, "reanalysis-of");
+    const report = edge(withLineage(source("src-mixed.report0001"), { studyId: "study-report" }), reanalysis, "reports");
     const analysisChain = buildLineageGraph([reanalysis, report, original]);
     expect(analysisChain.edgeCount).toBe(2);
-    expect(decision(analysisChain, report, original)).toEqual({
+    expect(decision(analysisChain, report, reanalysis)).toEqual({
       status: "dependent", reasons: ["report-relation", "dependency-component"],
     });
     expect(decision(analysisChain, reanalysis, original)).toEqual({
       status: "dependent", reasons: ["reanalysis-relation", "dependency-component"],
     });
-    expect(decision(analysisChain, report, reanalysis)).toEqual({
+    expect(decision(analysisChain, report, original)).toEqual({
       status: "dependent", reasons: ["dependency-component"],
     });
   });
@@ -203,9 +203,14 @@ describe("source lineage", () => {
     expect(code(() => buildLineageGraph([
       edge(a, b, "version-of"), edge(b, c, "reports"), edge(c, a, "reanalysis-of"),
     ]))).toBe("lineage.cycle");
-    const article = source("src-reverse.article01");
-    const preprint = edge(source("src-reverse.preprint1"), article, "version-of");
-    expect(code(() => buildLineageGraph([preprint, edge(article, preprint, "correction-of")])))
+    const preprint = source("src-reverse.preprint1");
+    const article = edge(source("src-reverse.article01"), preprint, "version-of");
+    expect(code(() => buildLineageGraph([article, edge(preprint, article, "correction-of")])))
+      .toBe("lineage.invalid-direction");
+    const original = source("src-reverse.original1");
+    const reanalysis = edge(source("src-reverse.reanalyse"), original, "reanalysis-of");
+    const report = edge(source("src-reverse.report001"), reanalysis, "reports");
+    expect(code(() => buildLineageGraph([report, reanalysis, edge(original, reanalysis, "reports")])))
       .toBe("lineage.invalid-direction");
     expect(code(() => buildLineageGraph([edge(a, b, "shares-cohort"), b]))).toBe("lineage.asymmetric-relation");
     const symmetric = buildLineageGraph([
@@ -311,16 +316,19 @@ describe("source lineage", () => {
 
     const provenance = buildRequestProvenanceIndex([a], []);
     const validated = validatedProvenanceRecordsForSnapshot(provenance);
-    expect(buildLineageGraphFromValidatedSources(validated, {
+    expect(buildLineageGraphFromValidatedSources(validated.sources, validated.sourceCanonicalJson, {
       maxSourceRecordCanonicalBytes: recordBytes, maxAggregateCanonicalBytes: aggregateBytes,
     }).revisionCount).toBe(1);
-    for (const forged of [
-      Object.freeze({}),
-      Object.freeze({ ...validated }),
-      Object.freeze({ sources: Object.freeze([a]), sourceCanonicalJson: Object.freeze([canonicalJson(a)]) }),
-      Object.freeze({ sources: Object.freeze([a]), sourceCanonicalJson: Object.freeze([canonicalJson(source("src-swapped.0000001"))]) }),
-      Object.freeze({ optionsSha256: "b".repeat(64), policySha256: "c".repeat(64) }),
-    ]) expect(code(() => buildLineageGraphFromValidatedSources(forged as never))).toBe("lineage.invalid-input");
+    const otherProvenance = validatedProvenanceRecordsForSnapshot(buildRequestProvenanceIndex([
+      source("src-swapped.0000001"),
+    ], []));
+    for (const [sources, sourceCanonicalJson] of [
+      [Object.freeze([...validated.sources]), validated.sourceCanonicalJson],
+      [validated.sources, Object.freeze([...validated.sourceCanonicalJson])],
+      [validated.sources, otherProvenance.sourceCanonicalJson],
+      [Object.freeze([a]), Object.freeze([canonicalJson(a)])],
+    ] as const) expect(code(() => buildLineageGraphFromValidatedSources(sources, sourceCanonicalJson)))
+      .toBe("lineage.invalid-input");
   });
 
   test("rejects oversized lineage metadata and nested strings under the count cap", () => {

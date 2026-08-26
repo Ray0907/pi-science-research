@@ -10,7 +10,6 @@ import {
   prepareProspectiveSourceCanonicalInternal,
   validatePreparedSourceSemanticsInternal,
   type PreparedProspectiveSourceSemantics,
-  type ValidatedSourceRecords,
 } from "../scholarly/source-identity.js";
 
 export type LineageErrorCode =
@@ -134,12 +133,13 @@ export function buildLineageGraph(sources: readonly SourceRecord[], options?: Li
 
 /** Package-internal snapshot seam; deliberately excluded from the package root. */
 export function buildLineageGraphFromValidatedSources(
-  validatedSources: ValidatedSourceRecords,
+  sources: readonly SourceRecord[],
+  sourceCanonicalJson: readonly string[],
   options?: LineageOptions,
 ): LineageGraph {
   const normalized = normalizeOptions(options);
   let internal: ReturnType<typeof getValidatedSourceRecordsInternal>;
-  try { internal = getValidatedSourceRecordsInternal(validatedSources); }
+  try { internal = getValidatedSourceRecordsInternal(sources, sourceCanonicalJson); }
   catch { return fail("lineage.invalid-input"); }
   if (internal.sources.length > normalized.maxRevisions) fail("lineage.too-many-sources");
   if (internal.sources.length !== internal.sourceCanonicalJson.length) fail("lineage.invalid-input");

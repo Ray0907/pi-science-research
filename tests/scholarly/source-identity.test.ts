@@ -361,11 +361,14 @@ describe("source identity and provenance", () => {
     expect(Object.keys(index).sort()).toEqual(["optionsSha256", "policySha256", "requestCount", "sourceCount", "witnessCount"]);
     expect(Object.isFrozen(index)).toBe(true);
     expect(JSON.stringify(index)).not.toMatch(/example\.org|logical-|query/i);
-    const validatedHandle = validatedProvenanceRecordsForSnapshot(index);
-    expect(Object.isFrozen(validatedHandle)).toBe(true);
-    expect(Object.keys(validatedHandle)).toEqual([]);
-    expect(JSON.stringify(validatedHandle)).toBe("{}");
-    const internal = getValidatedSourceRecordsInternal(validatedHandle);
+    const validatedRecords = validatedProvenanceRecordsForSnapshot(index);
+    expect(Object.isFrozen(validatedRecords)).toBe(true);
+    expect(Object.keys(validatedRecords).sort()).toEqual([
+      "requestCanonicalJson", "requests", "sourceCanonicalJson", "sources",
+    ]);
+    const internal = getValidatedSourceRecordsInternal(
+      validatedRecords.sources, validatedRecords.sourceCanonicalJson,
+    );
     expect(Object.isFrozen(internal.sources)).toBe(true);
     expect(internal.sourceCanonicalJson).toHaveLength(2);
 
@@ -407,8 +410,10 @@ describe("source identity and provenance", () => {
       metadataStepVisits: 0, witnessInsertions: 0,
     });
     const forwardIndex = buildRequestProvenanceIndex(revisions, [], { maxSources: 2_500, maxProvenanceSteps: 1 });
-    const reverseSnapshot = getValidatedSourceRecordsInternal(validatedProvenanceRecordsForSnapshot(reverseIndex));
-    const forwardSnapshot = getValidatedSourceRecordsInternal(validatedProvenanceRecordsForSnapshot(forwardIndex));
+    const reverseRecords = validatedProvenanceRecordsForSnapshot(reverseIndex);
+    const forwardRecords = validatedProvenanceRecordsForSnapshot(forwardIndex);
+    const reverseSnapshot = getValidatedSourceRecordsInternal(reverseRecords.sources, reverseRecords.sourceCanonicalJson);
+    const forwardSnapshot = getValidatedSourceRecordsInternal(forwardRecords.sources, forwardRecords.sourceCanonicalJson);
     expect(reverseSnapshot.sources.map(({ revision }) => revision)).toEqual(revisions.map(({ revision }) => revision));
     expect(reverseSnapshot.sourceCanonicalJson).toEqual(forwardSnapshot.sourceCanonicalJson);
   });
