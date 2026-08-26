@@ -7,3 +7,4 @@ export * from "./domain/reducer.js";
 export type { ParseResult, ValidationIssue } from "./domain/schema.js";
 export * from "./storage/event-ledger.js";
 export * from "./storage/retry-store.js";
+export * from "./storage/transaction-store.js";
