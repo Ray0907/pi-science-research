@@ -65,12 +65,32 @@ describe("scholarly identifiers", () => {
   test("rejects malformed DOI resolver URLs and ambiguous punctuation", () => {
     for (const value of [
       "https://doi.org/10.1234", "https://doi.org/10.1234/a?x=1", "https://doi.org/10.1234/a#x", "https://doi.org/10.1234/a/../b",
-      "https://doi.org/10.1234/a\\..\\b", "https://doi.org/10.1234/a%5C..%5Cb", "https://doi.org/10.1234/a%5c",
+      "https://doi.org/10.1234/a\\..\\b", "https://doi.org/10.1234/a%5C..%5Cb", "https://doi.org/10.1234/a%5c", "https://doi.org/10.1234/a%255c",
       "https://user@doi.org/10.1234/a", "https://doi.org/10.1234%2Fa", "https://doi.org/10.1234/%ZZ",
-      "10.1234/a\\b", "10.1234/a%5Cb", "10.1234/a%ZZ", "10.1234/a?query", "10.1234/a#fragment", "10.1234/a\n", "10.1234/a b",
+      "10.1234/a\\b", "10.1234/a%5Cb", "10.1234/a%", "10.1234/a%2", "10.1234/a%ZZ",
+      "10.1234/a?query", "10.1234/a#fragment", "10.1234/a\n", "10.1234/a b",
     ]) expect(code(() => normalizeDoi(value))).toBe("identifier.invalid-doi");
+    const percentLayers = [
+      ["10.1234/a%25b", "10.1234/a%25b"],
+      ["10.1234/a%2525b", "10.1234/a%2525b"],
+      ["10.1234/a%252525b", "10.1234/a%252525b"],
+      ["10.1234/a%255Cb", "10.1234/a%255cb"],
+      ["10.1234/a%25255Cb", "10.1234/a%25255cb"],
+      ["10.1234/a%2Fb", "10.1234/a/b"],
+      ["10.1234/a%252Fb", "10.1234/a%252fb"],
+      ["10.1234/a%25252Fb", "10.1234/a%25252fb"],
+      ["10.1234/a%25ff", "10.1234/a%25ff"],
+    ] as const;
+    for (const [input, expected] of percentLayers) {
+      const once = normalizeDoi(input);
+      expect(once).toBe(expected);
+      expect(normalizeDoi(once)).toBe(expected);
+      expect(normalizeDoi(normalizeDoi(once))).toBe(expected);
+      const resolver = canonicalDoiUrl(once);
+      expect(normalizeDoi(resolver)).toBe(expected);
+    }
+    expect(canonicalDoiUrl("10.1234/a%255Cb")).toBe("https://doi.org/10.1234/a%25255cb");
     expect(normalizeDoi("10.1234/a%2Eb")).toBe("10.1234/a.b");
-    expect(normalizeDoi("10.1234/a%255Cb")).toBe("10.1234/a%5cb");
     expect(normalizeDoi("10.1234/a.")).toBe("10.1234/a.");
   });
 

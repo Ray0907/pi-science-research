@@ -162,18 +162,20 @@ function normalizeDoiWithLimit(input: unknown, limit: number): string {
   const value = boundedScalar(input, limit, "identifier.too-long");
   if (CONTROL_OR_BIDI.test(value) || value.includes("\\")) fail("identifier.invalid-doi");
   const trimmed = trimAsciiSpaces(value);
+  const encodedCandidate = /^https?:\/\//i.test(trimmed)
+    ? doiFromResolver(trimmed)
+    : trimmed.replace(/^doi:/i, "");
+  if (MALFORMED_PERCENT.test(encodedCandidate) || encodedCandidate.includes("?") || encodedCandidate.includes("#"))
+    fail("identifier.invalid-doi");
   let candidate: string;
-  if (/^https?:\/\//i.test(trimmed)) candidate = doiFromResolver(trimmed);
-  else {
-    candidate = trimmed.replace(/^doi:/i, "");
-    if (MALFORMED_PERCENT.test(candidate) || candidate.includes("?") || candidate.includes("#")) fail("identifier.invalid-doi");
-    try { candidate = decodeURIComponent(candidate); }
-    catch { return fail("identifier.invalid-doi"); }
-  }
+  try { candidate = decodeURIComponent(encodedCandidate); }
+  catch { return fail("identifier.invalid-doi"); }
   if (CONTROL_OR_BIDI.test(candidate) || candidate.includes("\\") || /[^\x21-\x7e]/u.test(candidate)) fail("identifier.invalid-doi");
   const match = /^(10\.[0-9]{4,9})\/(.+)$/u.exec(candidate);
   if (!match || Buffer.byteLength(candidate, "utf8") > 512) fail("identifier.invalid-doi");
-  return `${match[1]!.toLowerCase()}/${match[2]!.toLowerCase()}`;
+  const canonicalPrefix = match[1]!.toLowerCase();
+  const canonicalSuffix = match[2]!.replaceAll("%", "%25").toLowerCase();
+  return `${canonicalPrefix}/${canonicalSuffix}`;
 }
 
 function normalizePmidWithLimit(input: unknown, limit: number): string {
