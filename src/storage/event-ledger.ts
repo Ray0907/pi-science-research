@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
-import type { FileHandle } from "node:fs/promises";
-import { resolve } from "node:path";
+import { constants } from "node:fs";
+import { lstat, open, type FileHandle } from "node:fs/promises";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { TextDecoder } from "node:util";
 
 import { canonicalJson } from "../crypto/canonical-json.js";
@@ -16,6 +17,7 @@ import {
   type ReservedIdentityOrigin,
 } from "../domain/events.js";
 import { ID_PATTERNS, isTimestamp } from "../domain/ids.js";
+import { reduceLedgerEvents } from "../domain/reducer.js";
 import { parse } from "../domain/schema.js";
 import {
   appendFully,
@@ -50,6 +52,12 @@ export interface EventLedgerIo {
   close(handle: FileHandle): Promise<void>;
 }
 
+export interface VerifiedLedgerSnapshotOptions {
+  maxLineBytes?: number;
+  trustedRoot?: string;
+  onCheck?: (phase: "before-final-path-check") => void | Promise<void>;
+}
+
 export interface EventLedgerOptions {
   now?: () => Date;
   eventId?: () => string;
@@ -79,6 +87,7 @@ export type EventLedgerErrorCode =
   | "ledger.truncate-failed"
   | "ledger.close-failed"
   | "ledger.durability-failed"
+  | "ledger.concurrent-mutation"
   | "ledger.line-too-large"
   | "ledger.empty-line"
   | "ledger.torn-tail"
@@ -103,6 +112,120 @@ export class EventLedgerError extends Error {
     this.name = "EventLedgerError";
     this.code = code;
   }
+}
+
+export async function readVerifiedLedgerSnapshot(
+  path: string,
+  options: VerifiedLedgerSnapshotOptions = {},
+): Promise<FoundationLedgerEvent[]> {
+  const canonicalPath = resolve(path);
+  const maxLineBytes = validateMaxLineBytes(options.maxLineBytes ?? DEFAULT_MAX_LEDGER_LINE_BYTES);
+  let handle: FileHandle | undefined;
+  let parentGuard: SnapshotParent[] = [];
+  try {
+    if (options.trustedRoot !== undefined) parentGuard = await pinSnapshotParents(options.trustedRoot, canonicalPath);
+    const beforePath = await lstat(canonicalPath, { bigint: true });
+    if (beforePath.isSymbolicLink()) throw new EventLedgerError("ledger.symlink");
+    const noFollow = constants.O_NOFOLLOW ?? 0;
+    handle = await open(canonicalPath, constants.O_RDONLY | noFollow);
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile()) throw new EventLedgerError("ledger.not-file");
+    if (!sameStableFile(before, beforePath)) throw new EventLedgerError("ledger.concurrent-mutation");
+    const events = await scanLedger(handle, maxLineBytes, false, defaultDurability, defaultIo);
+    reduceLedgerEvents(events);
+    await options.onCheck?.("before-final-path-check");
+    const [after, afterPath] = await Promise.all([
+      handle.stat({ bigint: true }),
+      lstat(canonicalPath, { bigint: true }),
+    ]);
+    if (afterPath.isSymbolicLink() || !sameStableFile(before, after) || !sameStableFile(before, afterPath)) {
+      throw new EventLedgerError("ledger.concurrent-mutation");
+    }
+    await assertSnapshotParents(parentGuard);
+    return events;
+  } catch (error) {
+    if (error instanceof EventLedgerError || error instanceof Error && error.name === "LedgerReducerCorruptionError") throw error;
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "ELOOP") throw new EventLedgerError("ledger.symlink");
+    throw new EventLedgerError("ledger.open-failed");
+  } finally {
+    if (handle) await handle.close().catch(() => undefined);
+    await Promise.all(parentGuard.map(({ handle: parent }) => parent.close().catch(() => undefined)));
+  }
+}
+
+interface SnapshotParent {
+  path: string;
+  handle: FileHandle;
+  dev: bigint;
+  ino: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+}
+
+async function pinSnapshotParents(trustedRoot: string, target: string): Promise<SnapshotParent[]> {
+  const root = resolve(trustedRoot);
+  const rel = relative(root, target);
+  if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new EventLedgerError("ledger.open-failed");
+  }
+  const paths = [root];
+  let current = root;
+  for (const segment of rel.split(sep).slice(0, -1)) {
+    current = join(current, segment);
+    paths.push(current);
+  }
+  const pinned: SnapshotParent[] = [];
+  const noFollow = constants.O_NOFOLLOW ?? 0;
+  const directory = constants.O_DIRECTORY ?? 0;
+  try {
+    for (const parentPath of paths) {
+      const before = await lstat(parentPath, { bigint: true });
+      if (before.isSymbolicLink() || !before.isDirectory()) throw new EventLedgerError("ledger.symlink");
+      const parent = await open(parentPath, constants.O_RDONLY | noFollow | directory);
+      const descriptor = await parent.stat({ bigint: true });
+      const pathname = await lstat(parentPath, { bigint: true });
+      if (!descriptor.isDirectory() || pathname.isSymbolicLink() || !sameStableDirectory(descriptor, pathname)) {
+        await parent.close().catch(() => undefined);
+        throw new EventLedgerError("ledger.symlink");
+      }
+      pinned.push({ path: parentPath, handle: parent, dev: descriptor.dev, ino: descriptor.ino, mtimeNs: descriptor.mtimeNs, ctimeNs: descriptor.ctimeNs });
+    }
+    return pinned;
+  } catch (error) {
+    await Promise.all(pinned.map(({ handle: parent }) => parent.close().catch(() => undefined)));
+    if (error instanceof EventLedgerError) throw error;
+    throw new EventLedgerError("ledger.open-failed");
+  }
+}
+
+async function assertSnapshotParents(parents: readonly SnapshotParent[]): Promise<void> {
+  for (const parent of parents) {
+    const [descriptor, pathname] = await Promise.all([
+      parent.handle.stat({ bigint: true }),
+      lstat(parent.path, { bigint: true }),
+    ]).catch(() => { throw new EventLedgerError("ledger.concurrent-mutation"); });
+    if (pathname.isSymbolicLink() || !descriptor.isDirectory() || !sameStableDirectory(descriptor, pathname)
+      || descriptor.dev !== parent.dev || descriptor.ino !== parent.ino
+      || descriptor.mtimeNs !== parent.mtimeNs || descriptor.ctimeNs !== parent.ctimeNs) {
+      throw new EventLedgerError("ledger.concurrent-mutation");
+    }
+  }
+}
+
+function sameStableDirectory(
+  left: { dev: bigint; ino: bigint },
+  right: { dev: bigint; ino: bigint },
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function sameStableFile(
+  left: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; ctimeNs: bigint },
+  right: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; ctimeNs: bigint },
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.size === right.size
+    && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
 }
 
 export async function openEventLedger(path: string, options: EventLedgerOptions = {}): Promise<EventLedger> {

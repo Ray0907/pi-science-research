@@ -122,6 +122,20 @@ export interface OwnedRunRoot {
   close(): Promise<void>;
 }
 
+/**
+ * A pinned, read-only integrity view. This verifies the owner marker and root
+ * binding but deliberately does not authenticate ownership or expose token
+ * material. Callers must close it.
+ */
+export interface InspectedOwnedRunRoot {
+  readonly path: string;
+  readonly runId: RunId;
+  readonly dev: number;
+  readonly ino: number;
+  revalidate(): Promise<void>;
+  close(): Promise<void>;
+}
+
 interface InternalOwnedRunRoot extends OwnedRunRoot {
   readonly rootHandle: OwnedDirectoryHandle;
   readonly inodeKey: string;
@@ -287,6 +301,65 @@ async function createOwnedRunRootLocked(
     );
   } catch (error) {
     await published.handle.close().catch(() => undefined);
+    throw wrap(error);
+  }
+}
+
+export async function inspectOwnedRunRootIntegrity(
+  path: string,
+  options: RunRootVerificationOptions = {},
+): Promise<InspectedOwnedRunRoot> {
+  assertSimpleOptions(options, new Set(["onCheck"]));
+  assertPathBounds(path);
+  const resolved = resolve(path);
+  await assertNoSymlinkSegments(resolved);
+  const canonical = await canonicalExistingDirectory(resolved);
+  await assertNoSymlinkSegments(canonical);
+  await assertIntrinsicUnsafeRoot(canonical);
+  await assertGlobalForbiddenRoot(canonical, []);
+  const handle = await openDirectoryNoFollow(canonical);
+  const fd = handle.fd;
+  let closed = false;
+  let closePromise: Promise<void> | undefined;
+  try {
+    const rootStat = await handle.stat();
+    const pathStat = await safeLstat(canonical);
+    if (!rootStat.isDirectory() || pathStat.isSymbolicLink() || !sameInode(rootStat, pathStat)) fail("run-root.replaced");
+    const first = await readOwnerMarker(canonical, options.onCheck);
+    if (!ID_PATTERNS.run.test(first.marker.runId)) fail("run-root.marker-invalid");
+    assertMarkerRootBinding(first.marker, rootStat, "run-root.replaced");
+    await invokeCheck(options.onCheck, "before-integrity-final-check");
+    const finalPathStat = await safeLstat(canonical);
+    const finalHandleStat = await handle.stat();
+    const second = await readOwnerMarker(canonical, options.onCheck);
+    if (!sameInode(rootStat, finalPathStat) || !sameInode(rootStat, finalHandleStat)
+      || !sameInode(first.stat, second.stat) || first.sha256 !== second.sha256
+      || first.marker.runId !== second.marker.runId) fail("run-root.replaced");
+    assertMarkerRootBinding(second.marker, finalHandleStat, "run-root.replaced");
+    return Object.freeze({
+      path: canonical,
+      runId: second.marker.runId as RunId,
+      dev: Number(finalHandleStat.dev),
+      ino: Number(finalHandleStat.ino),
+      async revalidate() {
+        if (closed) fail("run-root.closed");
+        const [currentHandleStat, currentPathStat] = await Promise.all([handle.stat(), safeLstat(canonical)]);
+        const marker = await readOwnerMarker(canonical);
+        if (!sameInode(rootStat, currentHandleStat) || !sameInode(rootStat, currentPathStat)
+          || !sameInode(second.stat, marker.stat) || second.sha256 !== marker.sha256
+          || second.marker.runId !== marker.marker.runId) fail("run-root.replaced");
+        assertMarkerRootBinding(marker.marker, currentHandleStat, "run-root.replaced");
+      },
+      async close() {
+        if (closed) return;
+        if (closePromise) return closePromise;
+        const attempt = closeFileHandleConfirmed(handle, fd).then(() => { closed = true; });
+        closePromise = attempt;
+        try { await attempt; } finally { if (closePromise === attempt) closePromise = undefined; }
+      },
+    });
+  } catch (error) {
+    await closeFileHandleConfirmed(handle, fd).catch(() => undefined);
     throw wrap(error);
   }
 }

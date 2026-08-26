@@ -143,6 +143,11 @@ export type TransactionReconciliationDecision = Readonly<{
   transactionId: TransactionId;
 }>;
 
+export interface ReadOnlyTransactionIntegrity {
+  readonly committedCount: number;
+  readonly pendingCount: number;
+}
+
 export type TransactionStoreErrorCode =
   | "transaction.invalid-input"
   | "transaction.invalid-record"
@@ -302,6 +307,91 @@ export async function listCommittedTransactions(
     for (const transactionId of names) output.push(await verifyDirectory(root, "committed", transactionId, limitsFrom(options)));
     return output;
   });
+}
+
+/**
+ * Verifies canonical transaction objects without creating directories, lock
+ * files, cleanup entries, or materialized state. The caller must already hold
+ * a pinned integrity view of the run root.
+ */
+export async function inspectCanonicalTransactionsReadOnly(
+  runRoot: string,
+  events: readonly FoundationLedgerEvent[],
+  options: TransactionStoreOptions = {},
+): Promise<ReadOnlyTransactionIntegrity> {
+  const reduced = reduceLedgerEvents(events);
+  const ledger = canonicalLedgerLinks(events);
+  const root = resolve(runRoot);
+  await assertSafeDirectory(root);
+  const stateDirectory = join(root, ".state");
+  if (await pathExists(stateDirectory)) await assertOwnedDirectory(stateDirectory);
+  const transactionsDirectory = join(stateDirectory, "transactions");
+  if (await pathExists(transactionsDirectory)) await assertOwnedDirectory(transactionsDirectory);
+  const committedRoot = join(transactionsDirectory, "committed");
+  if (await pathExists(committedRoot)) await assertOwnedDirectory(committedRoot);
+  const limits = limitsFrom(options);
+  const guard = await pinReadOnlyHierarchy(root);
+  try {
+    await assertPinnedHierarchy(guard, "read-only-before", options);
+    const results = new Map<string, Extract<FoundationLedgerEvent, { type: "result_recorded" }>>();
+    const recordCommits = new Map<string, Extract<FoundationLedgerEvent, { type: "records_committed" }>>();
+    const attemptCommits = new Set<string>();
+    for (const event of events) {
+      if (event.type === "result_recorded") results.set(event.payload.transactionId, event);
+      if (event.type === "records_committed") recordCommits.set(event.payload.transactionId, event);
+      if (event.type === "attempt_committed") attemptCommits.add(event.payload.transactionId);
+    }
+    const verifiedByTransaction = new Map<string, VerifiedTransaction>();
+    const catalog = emptyCatalog();
+    for (const event of events) {
+      if (event.type === "records_committed") {
+        const result = results.get(event.payload.transactionId);
+        const attempt = result ? ledger.attempts.get(result.payload.attemptId) : undefined;
+        if (!result || !attempt) fail("transaction.corrupt");
+        const verified = await verifyCommittedEvent(root, event, limits);
+        assertResultManifestLink(result, verified.manifest, ledger.runId, attempt);
+        validateCatalogAndReferences(verified.records, catalog, limits);
+        verifiedByTransaction.set(event.payload.transactionId, verified);
+      }
+      if (event.type === "attempt_committed") {
+        const verified = verifiedByTransaction.get(event.payload.transactionId);
+        if (!verified) fail("transaction.corrupt");
+        addRecordsToCatalog(verified.records, catalog, true);
+      }
+    }
+    let pendingCount = 0;
+    for (const [transactionId, result] of results) {
+      if (recordCommits.has(transactionId)) {
+        if (!attemptCommits.has(transactionId)) pendingCount++;
+        continue;
+      }
+      const attempt = ledger.attempts.get(result.payload.attemptId);
+      if (!attempt) fail("transaction.corrupt");
+      const directory = transactionDirectory(root, "committed", transactionId as TransactionId);
+      if (await pathExists(directory)) {
+        const verified = await verifyDirectory(root, "committed", transactionId as TransactionId, limits);
+        assertResultManifestLink(result, verified.manifest, ledger.runId, attempt);
+        validateCatalogAndReferences(verified.records, catalog, limits);
+      }
+      const decision = recoveryDecisionFor(reduced, attempt.logicalOperationId);
+      if (decision.kind === "finish-transaction" && decision.transactionId === transactionId) pendingCount++;
+    }
+    const committedDirectory = join(root, ".state/transactions/committed");
+    if (await pathExists(committedDirectory)) {
+      await assertOwnedDirectory(committedDirectory);
+      const entries = await readdir(committedDirectory, { withFileTypes: true }).catch(() => fail("transaction.io-failed"));
+      for (const entry of entries) {
+        if (!entry.isDirectory() || entry.isSymbolicLink() || !ID_PATTERNS.transaction.test(entry.name)) fail("transaction.suspicious-entry");
+        if (!results.has(entry.name)) fail("transaction.corrupt");
+      }
+    } else if (recordCommits.size > 0) {
+      fail("transaction.missing-object");
+    }
+    await assertPinnedHierarchy(guard, "read-only-after", options);
+    return Object.freeze({ committedCount: attemptCommits.size, pendingCount });
+  } finally {
+    await Promise.all(guard.map(({ handle }) => handle.close().catch(() => undefined)));
+  }
 }
 
 export async function reconcileCanonicalTransactions(
@@ -1112,7 +1202,14 @@ function positiveLimit(value: number): number {
   return value;
 }
 
-interface PinnedDirectory { path: string; handle: FileHandle; dev: number | bigint; ino: number | bigint }
+interface PinnedDirectory {
+  path: string;
+  handle: FileHandle;
+  dev: number | bigint;
+  ino: number | bigint;
+  readOnlyMtimeMs?: number;
+  readOnlyCtimeMs?: number;
+}
 type PinnedHierarchy = readonly PinnedDirectory[];
 
 function withMutationLock<T>(root: string, options: TransactionStoreOptions, operation: (guard: PinnedHierarchy) => Promise<T>): Promise<T> {
@@ -1138,6 +1235,31 @@ function withMutationLock<T>(root: string, options: TransactionStoreOptions, ope
     if (failure) throw failure;
     return result as T;
   });
+}
+
+async function pinReadOnlyHierarchy(root: string): Promise<PinnedHierarchy> {
+  const candidates = [root, join(root, ".state"), join(root, ".state/transactions"), join(root, ".state/transactions/committed")];
+  const existing: string[] = [];
+  for (const path of candidates) {
+    if (await pathExists(path)) existing.push(path);
+    else if (path === root) fail("transaction.unsafe-root");
+  }
+  const pinned: PinnedDirectory[] = [];
+  const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+  const directoryFlag = typeof constants.O_DIRECTORY === "number" ? constants.O_DIRECTORY : 0;
+  try {
+    for (const [index, path] of existing.entries()) {
+      const handle = await open(path, constants.O_RDONLY | noFollow | directoryFlag);
+      const stat = await handle.stat();
+      const uid = typeof process.getuid === "function" ? process.getuid() : null;
+      if (!stat.isDirectory() || (index > 0 && ((uid !== null && stat.uid !== uid) || (stat.mode & 0o077) !== 0))) fail("transaction.unsafe-root");
+      pinned.push({ path, handle, dev: stat.dev, ino: stat.ino, readOnlyMtimeMs: stat.mtimeMs, readOnlyCtimeMs: stat.ctimeMs });
+    }
+    return pinned;
+  } catch (error) {
+    await Promise.all(pinned.map(({ handle }) => handle.close().catch(() => undefined)));
+    throw normalize(error, "transaction.unsafe-root");
+  }
 }
 
 async function pinHierarchy(root: string): Promise<PinnedHierarchy> {
@@ -1166,7 +1288,9 @@ async function assertPinnedHierarchy(guard: PinnedHierarchy, phase: string, opti
     const descriptor = await item.handle.stat().catch(() => fail("transaction.unsafe-root"));
     const pathStat = await lstat(item.path).catch(() => fail("transaction.unsafe-root"));
     if (!descriptor.isDirectory() || !pathStat.isDirectory() || pathStat.isSymbolicLink()
-      || descriptor.dev !== item.dev || descriptor.ino !== item.ino || pathStat.dev !== item.dev || pathStat.ino !== item.ino) fail("transaction.unsafe-root");
+      || descriptor.dev !== item.dev || descriptor.ino !== item.ino || pathStat.dev !== item.dev || pathStat.ino !== item.ino
+      || item.readOnlyMtimeMs !== undefined && (descriptor.mtimeMs !== item.readOnlyMtimeMs || pathStat.mtimeMs !== item.readOnlyMtimeMs)
+      || item.readOnlyCtimeMs !== undefined && (descriptor.ctimeMs !== item.readOnlyCtimeMs || pathStat.ctimeMs !== item.readOnlyCtimeMs)) fail("transaction.unsafe-root");
   }
 }
 
