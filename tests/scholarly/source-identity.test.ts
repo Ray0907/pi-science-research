@@ -84,10 +84,7 @@ function options(overrides: SourceIdentityOptions = {}): SourceIdentityOptions {
 }
 
 function diagnostics(): RequestProvenanceDiagnostics {
-  return {
-    sourceVisits: 0, sourceCanonicalizations: 0, revisionVisits: 0, requestVisits: 0,
-    requestUrlVisits: 0, metadataStepVisits: 0, witnessInsertions: 0,
-  };
+  return { sourceVisits: 0, requestVisits: 0, requestUrlVisits: 0, metadataStepVisits: 0, witnessInsertions: 0 };
 }
 
 function errorCode(action: () => unknown): string | undefined {
@@ -239,6 +236,54 @@ describe("source identity and provenance", () => {
     expect(ambiguous.conflicts).toContainEqual(expect.objectContaining({ code: "source.ambiguous-identity", field: "identity" }));
   });
 
+  test("requires exact provenance before a same-ID update introduces a strong identifier", () => {
+    const fields = [
+      ["doi", "10.1234/new-identity"], ["pmid", "987654"], ["pmcid", "PMC987654"],
+    ] as const;
+    for (const [field, value] of fields) {
+      const base = src(`src-introduce-${field}.001`);
+      const identifiers = { ...base.identifiers, [field]: value };
+      const update = { ...base, revision: 2, identifiers };
+      const candidate = src(`src-candidate-${field}.001`, { identifiers, canonicalUrl: `https://candidate.example/${field}` });
+      const unproven = mergeSourceRecords([base], [candidate, update]);
+      expect(unproven.aliases).toEqual({});
+      expect(unproven.sources.filter(({ sourceId }) => sourceId === base.sourceId).at(-1)!.identifiers[field]).toBeNull();
+
+      const provenUpdate = {
+        ...update,
+        retrievalRequestIds: [REQUEST_A],
+        metadataProvenance: [{ field: `identifiers.${field}`, provider: "openalex", requestId: REQUEST_A }],
+      };
+      const proven = mergeSourceRecords([base], [provenUpdate, candidate]);
+      expect(proven.aliases).toEqual({ [candidate.sourceId]: base.sourceId });
+      expect(proven.sources.at(-1)!.identifiers[field]).toBe(value);
+      expect(canonicalResult(proven)).toBe(canonicalResult(mergeSourceRecords([base], [candidate, provenUpdate])));
+    }
+  });
+
+  test("uses the authoritative existing URL for fallback matching before merging an update", () => {
+    const base = src("src-urlhistory.00001", { canonicalUrl: "https://article.example/A" });
+    const update = { ...base, revision: 2, canonicalUrl: "https://article.example/B" };
+    const candidate = src("src-urlhistory.00002", { canonicalUrl: base.canonicalUrl });
+    const forward = mergeSourceRecords([base], [update, candidate]);
+    const reverse = mergeSourceRecords([base], [candidate, update]);
+    expect(forward.aliases).toEqual({ [candidate.sourceId]: base.sourceId });
+    expect(forward.sources.at(-1)!.canonicalUrl).toBe(base.canonicalUrl);
+    expect(forward.conflicts).toContainEqual(expect.objectContaining({ code: "source.metadata-conflict", field: "canonicalUrl" }));
+    expect(canonicalResult(forward)).toBe(canonicalResult(reverse));
+
+    const other = src("src-urlother.0000001", {
+      identifiers: { doi: "10.1234/url-bridge", pmid: null, pmcid: null }, canonicalUrl: "https://other.example/C",
+    });
+    const bridge = src("src-urlbridge.000001", {
+      identifiers: other.identifiers, canonicalUrl: base.canonicalUrl,
+    });
+    const ambiguous = mergeSourceRecords([other, base], [bridge, update]);
+    expect(ambiguous.aliases).toEqual({});
+    expect(ambiguous.conflicts).toContainEqual(expect.objectContaining({ code: "source.ambiguous-identity", field: "identity" }));
+    expect(canonicalResult(ambiguous)).toBe(canonicalResult(mergeSourceRecords([base, other], [update, bridge])));
+  });
+
   test("returns aliases and deeply frozen canonical arrays", () => {
     const a = src("src-frozen.00000001", { identifiers: { doi: DOI, pmid: null, pmcid: null } });
     const b = src("src-frozen.00000002", { identifiers: { doi: DOI, pmid: null, pmcid: null } });
@@ -275,9 +320,14 @@ describe("source identity and provenance", () => {
     const requests = [req(REQUEST_A, a.sourceId, { finalUrl: "https://example.org/a" }), req(REQUEST_B, b.sourceId, { finalUrl: "https://example.org/b", redirectUrls: ["https://redirect.example.org/b"] })];
     const visits = diagnostics();
     const index = buildRequestProvenanceIndex([a, b], requests, undefined, visits);
+    expect(Object.keys(visits).sort()).toEqual([
+      "metadataStepVisits", "requestUrlVisits", "requestVisits", "sourceVisits", "witnessInsertions",
+    ]);
+    expect(errorCode(() => buildRequestProvenanceIndex([a], [requests[0]!], undefined, {
+      ...diagnostics(), unknownCounter: 0,
+    } as never))).toBe("source.invalid-input");
     expect(visits).toEqual({
-      sourceVisits: 2, sourceCanonicalizations: 2, revisionVisits: 2, requestVisits: 2,
-      requestUrlVisits: 5, metadataStepVisits: 1, witnessInsertions: 3,
+      sourceVisits: 2, requestVisits: 2, requestUrlVisits: 5, metadataStepVisits: 1, witnessInsertions: 3,
     });
     const before = { ...visits };
     expect(validateSourceCanonicalUrlProvenance(a, index)).toEqual({ kind: "transport-url", requestId: REQUEST_A, matchedField: "finalUrl" });
@@ -305,8 +355,8 @@ describe("source identity and provenance", () => {
     const manyVisits = diagnostics();
     const manyIndex = buildRequestProvenanceIndex(manySources, manyRequests, undefined, manyVisits);
     expect(manyVisits).toEqual({
-      sourceVisits: 200, sourceCanonicalizations: 200, revisionVisits: 200, requestVisits: 200,
-      requestUrlVisits: 400, metadataStepVisits: 200, witnessInsertions: 400,
+      sourceVisits: 200, requestVisits: 200, requestUrlVisits: 400,
+      metadataStepVisits: 200, witnessInsertions: 400,
     });
     const manyBefore = { ...manyVisits };
     expect(validateSourceCanonicalUrlProvenance(manySources[0]!, manyIndex)).toEqual({
@@ -324,8 +374,8 @@ describe("source identity and provenance", () => {
       maxSources: 2_500, maxProvenanceSteps: 1,
     }, revisionVisits);
     expect(revisionVisits).toEqual({
-      sourceVisits: 2_000, sourceCanonicalizations: 2_000, revisionVisits: 2_000, requestVisits: 0,
-      requestUrlVisits: 0, metadataStepVisits: 0, witnessInsertions: 0,
+      sourceVisits: 2_000, requestVisits: 0, requestUrlVisits: 0,
+      metadataStepVisits: 0, witnessInsertions: 0,
     });
     const forwardIndex = buildRequestProvenanceIndex(revisions, [], { maxSources: 2_500, maxProvenanceSteps: 1 });
     const reverseSnapshot = validatedProvenanceRecordsForSnapshot(reverseIndex);

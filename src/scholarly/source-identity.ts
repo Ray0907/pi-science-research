@@ -72,8 +72,6 @@ export interface RequestProvenanceIndex {
 }
 export interface RequestProvenanceDiagnostics {
   sourceVisits: number;
-  sourceCanonicalizations: number;
-  revisionVisits: number;
   requestVisits: number;
   requestUrlVisits: number;
   metadataStepVisits: number;
@@ -169,7 +167,7 @@ function buildRequestProvenanceIndexInternal(
   let cumulativeRecordBytes = 0;
   for (const source of sourceInputs) {
     bumpDiagnostics(diagnostics, "sourceVisits");
-    const validated = validateSource(source as SourceRecord, normalized, diagnostics);
+    const validated = validateSource(source as SourceRecord, normalized);
     cumulativeRecordBytes = accumulateRecordBytes(cumulativeRecordBytes, validated.bytes, normalized);
     validatedSources.push(validated);
   }
@@ -195,7 +193,7 @@ function buildRequestProvenanceIndexInternal(
   }
   if (steps > normalized.maxProvenanceSteps) fail("source.too-many-provenance-steps");
   for (const { record } of validatedSources) validateSourceSemantics(record);
-  const sourceChains = revisionChains(validatedSources, true, diagnostics);
+  const sourceChains = revisionChains(validatedSources, true);
   const orderedSources = [...sourceChains.values()].flat();
   const orderedRequests = radixSortByUtf8Key(validatedRequests, ({ record }) => record.requestId);
   const indexedRequests = orderedRequests.map((request) => indexRequestUrls(request, normalized, diagnostics));
@@ -301,9 +299,7 @@ export function mergeSourceRecords(
   return mergeValidated(existingRecords, incomingRecords);
 }
 
-function validateSource(
-  source: SourceRecord, options: NormalizedOptions, diagnostics?: RequestProvenanceDiagnostics,
-): ValidatedSource {
+function validateSource(source: SourceRecord, options: NormalizedOptions): ValidatedSource {
   let prepared: ReturnType<typeof prepareProspectiveSourceIdentityFields>;
   try {
     prepared = prepareProspectiveSourceIdentityFields(source, options.sourceUrlPolicy, {
@@ -314,7 +310,6 @@ function validateSource(
     if (error instanceof ScholarlyIdentifierError) return translateIdentifierError(error);
     return fail("source.invalid-input");
   }
-  bumpDiagnostics(diagnostics, "sourceCanonicalizations");
   const { record, canonicalJson: json, canonicalBytes: bytes } = prepared;
   if (bytes > options.maxSourceRecordCanonicalBytes) fail("source.record-too-large");
   assertAggregateBytes(bytes, options);
@@ -466,33 +461,48 @@ function mergeValidated(existing: readonly ValidatedSource[], incoming: readonly
   const nodes: MergeNode[] = [];
   for (const [id, records] of existingById) {
     const update = incomingById.get(id)?.[0];
+    const authoritativeIdentifiers = effectiveIdentifiers(records);
     nodes.push({
-      id, current: update ?? records.at(-1)!, effectiveIdentifiers: effectiveIdentifiers(update ? [...records, update] : records),
-      existing: true, incoming: update !== undefined,
+      id,
+      current: update ?? records.at(-1)!,
+      authoritativeIdentifiers,
+      identityIdentifiers: identityIdentifiersForExisting(authoritativeIdentifiers, update?.record),
+      identityUrl: records.at(-1)!.record.canonicalUrl,
+      existing: true,
+      incoming: update !== undefined,
     });
   }
-  for (const [id, records] of incomingById) if (!existingById.has(id)) nodes.push({
-    id, current: records[0]!, effectiveIdentifiers: effectiveIdentifiers(records), existing: false, incoming: true,
-  });
+  for (const [id, records] of incomingById) if (!existingById.has(id)) {
+    const authoritativeIdentifiers = effectiveIdentifiers(records);
+    nodes.push({
+      id,
+      current: records[0]!,
+      authoritativeIdentifiers,
+      identityIdentifiers: authoritativeIdentifiers,
+      identityUrl: records[0]!.record.canonicalUrl,
+      existing: false,
+      incoming: true,
+    });
+  }
   const orderedNodes = radixSortByUtf8Key(nodes, ({ id }) => id);
   nodes.splice(0, nodes.length, ...orderedNodes);
   const union = new UnionFind(nodes.length);
   const strong = new Map<string, number>();
   const urls = new Map<string, number[]>();
   nodes.forEach((node, index) => {
-    for (const key of strongKeys(node.effectiveIdentifiers)) {
+    for (const key of strongKeys(node.identityIdentifiers)) {
       const prior = strong.get(key);
       if (prior === undefined) strong.set(key, index); else union.join(prior, index);
     }
-    const list = urls.get(node.current.record.canonicalUrl) ?? [];
-    list.push(index); urls.set(node.current.record.canonicalUrl, list);
+    const list = urls.get(node.identityUrl) ?? [];
+    list.push(index); urls.set(node.identityUrl, list);
   });
   const conflicts: SourceMergeConflict[] = [];
   const ambiguous = new Set<number>();
   for (const [url, indexes] of urls) {
     if (indexes.length < 2) continue;
     const hasStrongConflict = (["doi", "pmid", "pmcid"] as const).some((field) => {
-      const values = new Set(indexes.map((index) => nodes[index]!.effectiveIdentifiers[field]).filter((value) => value !== null));
+      const values = new Set(indexes.map((index) => nodes[index]!.identityIdentifiers[field]).filter((value) => value !== null));
       return values.size > 1;
     });
     if (hasStrongConflict) {
@@ -529,7 +539,7 @@ function mergeValidated(existing: readonly ValidatedSource[], incoming: readonly
     const base = baseValidated.record;
     const candidates = radixSortByUtf8Key(componentNodes.map(({ current }) => current),
       ({ record, json }) => `${record.sourceId}\0${json}`).map(({ record }) => record);
-    const retainedEffectiveIdentifiers = componentNodes.find(({ id }) => id === retainedId)!.effectiveIdentifiers;
+    const retainedEffectiveIdentifiers = componentNodes.find(({ id }) => id === retainedId)!.authoritativeIdentifiers;
     const merged = mergeGroup(
       baseValidated, candidates, retainedId, conflicts,
       componentNodes.some(({ incoming }) => incoming) ? retainedEffectiveIdentifiers : undefined,
@@ -556,17 +566,16 @@ function mergeValidated(existing: readonly ValidatedSource[], incoming: readonly
 interface MergeNode {
   readonly id: string;
   readonly current: ValidatedSource;
-  readonly effectiveIdentifiers: SourceRecord["identifiers"];
+  readonly authoritativeIdentifiers: SourceRecord["identifiers"];
+  readonly identityIdentifiers: SourceRecord["identifiers"];
+  readonly identityUrl: string;
   readonly existing: boolean;
   readonly incoming: boolean;
 }
 
-function revisionChains(
-  records: readonly ValidatedSource[], existing: boolean, diagnostics?: RequestProvenanceDiagnostics,
-): Map<string, ValidatedSource[]> {
+function revisionChains(records: readonly ValidatedSource[], existing: boolean): Map<string, ValidatedSource[]> {
   const indexed = new Map<string, Map<number, ValidatedSource>>();
   for (const record of records) {
-    bumpDiagnostics(diagnostics, "revisionVisits");
     const revisions = indexed.get(record.record.sourceId) ?? new Map<number, ValidatedSource>();
     if (revisions.has(record.record.revision)) fail("source.duplicate-revision");
     revisions.set(record.record.revision, record);
@@ -690,6 +699,17 @@ function effectiveIdentifiers(records: readonly ValidatedSource[]): SourceRecord
     if (output[field] === null && record.identifiers[field] !== null) output[field] = record.identifiers[field];
   return Object.freeze(output);
 }
+function identityIdentifiersForExisting(
+  authoritative: SourceRecord["identifiers"], update: SourceRecord | undefined,
+): SourceRecord["identifiers"] {
+  if (!update) return authoritative;
+  const output = { ...authoritative };
+  for (const field of ["doi", "pmid", "pmcid"] as const) {
+    if (output[field] === null && update.identifiers[field] !== null && hasProvenance(update, `identifiers.${field}`))
+      output[field] = update.identifiers[field];
+  }
+  return Object.freeze(output);
+}
 function strongKeys(identifiers: SourceRecord["identifiers"]): string[] {
   const keys: string[] = [];
   if (identifiers.doi !== null) keys.push(`doi:${identifiers.doi}`);
@@ -789,10 +809,7 @@ function bumpDiagnostics(
 function validateDiagnostics(diagnostics: RequestProvenanceDiagnostics | undefined): void {
   if (diagnostics === undefined) return;
   if (utilTypes.isProxy(diagnostics) || !isPlain(diagnostics)) fail("source.invalid-input");
-  const keys = [
-    "sourceVisits", "sourceCanonicalizations", "revisionVisits", "requestVisits",
-    "requestUrlVisits", "metadataStepVisits", "witnessInsertions",
-  ];
+  const keys = ["sourceVisits", "requestVisits", "requestUrlVisits", "metadataStepVisits", "witnessInsertions"];
   if (Reflect.ownKeys(diagnostics).length !== keys.length) fail("source.invalid-input");
   for (const key of keys) {
     const descriptor = Object.getOwnPropertyDescriptor(diagnostics, key);
