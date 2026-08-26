@@ -31,7 +31,7 @@ function runSnapshot(): RunSnapshot {
   };
 }
 function task(): TaskRecord {
-  return { schemaVersion: 1, taskId: TASK, revision: 1, description: "task", evidenceRule: { minimumLineages: 1, independentVerificationAllowed: true, primarySourceRequired: false, fullTextRequired: false }, role: "literature-searcher", state: "running", attemptIds: [], blocker: null, resolution: null };
+  return { schemaVersion: 1, taskId: TASK, revision: 1, description: "task", evidenceRule: { minimumLineages: 1, independentVerificationAllowed: true, primarySourceRequired: false, fullTextRequired: false }, role: "literature-searcher", state: "running", attemptIds: [ATTEMPT], blocker: null, resolution: null };
 }
 function attempt(kind: "research" | "calculation" = "research"): AttemptRecord {
   return {
@@ -58,8 +58,8 @@ async function fixture() {
 }
 
 async function addAttempt(ledger: EventLedger, kind: "research" | "calculation") {
-  await ledger.append("task_upserted", { task: task() });
   await ledger.reserveIdentity("attempt", ATTEMPT, "parent-generated");
+  await ledger.append("task_upserted", { task: task() });
   await ledger.append("dispatch_intent", { attempt: attempt(kind) });
   await ledger.append("dispatch_started", { attemptId: ATTEMPT, pid: null, requestCorrelation: null });
 }

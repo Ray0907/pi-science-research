@@ -139,6 +139,7 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
   const tasks = new Map<string, { record: TaskRecord; event: FoundationLedgerEvent; index: number }>();
   const reservations = new Map<string, Set<string>>();
   const schedules = new Map<string, MutableSchedule>();
+  const scheduleClasses = new Map<string, "attempt" | "request">();
   const retryEdges = new Map<string, MutableSchedule>();
   const pendingScheduleOperations = new Map<string, MutableSchedule>();
   const pendingSchedulesByEpoch = new Map<number, Set<MutableSchedule>>();
@@ -151,6 +152,7 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
   const cancelReasons = new Map<number, Extract<FoundationLedgerEvent, { type: "cancel_requested" }>["payload"]["reason"]>();
   const resumedEpochs = new Set<number>();
   const requests = new Map<string, MutableRequest>();
+  const attemptTaskOwners = new Map<string, string>();
   const requestIntentBySeq = new Map<number, MutableRequest>();
   const requestSchedules = new Map<string, MutableRequestSchedule>();
   const requestScheduleEdges = new Map<string, MutableRequestSchedule>();
@@ -255,6 +257,12 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
             || prior.record.attemptIds.some((id, offset) => next.attemptIds[offset] !== id)) fail(event, index, "reducer.task-attempt-history");
         }
         if (new Set(next.attemptIds).size !== next.attemptIds.length) fail(event, index, "reducer.task-attempt-history");
+        for (const attemptId of next.attemptIds) {
+          if (!reserved("attempt", attemptId)) fail(event, index, "reducer.task-attempt-not-reserved");
+          const owner = attemptTaskOwners.get(attemptId);
+          if (owner !== undefined && owner !== next.taskId) fail(event, index, "reducer.task-attempt-owner");
+          attemptTaskOwners.set(attemptId, next.taskId);
+        }
         if (next.state === "resolved") {
           const committed = next.attemptIds.some((id) => attempts.get(id)?.phase === "committed" && attempts.get(id)?.record.taskId === next.taskId);
           if (!committed || next.resolution === null) fail(event, index, "reducer.task-resolution");
@@ -266,7 +274,11 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
         if (resumeTransitionPending) fail(event, index, "reducer.resume-transition-pending");
         const record = event.payload.attempt;
         if (runId === null || record.runId !== runId) fail(event, index, "reducer.run-not-found");
-        if (!tasks.has(record.taskId)) fail(event, index, "reducer.task-not-found");
+        const owningTask = tasks.get(record.taskId);
+        if (!owningTask) fail(event, index, "reducer.task-not-found");
+        if (owningTask!.record.state !== "running") fail(event, index, "reducer.dispatch-task-state");
+        if (owningTask!.record.attemptIds.filter((id) => id === record.attemptId).length !== 1
+          || attemptTaskOwners.get(record.attemptId) !== record.taskId) fail(event, index, "reducer.dispatch-task-owner");
         if (!reserved("attempt", record.attemptId)) fail(event, index, "reducer.attempt-not-reserved");
         if (attempts.has(record.attemptId)) fail(event, index, "reducer.duplicate-attempt");
         if (record.state !== "intent-recorded") fail(event, index, "reducer.attempt-initial-state");
@@ -408,6 +420,7 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
       case "retry_scheduled": {
         if (resumeTransitionPending) fail(event, index, "reducer.resume-transition-pending");
         if (!reserved("retry-schedule", event.payload.scheduleId)) fail(event, index, "reducer.schedule-not-reserved");
+        if (scheduleClasses.has(event.payload.scheduleId)) fail(event, index, "reducer.schedule-namespace");
         if (schedules.has(event.payload.scheduleId)) fail(event, index, "reducer.duplicate-schedule");
         const predecessor = requireAttempt(event, index, event.payload.failedAttemptId);
         if (predecessor.failureState !== "retryable-failed" || predecessor.record.replayPolicy !== "safe-read") fail(event, index, "reducer.retry-predecessor");
@@ -425,6 +438,7 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
         const schedule: RetrySchedule = Object.freeze({ schemaVersion: 1, ...event.payload, replayPolicy: "safe-read" });
         const mutable: MutableSchedule = { schedule, eventSeq: event.seq, executionEpoch: currentEpoch, consumedByAttemptId: null };
         schedules.set(schedule.scheduleId, mutable);
+        scheduleClasses.set(schedule.scheduleId, "attempt");
         retryEdges.set(edge, mutable);
         pendingScheduleOperations.set(event.payload.logicalOperationId, mutable);
         let epochSchedules = pendingSchedulesByEpoch.get(currentEpoch);
@@ -438,6 +452,7 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
       }
       case "retry_started": {
         if (resumeTransitionPending) fail(event, index, "reducer.resume-transition-pending");
+        if (scheduleClasses.get(event.payload.scheduleId) !== "attempt") fail(event, index, "reducer.schedule-namespace");
         const schedule = schedules.get(event.payload.scheduleId);
         if (!schedule) fail(event, index, "reducer.schedule-not-found");
         const startedSchedule = schedule!;
@@ -535,15 +550,22 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
         requireAttempt(event, index, event.payload.attemptId);
         recordJournal(event, index);
         if (!reserved("retry-schedule", event.payload.scheduleId) || requestSchedules.has(event.payload.scheduleId)) fail(event, index, "reducer.request-schedule-identity");
+        if (scheduleClasses.has(event.payload.scheduleId)) fail(event, index, "reducer.schedule-namespace");
         const predecessor = requests.get(event.payload.failedRequestId);
-        if (!predecessor || (predecessor.result !== null && predecessor.result.status !== "retryable-error") || predecessor.intent.replayPolicy !== "safe-read"
+        if (!predecessor || predecessor.result?.status !== "retryable-error" || predecessor.intent.replayPolicy !== "safe-read"
           || predecessor.intent.logicalRequestId !== event.payload.logicalRequestId
           || predecessor.intent.physicalAttemptOrdinal + 1 !== event.payload.nextPhysicalAttemptOrdinal) fail(event, index, "reducer.request-schedule-link");
+        const failedRequest = predecessor!;
+        if (event.payload.attemptId !== failedRequest.intent.attemptId
+          || requireAttempt(event, index, event.payload.attemptId).record.executionEpoch !== failedRequest.intent.executionEpoch
+          || failedRequest.intent.executionEpoch !== currentEpoch
+          || cancelledEpochs.has(failedRequest.intent.executionEpoch)) fail(event, index, "reducer.request-schedule-owner");
         const edgeKey = `${event.payload.failedRequestId}\0${event.payload.nextPhysicalAttemptOrdinal}`;
         const priorEdge = requestScheduleEdges.get(edgeKey);
         if (priorEdge && !cancelledEpochs.has(priorEdge.executionEpoch)) fail(event, index, "reducer.request-schedule-link");
         const mutableSchedule = { event, executionEpoch: currentEpoch, startedRequestId: null };
         requestSchedules.set(event.payload.scheduleId, mutableSchedule);
+        scheduleClasses.set(event.payload.scheduleId, "request");
         requestScheduleEdges.set(edgeKey, mutableSchedule);
         break;
       }
@@ -551,6 +573,7 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
         if (resumeTransitionPending) fail(event, index, "reducer.resume-transition-pending");
         const attempt = requireAttempt(event, index, event.payload.attemptId);
         recordJournal(event, index);
+        if (scheduleClasses.get(event.payload.scheduleId) !== "request") fail(event, index, "reducer.schedule-namespace");
         const schedule = requestSchedules.get(event.payload.scheduleId);
         if (!schedule || schedule.startedRequestId !== null || schedule.event.seq !== event.payload.scheduledFromLedgerSeq
           || schedule.event.payload.logicalRequestId !== event.payload.logicalRequestId
@@ -611,7 +634,9 @@ export function reduceLedgerEvents(events: readonly FoundationLedgerEvent[]): Re
   }
   for (const { record, event, index } of tasks.values()) {
     for (const attemptId of record.attemptIds) {
-      if (!attempts.has(attemptId)) fail(event, index, "reducer.task-attempt-ref");
+      if (!attempts.has(attemptId) && (!reserved("attempt", attemptId) || attemptTaskOwners.get(attemptId) !== record.taskId)) {
+        fail(event, index, "reducer.task-attempt-ref");
+      }
     }
   }
 

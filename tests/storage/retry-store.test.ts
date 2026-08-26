@@ -46,11 +46,11 @@ function runSnapshot(): RunSnapshot {
   };
 }
 
-function taskRecord(): TaskRecord {
+function taskRecord(attemptIds: string[] = [ATTEMPT_1], revision = 1): TaskRecord {
   return {
     schemaVersion: 1, taskId: TASK_ID, revision: 1, description: "research",
     evidenceRule: { minimumLineages: 1, independentVerificationAllowed: true, primarySourceRequired: false, fullTextRequired: false },
-    role: "literature-searcher", state: "running", attemptIds: [], blocker: null, resolution: null,
+    role: "literature-searcher", state: "running", attemptIds, blocker: null, resolution: null,
   };
 }
 
@@ -89,8 +89,8 @@ async function seedFailed(ledger: EventLedger, attempt = attemptRecord(), failur
   await ledger.append("run_created", { run: runSnapshot() });
   await ledger.append("state_changed", { from: "created", to: "planning", blocker: null });
   await ledger.append("state_changed", { from: "planning", to: "researching", blocker: null });
-  await ledger.append("task_upserted", { task: taskRecord() });
   await ledger.reserveIdentity("attempt", attempt.attemptId, "parent-generated");
+  await ledger.append("task_upserted", { task: taskRecord([attempt.attemptId]) });
   await ledger.append("dispatch_intent", { attempt });
   await ledger.append("dispatch_started", { attemptId: attempt.attemptId, pid: 1, requestCorrelation: null });
   if (failure === "superseded") throw new Error("superseded requires replacement fixture");
@@ -440,16 +440,17 @@ describe("durable retry scheduling", () => {
     events.add("run_created", { run: runSnapshot() });
     events.add("state_changed", { from: "created", to: "planning", blocker: null });
     events.add("state_changed", { from: "planning", to: "researching", blocker: null });
-    events.add("task_upserted", { task: taskRecord() });
     const epochs = 12;
     const perEpoch = 20;
+    const attemptIds = Array.from({ length: epochs * perEpoch }, (_, index) => `attempt-${String(index + 1).padStart(16, "0")}`);
+    for (const attemptId of attemptIds) events.add("identity_reserved", { kind: "attempt", id: attemptId, origin: "parent-generated" });
+    events.add("task_upserted", { task: taskRecord(attemptIds) });
     for (let epoch = 0; epoch < epochs; epoch += 1) {
       for (let item = 0; item < perEpoch; item += 1) {
         const suffix = String(epoch * perEpoch + item + 1).padStart(16, "0");
         const attemptId = `attempt-${suffix}`;
         const scheduleId = `retry-${suffix}`;
         const attempt = attemptRecord({ attemptId, executionEpoch: epoch, logicalOperationId: `large-operation-${suffix}` });
-        events.add("identity_reserved", { kind: "attempt", id: attemptId, origin: "parent-generated" });
         events.add("dispatch_intent", { attempt });
         events.add("dispatch_started", { attemptId, pid: null, requestCorrelation: null });
         events.add("attempt_failed", { attemptId, state: "retryable-failed", errorClass: "transient", message: "safe" });

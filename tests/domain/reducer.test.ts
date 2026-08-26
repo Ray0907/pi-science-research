@@ -14,6 +14,7 @@ const HASH = "a".repeat(64);
 const HASH_B = "b".repeat(64);
 const RUN_ID = "run-0000000000000001";
 const TASK_ID = "task-0000000000000001";
+const TASK_ID_2 = "task-0000000000000002";
 const ATTEMPT_1 = "attempt-0000000000000001";
 const ATTEMPT_2 = "attempt-0000000000000002";
 const ATTEMPT_3 = "attempt-0000000000000003";
@@ -120,6 +121,8 @@ function attemptRecord(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
 
 class Events {
   readonly values: FoundationLedgerEvent[] = [];
+  private taskRevision = 0;
+  private taskAttemptIds: string[] = [];
 
   add<T extends FoundationEventType>(type: T, payload: FoundationEventPayload<T>): FoundationLedgerEvent {
     const seq = this.values.length + 1;
@@ -134,6 +137,17 @@ class Events {
       entrySha256: HASH,
     } as FoundationLedgerEvent;
     this.values.push(event);
+    if (type === "task_upserted") {
+      const task = (payload as FoundationEventPayload<"task_upserted">).task;
+      if (task.taskId === TASK_ID) { this.taskRevision = task.revision; this.taskAttemptIds = [...task.attemptIds]; }
+    } else if (type === "identity_reserved") {
+      const reservation = payload as FoundationEventPayload<"identity_reserved">;
+      if (reservation.kind === "attempt" && this.taskRevision > 0 && !this.taskAttemptIds.includes(reservation.id)) {
+        this.taskRevision += 1;
+        this.taskAttemptIds.push(reservation.id);
+        this.add("task_upserted", { task: taskRecord({ revision: this.taskRevision, attemptIds: [...this.taskAttemptIds] }) });
+      }
+    }
     return event;
   }
 
@@ -141,8 +155,8 @@ class Events {
     this.add("run_created", { run: runSnapshot() });
     this.add("state_changed", { from: "created", to: "planning", blocker: null });
     this.add("state_changed", { from: "planning", to: "researching", blocker: null });
-    this.add("task_upserted", { task: taskRecord() });
     this.add("identity_reserved", { kind: "attempt", id: attempt.attemptId, origin: "parent-generated" });
+    this.add("task_upserted", { task: taskRecord({ attemptIds: [attempt.attemptId] }) });
     this.add("dispatch_intent", { attempt });
   }
 
@@ -718,7 +732,7 @@ describe("semantic corruption", () => {
           events.add("task_upserted", { task: taskRecord({ attemptIds: [ATTEMPT_1] }) });
           return events.values;
         },
-        code: "reducer.task-attempt-ref",
+        code: "reducer.task-attempt-not-reserved",
       },
       {
         name: "attempt references an absent task",
@@ -907,6 +921,92 @@ function scheduledRetryEvents(): Events {
   return events;
 }
 
+describe("remaining cross-module ledger invariants", () => {
+  test("requires a prior retryable request result before scheduling", () => {
+    const events = new Events(); events.base(); events.started();
+    events.add("identity_reserved", { kind: "request", id: REQUEST_1, origin: "child-import" });
+    events.add("request_intent_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: 1, journalEntrySha256: HASH, intent: requestIntent() });
+    events.add("identity_reserved", { kind: "retry-schedule", id: REQUEST_RETRY, origin: "child-import" });
+    events.add("request_retry_scheduled", { scheduleId: REQUEST_RETRY, attemptId: ATTEMPT_1, journalLocalSeq: 2, journalEntrySha256: HASH_B,
+      logicalRequestId: "request-series", failedRequestId: REQUEST_1, nextPhysicalAttemptOrdinal: 2, notBeforeAt: LATER, delayMs: 1, reasonClass: "transient" });
+    expectCorruption(events.values, "reducer.request-schedule-link");
+  });
+
+  test("binds request schedules to the failed request owning attempt", () => {
+    const events = new Events(); events.base(); events.started();
+    events.add("identity_reserved", { kind: "request", id: REQUEST_1, origin: "child-import" });
+    const intent = events.add("request_intent_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: 1, journalEntrySha256: HASH, intent: requestIntent() });
+    events.add("request_result_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: 2, journalEntrySha256: HASH_B, intentLedgerSeq: intent.seq, request: requestResult() });
+    events.add("identity_reserved", { kind: "attempt", id: ATTEMPT_2, origin: "parent-generated" });
+    events.add("dispatch_intent", { attempt: attemptRecord({ attemptId: ATTEMPT_2, logicalOperationId: "other", attemptEnvelopeSha256: "c".repeat(64) }) });
+    events.add("identity_reserved", { kind: "retry-schedule", id: REQUEST_RETRY, origin: "child-import" });
+    events.add("request_retry_scheduled", { scheduleId: REQUEST_RETRY, attemptId: ATTEMPT_2, journalLocalSeq: 1, journalEntrySha256: "d".repeat(64),
+      logicalRequestId: "request-series", failedRequestId: REQUEST_1, nextPhysicalAttemptOrdinal: 2, notBeforeAt: LATER, delayMs: 1, reasonClass: "transient" });
+    expectCorruption(events.values, "reducer.request-schedule-owner");
+  });
+
+  test("requires dispatch reverse membership in one running task", () => {
+    const events = new Events();
+    events.add("run_created", { run: runSnapshot() });
+    events.add("identity_reserved", { kind: "attempt", id: ATTEMPT_1, origin: "parent-generated" });
+    events.add("task_upserted", { task: taskRecord({ state: "ready", attemptIds: [] }) });
+    events.add("dispatch_intent", { attempt: attemptRecord() });
+    expectCorruption(events.values, "reducer.dispatch-task-state");
+
+    const duplicateOwner = new Events();
+    duplicateOwner.add("run_created", { run: runSnapshot() });
+    duplicateOwner.add("identity_reserved", { kind: "attempt", id: ATTEMPT_1, origin: "parent-generated" });
+    duplicateOwner.add("task_upserted", { task: taskRecord({ attemptIds: [ATTEMPT_1] }) });
+    duplicateOwner.add("task_upserted", { task: taskRecord({ taskId: TASK_ID_2, attemptIds: [ATTEMPT_1] }) });
+    expectCorruption(duplicateOwner.values, "reducer.task-attempt-owner");
+  });
+
+  test("rejects old-epoch request scheduling after resume and incompatible late results", () => {
+    const resumed = new Events(); resumed.base(); resumed.started();
+    resumed.add("identity_reserved", { kind: "request", id: REQUEST_1, origin: "child-import" });
+    const intent = resumed.add("request_intent_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: 1, journalEntrySha256: HASH, intent: requestIntent() });
+    resumed.add("request_result_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: 2, journalEntrySha256: HASH_B, intentLedgerSeq: intent.seq, request: requestResult() });
+    const cancel = resumed.add("cancel_requested", { executionEpoch: 0, reason: "user-pause" });
+    resumed.resume(0, 1, cancel.seq);
+    resumed.add("identity_reserved", { kind: "retry-schedule", id: REQUEST_RETRY, origin: "child-import" });
+    resumed.add("request_retry_scheduled", { scheduleId: REQUEST_RETRY, attemptId: ATTEMPT_1, journalLocalSeq: 3, journalEntrySha256: "c".repeat(64),
+      logicalRequestId: "request-series", failedRequestId: REQUEST_1, nextPhysicalAttemptOrdinal: 2, notBeforeAt: LATER, delayMs: 1, reasonClass: "transient" });
+    expectCorruption(resumed.values, "reducer.request-schedule-owner");
+
+    const late = new Events(); late.base(); late.started();
+    late.add("identity_reserved", { kind: "request", id: REQUEST_1, origin: "child-import" });
+    const lateIntent = late.add("request_intent_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: 1, journalEntrySha256: HASH, intent: requestIntent() });
+    late.add("request_result_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: 2, journalEntrySha256: HASH_B, intentLedgerSeq: lateIntent.seq, request: requestResult() });
+    late.add("identity_reserved", { kind: "retry-schedule", id: REQUEST_RETRY, origin: "child-import" });
+    late.add("request_retry_scheduled", { scheduleId: REQUEST_RETRY, attemptId: ATTEMPT_1, journalLocalSeq: 3, journalEntrySha256: "c".repeat(64),
+      logicalRequestId: "request-series", failedRequestId: REQUEST_1, nextPhysicalAttemptOrdinal: 2, notBeforeAt: LATER, delayMs: 1, reasonClass: "transient" });
+    late.add("request_result_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: 4, journalEntrySha256: "d".repeat(64), intentLedgerSeq: lateIntent.seq,
+      request: { ...requestResult(), status: "terminal-error", errorClass: "terminal" } });
+    expectCorruption(late.values, "reducer.request-intent-link");
+  });
+
+  test("uses one schedule namespace across attempt and request retries", () => {
+    const events = scheduledRetryEvents();
+    events.add("identity_reserved", { kind: "request", id: REQUEST_1, origin: "child-import" });
+    const intent = events.add("request_intent_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: 1, journalEntrySha256: "c".repeat(64), intent: requestIntent() });
+    events.add("request_result_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: 2, journalEntrySha256: "d".repeat(64), intentLedgerSeq: intent.seq, request: requestResult() });
+    events.add("request_retry_scheduled", { scheduleId: RETRY_1, attemptId: ATTEMPT_1, journalLocalSeq: 3, journalEntrySha256: "e".repeat(64),
+      logicalRequestId: "request-series", failedRequestId: REQUEST_1, nextPhysicalAttemptOrdinal: 2, notBeforeAt: LATER, delayMs: 1, reasonClass: "transient" });
+    expectCorruption(events.values, "reducer.schedule-namespace");
+
+    const reverse = new Events(); reverse.base(); reverse.started();
+    reverse.add("identity_reserved", { kind: "request", id: REQUEST_1, origin: "child-import" });
+    const reverseIntent = reverse.add("request_intent_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: 1, journalEntrySha256: "c".repeat(64), intent: requestIntent() });
+    reverse.add("request_result_recorded", { attemptId: ATTEMPT_1, journalLocalSeq: 2, journalEntrySha256: "d".repeat(64), intentLedgerSeq: reverseIntent.seq, request: requestResult() });
+    reverse.add("identity_reserved", { kind: "retry-schedule", id: RETRY_1, origin: "child-import" });
+    reverse.add("request_retry_scheduled", { scheduleId: RETRY_1, attemptId: ATTEMPT_1, journalLocalSeq: 3, journalEntrySha256: "e".repeat(64),
+      logicalRequestId: "request-series", failedRequestId: REQUEST_1, nextPhysicalAttemptOrdinal: 2, notBeforeAt: LATER, delayMs: 1, reasonClass: "transient" });
+    reverse.add("attempt_failed", { attemptId: ATTEMPT_1, state: "retryable-failed", errorClass: "transient", message: "safe" });
+    reverse.add("retry_scheduled", { scheduleId: RETRY_1, logicalOperationId: LOGICAL, failedAttemptId: ATTEMPT_1, nextAttemptOrdinal: 2, notBeforeAt: LATER, delayMs: 1, reasonClass: "transient" });
+    expectCorruption(reverse.values, "reducer.schedule-namespace");
+  });
+});
+
 describe("cross-module ledger invariants", () => {
   test("reduces a linked request intent/result and rejects immutable mismatch", () => {
     const events = new Events(); events.base(); events.started();
@@ -993,9 +1093,9 @@ describe("cross-module ledger invariants", () => {
 
   test("rejects task revision, transition, and append-only attempt history violations", () => {
     const cases: Array<{ next: Partial<TaskRecord>; code: string }> = [
-      { next: { revision: 1, state: "ready" }, code: "reducer.task-revision" },
-      { next: { revision: 2, state: "resolved", resolution: "early" }, code: "reducer.task-resolution" },
-      { next: { revision: 2, state: "open" }, code: "reducer.task-transition" },
+      { next: { revision: 1, state: "ready", attemptIds: [ATTEMPT_1] }, code: "reducer.task-revision" },
+      { next: { revision: 2, state: "resolved", resolution: "early", attemptIds: [ATTEMPT_1] }, code: "reducer.task-resolution" },
+      { next: { revision: 2, state: "open", attemptIds: [ATTEMPT_1] }, code: "reducer.task-transition" },
       { next: { revision: 2, attemptIds: [ATTEMPT_1, ATTEMPT_1] }, code: "reducer.task-attempt-history" },
     ];
     for (const item of cases) {

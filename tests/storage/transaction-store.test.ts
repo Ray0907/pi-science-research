@@ -1160,7 +1160,7 @@ function runSnapshot(): RunSnapshot {
   };
 }
 function task(): TaskRecord {
-  return { schemaVersion: 1, taskId: TASK, revision: 1, description: "task", evidenceRule: { minimumLineages: 1, independentVerificationAllowed: true, primarySourceRequired: false, fullTextRequired: false }, role: "literature-searcher", state: "running", attemptIds: [], blocker: null, resolution: null };
+  return { schemaVersion: 1, taskId: TASK, revision: 1, description: "task", evidenceRule: { minimumLineages: 1, independentVerificationAllowed: true, primarySourceRequired: false, fullTextRequired: false }, role: "literature-searcher", state: "running", attemptIds: [ATTEMPT], blocker: null, resolution: null };
 }
 function attempt(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
   return { schemaVersion: 1, attemptId: ATTEMPT, revision: 1, runId: RUN, taskId: TASK, executionEpoch: 0, logicalOperationId: "op", attemptOrdinal: 1, retryOfAttemptId: null, attemptKind: "research", replayPolicy: "safe-read", state: "intent-recorded", providerModel: "p/m", thinkingLevel: "medium", promptTemplateSha256: HASH, renderedPromptSha256: "b".repeat(64), logicalInputSha256: "c".repeat(64), attemptEnvelopeSha256: "d".repeat(64), toolAllowlist: [], deadlineAt: AT, capabilityId: "cap", resultSha256: null, billingStatus: "unknown", reportedUsage: null, error: null, createdAt: AT, updatedAt: AT, ...overrides };
@@ -1192,6 +1192,7 @@ function supersededResultEvents(): FoundationLedgerEvent[] {
   events.push(event("identity_reserved", { kind: "retry-schedule", id: RETRY, origin: "parent-generated" }));
   events.push(event("retry_scheduled", { scheduleId: RETRY, logicalOperationId: "op", failedAttemptId: ATTEMPT, nextAttemptOrdinal: 2, notBeforeAt: AT, delayMs: 0, reasonClass: "transient" }));
   events.push(event("identity_reserved", { kind: "attempt", id: ATTEMPT_2, origin: "parent-generated" }));
+  events.push(event("task_upserted", { task: { ...task(), revision: 2, attemptIds: [ATTEMPT, ATTEMPT_2] } }));
   events.push(event("retry_started", { scheduleId: RETRY, logicalOperationId: "op", attemptId: ATTEMPT_2, attemptOrdinal: 2, scheduledFromSeq: 9 }));
   events.push(event("dispatch_intent", { attempt: attempt({ attemptId: ATTEMPT_2, attemptOrdinal: 2, retryOfAttemptId: ATTEMPT, attemptEnvelopeSha256: "e".repeat(64) }) }));
   events.push(event("attempt_failed", { attemptId: ATTEMPT, state: "superseded", errorClass: "superseded", message: "replacement" }));
@@ -1203,8 +1204,8 @@ function coreBaseEvents(): FoundationLedgerEvent[] {
   eventSeq = 1;
   return [
     event("run_created", { run: runSnapshot() }),
-    event("task_upserted", { task: task() }),
     event("identity_reserved", { kind: "attempt", id: ATTEMPT, origin: "parent-generated" }),
+    event("task_upserted", { task: task() }),
     event("identity_reserved", { kind: "transaction", id: TX, origin: "parent-generated" }),
     event("dispatch_intent", { attempt: attempt() }),
     event("dispatch_started", { attemptId: ATTEMPT, pid: null, requestCorrelation: null }),
