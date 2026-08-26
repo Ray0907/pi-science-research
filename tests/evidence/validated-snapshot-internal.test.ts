@@ -1,0 +1,122 @@
+import { describe, expect, test } from "vitest";
+
+import * as rootExports from "../../src/index.js";
+import type { RequestRecord } from "../../src/domain/events.js";
+import type { ClaimRecord, EvidenceRecord, SourceRecord } from "../../src/domain/research-records.js";
+import {
+  EvidenceAdmissionError,
+  buildBoundedValidatedEvidenceSnapshot,
+  type CanonicalEvidenceSet,
+  type EvidenceSnapshotDiagnostics,
+} from "../../src/evidence/admission.js";
+import { getValidatedSnapshotIndexes } from "../../src/evidence/validated-snapshot-internal.js";
+
+const AT = "2026-08-25T12:00:00.000Z";
+const HASH = "a".repeat(64);
+const ATTEMPT = "attempt-0000000000000001";
+function source(overrides: Partial<SourceRecord> = {}): SourceRecord {
+  return {
+    schemaVersion: 1, sourceId: "src-internal.000001", revision: 1,
+    identifiers: { doi: "10.1234/internal", pmid: null, pmcid: null }, canonicalUrl: "https://doi.org/10.1234/internal",
+    title: "Internal", authors: [], containerTitle: null, publisher: null, volume: null, issue: null, pages: null,
+    published: { date: null, precision: "unknown" }, publicationType: "journal-article", peerReviewStatus: "unknown",
+    accessLevel: "full-text", retrievedAt: AT, retrievalRequestIds: [], metadataProvenance: [],
+    lineage: { studyId: "study-internal", cohortIds: [], datasetIds: [], relatedSourceIds: [], relationTypes: [] }, ...overrides,
+  };
+}
+function claim(): ClaimRecord { return {
+  schemaVersion: 1, claimId: "claim-0000000000000001", revision: 1, statement: "Internal claim", kind: "externally-verifiable-fact",
+  materiality: "load-bearing", scopeQualifiers: { population: null, intervention: null, comparator: null, outcome: null, timeRange: null },
+  evidenceRule: { minimumLineages: 1, independentVerificationAllowed: false, primarySourceRequired: false, fullTextRequired: false },
+  status: "supported", confidence: 1, evidenceRefs: [{ evidenceId: "ev-0000000000000001", revision: 1 }], conflictClaimIds: [], createdByAttemptId: ATTEMPT,
+}; }
+function evidence(): EvidenceRecord { return {
+  schemaVersion: 1, evidenceId: "ev-0000000000000001", revision: 1, claimRef: { claimId: claim().claimId, revision: 1 },
+  evidenceType: "retrieved", sourceRef: { sourceId: source().sourceId, revision: 1 }, calculationId: null, stance: "supporting",
+  quotes: ["quote"], locators: [{ type: "page", value: "1" }], extractedValues: [], method: null,
+  quality: "primary-peer-reviewed", confidence: 1, recordedByAttemptId: ATTEMPT, verificationStatus: "verified", conflictsWith: [],
+}; }
+function records(overrides: Partial<CanonicalEvidenceSet> = {}): CanonicalEvidenceSet {
+  return { sources: [source()], claims: [claim()], evidence: [evidence()], verifications: [], requests: [], calculations: [], ...overrides };
+}
+function diagnostics(): EvidenceSnapshotDiagnostics { return {
+  canonicalRecordVisits: 0, referenceVisits: 0, revisionIndexInsertions: 0, sourceIdentityVisits: 0,
+  lineageVisits: 0, requestRecordsIndexed: 0, requestUrlVisits: 0, metadataStepVisits: 0,
+}; }
+function code(action: () => unknown): string | undefined {
+  try { action(); } catch (error) { expect(error).toBeInstanceOf(EvidenceAdmissionError); return (error as EvidenceAdmissionError).code; }
+  return undefined;
+}
+
+describe("validated evidence snapshot internals", () => {
+  test("builds one immutable bounded validated evidence snapshot in linear visits", () => {
+    const visits = diagnostics(); const snapshot = buildBoundedValidatedEvidenceSnapshot(records(), undefined, visits);
+    expect(visits.canonicalRecordVisits).toBe(3);
+    expect(visits.revisionIndexInsertions).toBe(3);
+    expect(Object.isFrozen(snapshot)).toBe(true);
+    expect(Object.isFrozen(snapshot.records.sources)).toBe(true);
+  });
+  test("binds snapshot option policy and view hashes without leaking indexes", () => {
+    const snapshot = buildBoundedValidatedEvidenceSnapshot(records());
+    expect(snapshot.snapshotSha256).toMatch(/^[a-f0-9]{64}$/u);
+    expect(snapshot.optionsSha256).toMatch(/^[a-f0-9]{64}$/u);
+    expect(snapshot.policySha256).toMatch(/^[a-f0-9]{64}$/u);
+    expect(JSON.stringify(snapshot)).not.toMatch(/canonicalRecordString|outgoingReferences|lineageGraph/u);
+  });
+  test("returns authentic immutable validated snapshot indexes without Map escape", () => {
+    const snapshot = buildBoundedValidatedEvidenceSnapshot(records());
+    const indexes = getValidatedSnapshotIndexes(snapshot);
+    expect(Object.isFrozen(indexes)).toBe(true);
+    expect(indexes.getExactRecord({ kind: "claims", id: claim().claimId, revision: 1 })).toEqual(claim());
+    expect(indexes.getCanonicalRecordString({ kind: "claims", id: claim().claimId, revision: 1 })).toContain("Internal claim");
+    expect(Object.values(indexes).some((value) => value instanceof Map || value instanceof Set)).toBe(false);
+    expect("getValidatedSnapshotIndexes" in rootExports).toBe(false);
+    expect("buildBoundedValidatedEvidenceSnapshotInternal" in rootExports).toBe(false);
+  });
+  test("rejects structurally identical forged snapshot with evidence.snapshot-invalid", () => {
+    const snapshot = buildBoundedValidatedEvidenceSnapshot(records());
+    expect(code(() => getValidatedSnapshotIndexes(Object.freeze({ ...snapshot })))).toBe("evidence.snapshot-invalid");
+  });
+  test("rejects altered snapshot policy and hashes with evidence.snapshot-invalid", () => {
+    const snapshot = buildBoundedValidatedEvidenceSnapshot(records());
+    for (const field of ["snapshotSha256", "optionsSha256", "policySha256"] as const)
+      expect(code(() => getValidatedSnapshotIndexes(Object.freeze({ ...snapshot, [field]: "b".repeat(64) })))).toBe("evidence.snapshot-invalid");
+  });
+  test("keeps diagnostics unchanged across repeated internal index access", () => {
+    const visits = diagnostics(); const snapshot = buildBoundedValidatedEvidenceSnapshot(records(), undefined, visits); const before = { ...visits };
+    getValidatedSnapshotIndexes(snapshot); getValidatedSnapshotIndexes(snapshot);
+    expect(visits).toEqual(before);
+  });
+  test("rejects forged and hash-mismatched evidence snapshots", () => {
+    expect(code(() => getValidatedSnapshotIndexes(Object.freeze({}) as never))).toBe("evidence.snapshot-invalid");
+    const proxy = new Proxy({}, { get() { throw new Error("SECRET"); } });
+    expect(code(() => getValidatedSnapshotIndexes(proxy as never))).toBe("evidence.snapshot-invalid");
+  });
+  test("reuses one request provenance index across many source audits", () => {
+    const id = "request-0000000000000001";
+    const s = source({ identifiers: { doi: null, pmid: null, pmcid: null }, canonicalUrl: "https://example.org/article", retrievalRequestIds: [id] });
+    const request: RequestRecord = {
+      schemaVersion: 1, requestId: id, attemptId: ATTEMPT, executionEpoch: 0, logicalRequestId: "logical-0000000000000001",
+      physicalAttemptOrdinal: 1, retryOfRequestId: null, replayPolicy: "safe-read", provider: "openalex", operation: "fetch",
+      normalizedInput: { query: null, identifier: null, url: s.canonicalUrl, parameters: [] }, accessPolicySha256: HASH,
+      startedAt: AT, endedAt: AT, status: "success", httpStatus: 200, requestedUrl: s.canonicalUrl, finalUrl: s.canonicalUrl,
+      redirectUrls: [], responseSha256: null, responseFile: null, encodedBytes: 0, decodedBytes: 0, resultSourceIds: [s.sourceId], errorClass: null,
+    };
+    const snapshot = buildBoundedValidatedEvidenceSnapshot(records({ sources: [s], requests: [request] }));
+    expect(getValidatedSnapshotIndexes(snapshot).requestProvenanceIndex).toBe(snapshot.requestProvenanceIndex);
+  });
+  test("bounds every canonical record kind and aggregate set bytes before indexes", () => {
+    expect(code(() => buildBoundedValidatedEvidenceSnapshot(records(), { limits: { maxClaimRecordCanonicalBytes: 10 } }))).toBe("evidence.record-too-large");
+    expect(code(() => buildBoundedValidatedEvidenceSnapshot(records(), { limits: {
+      maxCanonicalScalarBytes: 128,
+      maxSourceRecordCanonicalBytes: 1_000, maxRequestRecordCanonicalBytes: 1_000,
+      maxClaimRecordCanonicalBytes: 1_000, maxEvidenceRecordCanonicalBytes: 1_000,
+      maxVerificationRecordCanonicalBytes: 1_000, maxCalculationRecordCanonicalBytes: 1_000,
+      maxCanonicalEvidenceSetBytes: 1_000,
+    } }))).toBe("evidence.input-too-large");
+  });
+  test("rejects oversized quotes metadata request queries calculation strings and nested values", () => {
+    const huge = evidence(); huge.quotes = ["x".repeat(2_000)];
+    expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ evidence: [huge] }), { limits: { maxEvidenceRecordCanonicalBytes: 1_000 } }))).toBe("evidence.record-too-large");
+  });
+});

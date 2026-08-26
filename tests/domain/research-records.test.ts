@@ -1,6 +1,11 @@
 import { describe, expect, test } from "vitest";
 import { canonicalJson } from "../../src/crypto/canonical-json.js";
-import { parseResearchRecord, type SourceRecord } from "../../src/domain/research-records.js";
+import {
+  CitationMapRecordSchema,
+  parseResearchRecord,
+  type SourceRecord,
+} from "../../src/domain/research-records.js";
+import { parse } from "../../src/domain/schema.js";
 import { ScholarlyIdentifierError, validateProspectiveSourceIdentityFields } from "../../src/scholarly/identifiers.js";
 
 const AT = "2026-08-25T12:00:00.000Z";
@@ -73,6 +78,23 @@ describe("closed research record schemas", () => {
       expect(error).toBeInstanceOf(ScholarlyIdentifierError);
       expect((error as ScholarlyIdentifierError).code).toBe("identifier.invalid-doi");
     }
+  });
+
+  test("parses closed CitationMapRecord without tightening V1 record schemas", () => {
+    const citation = {
+      schemaVersion: 1,
+      citationNumber: 1,
+      sourceRef: { sourceId: "src-openalex.w1", revision: 1 },
+      claimRefs: [{ claimId: "claim-0000000000000001", revision: 1 }],
+      evidenceRefs: [{ evidenceId: "ev-0000000000000001", revision: 1 }],
+    };
+    expect(parse(CitationMapRecordSchema, citation).success).toBe(true);
+    expect(parse(CitationMapRecordSchema, { ...citation, unexpected: true }).success).toBe(false);
+    const legacy = { ...evidenceRecord(), quotes: [""], locators: [{ type: "page", value: "" }] };
+    const before = canonicalJson(legacy);
+    const parsed = parseResearchRecord("evidence", legacy);
+    expect(parsed.success).toBe(true);
+    expect(parsed.success && canonicalJson(parsed.value)).toBe(before);
   });
 
   test("enforces confidence, exact refs and calculation status", () => {

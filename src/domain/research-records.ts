@@ -53,6 +53,16 @@ export const EvidenceRuleSchema = Type.Object({
   minimumLineages: nonNegativeInteger, independentVerificationAllowed: Type.Boolean(),
   primarySourceRequired: Type.Boolean(), fullTextRequired: Type.Boolean(),
 }, closed);
+export type EvidenceRule = Static<typeof EvidenceRuleSchema>;
+
+export const CitationMapRecordSchema = Type.Object({
+  schemaVersion: Type.Literal(1),
+  citationNumber: Type.Integer({ minimum: 1 }),
+  sourceRef: SourceRefSchema,
+  claimRefs: Type.Array(ClaimRefSchema),
+  evidenceRefs: Type.Array(EvidenceRefSchema),
+}, closed);
+export type CitationMapRecord = Static<typeof CitationMapRecordSchema>;
 const ScopeQualifiersSchema = Type.Object({ population: nullableString, intervention: nullableString, comparator: nullableString, outcome: nullableString, timeRange: nullableString }, closed);
 export const ClaimRecordSchema = Type.Object({
   schemaVersion: Type.Literal(1), claimId: id(ID_PATTERNS.claim), revision, statement: Type.String(),
