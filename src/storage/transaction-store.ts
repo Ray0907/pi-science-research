@@ -121,6 +121,7 @@ export interface TransactionStoreOptions {
   lockTrashMinAgeMs?: number;
   onAncestorCheck?: (phase: string) => void | Promise<void>;
   onReadOnlyCheck?: (phase: string, path: string) => void | Promise<void>;
+  onHandleOpened?: (kind: "read-only-hierarchy" | "mutation-hierarchy" | "transaction-directory" | "transaction-file", path: string, handle: FileHandle) => void | Promise<void>;
 }
 
 export interface TransactionManifestRef {
@@ -332,7 +333,7 @@ export async function inspectCanonicalTransactionsReadOnly(
   const committedRoot = join(transactionsDirectory, "committed");
   if (await pathExists(committedRoot)) await assertOwnedDirectory(committedRoot);
   const limits = limitsFrom(options);
-  const guard = await pinReadOnlyHierarchy(root);
+  const guard = await pinReadOnlyHierarchy(root, options);
   let result: ReadOnlyTransactionIntegrity | undefined;
   let failure: unknown;
   try {
@@ -821,8 +822,8 @@ async function verifyDirectory(
   let result: VerifiedTransaction | undefined;
   let failure: unknown;
   try {
-    container = await pinTransactionDirectory(dirname(directory));
-    pinned = await pinTransactionDirectory(directory);
+    container = await pinTransactionDirectory(dirname(directory), options);
+    pinned = await pinTransactionDirectory(directory, options);
     await assertPinnedTransactionDirectory(container);
     await invokeReadOnlyCheck(options, "transaction-directory-pinned", directory);
     await assertPinnedTransactionDirectory(container);
@@ -885,20 +886,22 @@ async function verifyDirectory(
   return result!;
 }
 
-async function pinTransactionDirectory(path: string): Promise<PinnedTransactionDirectory> {
+async function pinTransactionDirectory(path: string, options: TransactionStoreOptions): Promise<PinnedTransactionDirectory> {
   const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
   const directoryFlag = typeof constants.O_DIRECTORY === "number" ? constants.O_DIRECTORY : 0;
   let handle: FileHandle | undefined;
   try {
     handle = await open(path, constants.O_RDONLY | noFollow | directoryFlag);
+    await invokeHandleOpened(options, "transaction-directory", path, handle);
     const descriptor = await handle.stat({ bigint: true });
     const pathname = await lstat(path, { bigint: true });
     if (!descriptor.isDirectory() || pathname.isSymbolicLink() || !pathname.isDirectory()
       || descriptor.dev !== pathname.dev || descriptor.ino !== pathname.ino || descriptor.ctimeNs !== pathname.ctimeNs) fail("transaction.unsafe-file");
     return { path, handle, dev: descriptor.dev, ino: descriptor.ino, ctimeNs: descriptor.ctimeNs };
   } catch (error) {
-    await handle?.close().catch(() => undefined);
-    throw normalize(error, "transaction.unsafe-file");
+    let failure: unknown = normalize(error, "transaction.unsafe-file");
+    if (handle) failure = await closeForOperation(handle, options, failure);
+    throw failure;
   }
 }
 
@@ -918,6 +921,15 @@ async function assertPinnedTransactionDirectory(pinned: PinnedTransactionDirecto
 
 async function invokeReadOnlyCheck(options: TransactionStoreOptions, phase: string, path: string): Promise<void> {
   try { await options.onReadOnlyCheck?.(phase, path); } catch { fail("transaction.unsafe-file"); }
+}
+
+async function invokeHandleOpened(
+  options: TransactionStoreOptions,
+  kind: "read-only-hierarchy" | "mutation-hierarchy" | "transaction-directory" | "transaction-file",
+  path: string,
+  handle: FileHandle,
+): Promise<void> {
+  await options.onHandleOpened?.(kind, path, handle);
 }
 
 function parseCanonicalSingleJson(bytes: Buffer, limits: Limits): unknown {
@@ -1096,14 +1108,18 @@ async function cleanupMatchingStaging(root: string, transactionId: string, commi
   if (!before.isDirectory() || before.isSymbolicLink()) fail("transaction.unsafe-file");
   const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
   const directoryFlag = typeof constants.O_DIRECTORY === "number" ? constants.O_DIRECTORY : 0;
-  const handle = await open(stage, constants.O_RDONLY | noFollow | directoryFlag).catch(() => fail("transaction.unsafe-file"));
+  let handle: FileHandle | undefined;
+  let failure: unknown;
   try {
-    const pinned = await handle.stat();
+    const acquired = await open(stage, constants.O_RDONLY | noFollow | directoryFlag).catch(() => fail("transaction.unsafe-file"));
+    handle = acquired;
+    await invokeHandleOpened(options, "transaction-directory", stage, acquired);
+    const pinned = await acquired.stat();
     if (!pinned.isDirectory() || pinned.dev !== before.dev || pinned.ino !== before.ino) fail("transaction.unsafe-file");
     const assertStage = async () => {
       await assertPinnedHierarchy(guard, "during-staging-cleanup", options);
       const current = await lstat(stage).catch(() => fail("transaction.unsafe-file"));
-      const descriptor = await handle.stat().catch(() => fail("transaction.unsafe-file"));
+      const descriptor = await acquired.stat().catch(() => fail("transaction.unsafe-file"));
       if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== pinned.dev || current.ino !== pinned.ino
         || descriptor.dev !== pinned.dev || descriptor.ino !== pinned.ino) fail("transaction.unsafe-file");
     };
@@ -1137,10 +1153,14 @@ async function cleanupMatchingStaging(root: string, transactionId: string, commi
     await protocolStep("quarantine-destination-parent-synced", options);
     await assertPinnedHierarchy(guard, "after-quarantine-rename", options);
     const quarantined = await lstat(quarantine).catch(() => fail("transaction.unsafe-file"));
-    const descriptor = await handle.stat().catch(() => fail("transaction.unsafe-file"));
+    const descriptor = await acquired.stat().catch(() => fail("transaction.unsafe-file"));
     if (!quarantined.isDirectory() || quarantined.isSymbolicLink() || quarantined.dev !== pinned.dev || quarantined.ino !== pinned.ino
       || descriptor.dev !== pinned.dev || descriptor.ino !== pinned.ino) fail("transaction.unsafe-file");
-  } finally { await handle.close().catch(() => undefined); }
+  } catch (error) {
+    failure = error;
+  }
+  if (handle) failure = await closeForOperation(handle, options, failure);
+  if (failure) throw normalize(failure, "transaction.unsafe-file");
 }
 
 /**
@@ -1224,6 +1244,7 @@ async function openAndReadPinnedFile(
     // Darwin/Node has no openat for child reads; the read-only pathname open
     // remains bracketed by pinned-parent and descriptor/path checks.
     handle = await open(path, constants.O_RDONLY | noFollow);
+    await invokeHandleOpened(options, "transaction-file", path, handle);
     await assertPinnedTransactionDirectory(parent);
     const initial = await handle.stat({ bigint: true });
     const initialPath = await lstat(path, { bigint: true });
@@ -1295,11 +1316,14 @@ async function readSafeFile(
   let initialPath: BigIntStats | undefined;
   const parts: Buffer[] = [];
   let total = 0;
+  let result: Buffer | undefined;
+  let failure: unknown;
   try {
     if (parent) await assertPinnedTransactionDirectory(parent);
     // Darwin/Node has no openat for child reads; O_NOFOLLOW pathname open is
     // therefore bracketed by pinned-parent and descriptor/path identity checks.
     handle = await open(path, constants.O_RDONLY | noFollow);
+    await invokeHandleOpened(options, "transaction-file", path, handle);
     if (parent) await assertPinnedTransactionDirectory(parent);
     initial = await handle.stat({ bigint: true });
     initialPath = await lstat(path, { bigint: true });
@@ -1325,12 +1349,13 @@ async function readSafeFile(
     if (after.dev !== initial.dev || after.ino !== initial.ino || after.size !== initial.size
       || after.mtimeNs !== initial.mtimeNs || after.ctimeNs !== initial.ctimeNs || after.size !== BigInt(total)) fail("transaction.unsafe-file");
     if (parent) await assertPinnedTransactionDirectory(parent);
-    return Buffer.concat(parts, total);
+    result = Buffer.concat(parts, total);
   } catch (error) {
-    throw normalize(error, "transaction.unsafe-file");
-  } finally {
-    await handle?.close().catch(() => undefined);
+    failure = normalize(error, "transaction.unsafe-file");
   }
+  if (handle) failure = await closeForOperation(handle, options, failure);
+  if (failure) throw failure;
+  return result!;
 }
 
 function assertStablePinnedFile(
@@ -1435,7 +1460,7 @@ type PinnedHierarchy = readonly PinnedDirectory[];
 
 function withMutationLock<T>(root: string, options: TransactionStoreOptions, operation: (guard: PinnedHierarchy) => Promise<T>): Promise<T> {
   return withRootLock(root, async () => {
-    const guard = await pinHierarchy(root);
+    const guard = await pinHierarchy(root, options);
     let lock: MutationLock | undefined;
     let result: T | undefined;
     let failure: unknown;
@@ -1452,13 +1477,13 @@ function withMutationLock<T>(root: string, options: TransactionStoreOptions, ope
       try { await releaseMutationLock(root, lock, options); }
       catch (error) { if (!failure) failure = error; }
     }
-    await Promise.all(guard.map(({ handle }) => handle.close().catch(() => undefined)));
+    for (const item of [...guard].reverse()) failure = await closeForOperation(item.handle, options, failure);
     if (failure) throw failure;
     return result as T;
   });
 }
 
-async function pinReadOnlyHierarchy(root: string): Promise<PinnedHierarchy> {
+async function pinReadOnlyHierarchy(root: string, options: TransactionStoreOptions): Promise<PinnedHierarchy> {
   const candidates = [root, join(root, ".state"), join(root, ".state/transactions"), join(root, ".state/transactions/committed")];
   const existing: string[] = [];
   for (const path of candidates) {
@@ -1466,11 +1491,14 @@ async function pinReadOnlyHierarchy(root: string): Promise<PinnedHierarchy> {
     else if (path === root) fail("transaction.unsafe-root");
   }
   const pinned: PinnedDirectory[] = [];
+  const opened: FileHandle[] = [];
   const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
   const directoryFlag = typeof constants.O_DIRECTORY === "number" ? constants.O_DIRECTORY : 0;
   try {
     for (const [index, path] of existing.entries()) {
       const handle = await open(path, constants.O_RDONLY | noFollow | directoryFlag);
+      opened.push(handle);
+      await invokeHandleOpened(options, "read-only-hierarchy", path, handle);
       const stat = await handle.stat();
       const uid = typeof process.getuid === "function" ? process.getuid() : null;
       if (!stat.isDirectory() || (index > 0 && ((uid !== null && stat.uid !== uid) || (stat.mode & 0o077) !== 0))) fail("transaction.unsafe-root");
@@ -1478,19 +1506,23 @@ async function pinReadOnlyHierarchy(root: string): Promise<PinnedHierarchy> {
     }
     return pinned;
   } catch (error) {
-    await Promise.all(pinned.map(({ handle }) => handle.close().catch(() => undefined)));
-    throw normalize(error, "transaction.unsafe-root");
+    let failure: unknown = normalize(error, "transaction.unsafe-root");
+    for (const handle of opened.reverse()) failure = await closeForOperation(handle, options, failure);
+    throw failure;
   }
 }
 
-async function pinHierarchy(root: string): Promise<PinnedHierarchy> {
+async function pinHierarchy(root: string, options: TransactionStoreOptions): Promise<PinnedHierarchy> {
   const paths = [root, join(root, ".state"), join(root, ".state/transactions"), join(root, ".state/transactions/.staging"), join(root, ".state/transactions/committed")];
   const pinned: PinnedDirectory[] = [];
+  const opened: FileHandle[] = [];
   const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
   const directoryFlag = typeof constants.O_DIRECTORY === "number" ? constants.O_DIRECTORY : 0;
   try {
     for (const [index, path] of paths.entries()) {
       const handle = await open(path, constants.O_RDONLY | noFollow | directoryFlag);
+      opened.push(handle);
+      await invokeHandleOpened(options, "mutation-hierarchy", path, handle);
       const stat = await handle.stat();
       const uid = typeof process.getuid === "function" ? process.getuid() : null;
       if (!stat.isDirectory() || (index > 0 && ((uid !== null && stat.uid !== uid) || (stat.mode & 0o077) !== 0))) fail("transaction.unsafe-root");
@@ -1498,8 +1530,9 @@ async function pinHierarchy(root: string): Promise<PinnedHierarchy> {
     }
     return pinned;
   } catch (error) {
-    await Promise.all(pinned.map(({ handle }) => handle.close().catch(() => undefined)));
-    throw normalize(error, "transaction.unsafe-root");
+    let failure: unknown = normalize(error, "transaction.unsafe-root");
+    for (const handle of opened.reverse()) failure = await closeForOperation(handle, options, failure);
+    throw failure;
   }
 }
 

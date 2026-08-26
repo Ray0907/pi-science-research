@@ -991,6 +991,116 @@ describe("read-only transaction race resistance", () => {
     expect(handles.length).toBeGreaterThanOrEqual(9);
     for (const handle of handles) await expect(handle.stat()).rejects.toBeDefined();
   });
+
+  test.each([
+    ["first-stat", 1],
+    ["validation", 1],
+    ["second-handle", 2],
+  ] as const)("cleans the read-only hierarchy registry after %s failure", async (failureKind, expectedHandles) => {
+    const runRoot = await root();
+    await committed(runRoot);
+    const handles: FileHandle[] = [];
+    const closes = new Map<FileHandle, number>();
+    const options = {
+      onHandleOpened: async (kind: string, _path: string, handle: FileHandle) => {
+        if (kind !== "read-only-hierarchy") return;
+        handles.push(handle);
+        if (failureKind === "first-stat" && handles.length === 1) {
+          Object.defineProperty(handle, "stat", { configurable: true, value: async () => { throw new Error("first-stat-secret"); } });
+        }
+        if (failureKind === "validation" && handles.length === 1) throw new Error("validation-secret");
+        if (failureKind === "second-handle" && handles.length === 2) throw new Error("second-handle-secret");
+      },
+      close: async (handle: FileHandle) => {
+        closes.set(handle, (closes.get(handle) ?? 0) + 1);
+        await handle.close();
+      },
+    };
+    const failure = inspectCanonicalTransactionsReadOnly(runRoot, baseEvents(), options);
+    await expectCode(failure, "transaction.unsafe-root");
+    expect(handles).toHaveLength(expectedHandles);
+    for (const handle of handles) {
+      expect(closes.get(handle)).toBe(1);
+      await expect(handle.stat()).rejects.toBeDefined();
+    }
+    expect(await inspectCanonicalTransactionsReadOnly(runRoot, baseEvents())).toMatchObject({ pendingCount: 1 });
+  });
+
+  test("preserves the primary hierarchy error when injected close also throws", async () => {
+    const runRoot = await root();
+    await committed(runRoot);
+    const handles: FileHandle[] = [];
+    const nativeCloses = new Map<FileHandle, number>();
+    const options = {
+      onHandleOpened: async (kind: string, _path: string, handle: FileHandle) => {
+        if (kind !== "read-only-hierarchy") return;
+        handles.push(handle);
+        const nativeClose = handle.close.bind(handle);
+        Object.defineProperty(handle, "close", {
+          configurable: true,
+          value: async () => {
+            nativeCloses.set(handle, (nativeCloses.get(handle) ?? 0) + 1);
+            await nativeClose();
+          },
+        });
+        throw new Error("primary-secret");
+      },
+      close: async () => { throw new Error("close-secret"); },
+    };
+    const failure = inspectCanonicalTransactionsReadOnly(runRoot, baseEvents(), options);
+    await expectCode(failure, "transaction.unsafe-root");
+    await expect(failure.catch((error: Error) => error.message)).resolves.not.toContain("secret");
+    expect(handles).toHaveLength(1);
+    expect(nativeCloses.get(handles[0]!)).toBe(1);
+    await expect(handles[0]!.stat()).rejects.toBeDefined();
+    expect(await inspectCanonicalTransactionsReadOnly(runRoot, baseEvents())).toMatchObject({ pendingCount: 1 });
+  });
+
+  test("closes a newly opened mutation-hierarchy handle before ownership transfer", async () => {
+    const runRoot = await root();
+    await committed(runRoot);
+    const handles: FileHandle[] = [];
+    const closes = new Map<FileHandle, number>();
+    const options = {
+      onHandleOpened: async (kind: string, _path: string, handle: FileHandle) => {
+        if (kind !== "mutation-hierarchy" || handles.length > 0) return;
+        handles.push(handle);
+        Object.defineProperty(handle, "stat", { configurable: true, value: async () => { throw new Error("mutation-stat-secret"); } });
+      },
+      close: async (handle: FileHandle) => {
+        closes.set(handle, (closes.get(handle) ?? 0) + 1);
+        await handle.close();
+      },
+    };
+    await expectCode(reconcileCanonicalTransactions(runRoot, baseEvents(), options), "transaction.unsafe-root");
+    expect(handles).toHaveLength(1);
+    expect(closes.get(handles[0]!)).toBe(1);
+    expect(await reconcileCanonicalTransactions(runRoot, baseEvents())).toEqual([{ kind: "finish-transaction", transactionId: TX }]);
+  });
+
+  test.each(["transaction-directory", "transaction-file"])("closes a newly opened %s handle when its first validation throws", async (targetKind) => {
+    const runRoot = await root();
+    await committed(runRoot);
+    const handles: FileHandle[] = [];
+    const closes = new Map<FileHandle, number>();
+    const options = {
+      onHandleOpened: async (kind: string, _path: string, handle: FileHandle) => {
+        if (kind !== targetKind || handles.length > 0) return;
+        handles.push(handle);
+        Object.defineProperty(handle, "stat", { configurable: true, value: async () => { throw new Error("retained-stat-secret"); } });
+      },
+      close: async (handle: FileHandle) => {
+        closes.set(handle, (closes.get(handle) ?? 0) + 1);
+        await handle.close();
+      },
+    };
+    const failure = inspectCanonicalTransactionsReadOnly(runRoot, baseEvents(), options);
+    await expectCode(failure, "transaction.unsafe-file");
+    expect(handles).toHaveLength(1);
+    expect(closes.get(handles[0]!)).toBe(1);
+    await expect(handles[0]!.stat()).rejects.toBeDefined();
+    expect(await inspectCanonicalTransactionsReadOnly(runRoot, baseEvents())).toMatchObject({ pendingCount: 1 });
+  });
 });
 
 function runSnapshot(): RunSnapshot {
