@@ -451,6 +451,33 @@ test("cross-process create", async () => {
     await expect(lstat(join(replacement, "run"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  test("rejects a higher approved ancestor swap-and-restore before writing", async () => {
+    const { base, project } = await fixture();
+    const high = join(base, "approved-high");
+    const low = join(high, "low");
+    const moved = join(base, "approved-high-old");
+    const replacement = join(base, "approved-high-replacement");
+    await mkdir(low, { recursive: true });
+    await mkdir(join(replacement, "low"), { recursive: true });
+    let swapped = false;
+
+    await expect(createOwnedRunRoot(options(project, {
+      requestedPath: join(low, "run"),
+      allowAbsoluteRequestedPath: true,
+      approvedOutsideRoots: [high],
+      onCheck: async (phase: string) => {
+        if (phase !== "before-create" || swapped) return;
+        swapped = true;
+        await rename(high, moved);
+        await rename(replacement, high);
+        await rename(high, replacement);
+        await rename(moved, high);
+      },
+    }))).rejects.toEqual(expectCode("run-root.replaced"));
+    expect(swapped).toBe(true);
+    await expect(lstat(join(low, "run"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   test("rechecks the approved outside chain immediately before exclusive creation", async () => {
     const { base, project } = await fixture();
     const outside = join(base, "outside-late-swap");
@@ -606,6 +633,40 @@ test("cross-process create", async () => {
     expect((await lstat(replacementPath)).isFile()).toBe(true);
     expect((await lstat(`${replacementPath}.moved`)).isFile()).toBe(true);
   });
+
+  test.each(["replacement", "swap-and-restore"] as const)(
+    "never fsyncs a marker pathname %s injected immediately before marker sync",
+    async (kind) => {
+      const { project } = await fixture();
+      let injected = false;
+      const synced: string[] = [];
+      await expect(createOwnedRunRoot(options(project, {
+        topic: `marker-sync-${kind}`,
+        onCheck: async (phase: string) => {
+          if (phase !== "before-marker-synced-marker-sync-verification" || injected) return;
+          injected = true;
+          const research = join(await realpath(project), "research");
+          const leaf = (await readdir(research)).find((entry) => entry.includes(`marker-sync-${kind}`));
+          if (!leaf) throw new Error("marker leaf absent");
+          const marker = join(research, leaf, ".pi-science-research-owner.json");
+          const bytes = await readFile(marker);
+          const original = `${marker}.original`;
+          await rename(marker, original);
+          await writeFile(marker, bytes);
+          if (kind === "swap-and-restore") {
+            await rename(marker, `${marker}.replacement`);
+            await rename(original, marker);
+          }
+        },
+        durability: async (handle: { sync(): Promise<void> }, step: string) => {
+          synced.push(step);
+          await handle.sync();
+        },
+      }))).rejects.toEqual(expectCode("run-root.replaced"));
+      expect(injected).toBe(true);
+      expect(synced).not.toContain("marker-synced");
+    },
+  );
 
   test("rejects in-place marker mutation after the marker was previously read", async () => {
     const { project } = await fixture();

@@ -258,10 +258,10 @@ async function createOwnedRunRootLocked(
   await assertNoSymlinkSegments(target);
   await assertForbiddenRoot(target, trustedProject, repositoryRoot, options);
   const approvalProof = await authorizeLocation(target, trustedProject, options);
-  await recheckApprovalProof(approvalProof, false);
+  await recheckApprovalProof(approvalProof);
   await assertPinnedDirectory(trustedProject, projectStat);
   await options.onCheck?.("before-create");
-  await recheckApprovalProof(approvalProof, options.onCheck !== undefined);
+  await recheckApprovalProof(approvalProof);
   await assertPinnedDirectory(trustedProject, projectStat);
   await assertNoSymlinkSegments(target);
 
@@ -275,7 +275,7 @@ async function createOwnedRunRootLocked(
   };
   const published = await prepareAndPublishLeaf(target, collision, markerSeed, ancestorPins, approvalProof, options);
   try {
-    await recheckApprovalProof(approvalProof, false);
+    await recheckApprovalProof(approvalProof);
     return registerOwnedRoot(
       published.path,
       options.runId,
@@ -382,18 +382,20 @@ async function assertContainedWriteInternal(
     const handleStat = await parentHandle.stat();
     if (!sameInode(handleStat, second.parentStat)) fail("run-root.replaced");
     let closed = false;
+    let closePromise: Promise<void> | undefined;
+    const parentFd = parentHandle.fd;
     const openFlags = constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | noFollow;
     return {
       relativePath: rel.split(sep).join("/"),
       existingParentPath: second.existingParentPath,
       remainingPath: second.remainingPath.split(sep).join("/"),
       rootFd: internal.rootHandle.fd,
-      parentFd: parentHandle.fd,
+      parentFd,
       openFlags,
       async openExclusive(mode = 0o600, openOptions: ContainedWriteOpenOptions = {}) {
         try {
           assertSimpleOptions(openOptions, new Set(["onCheck"]));
-          if (closed) fail("run-root.closed");
+          if (closed || closePromise) fail("run-root.closed");
           if (!Number.isInteger(mode) || mode < 0 || mode > 0o777) fail("run-root.invalid-options");
           await revalidateOwnedRunRoot(internal);
           const current = await inspectContainedPath(internal.path, rel);
@@ -427,8 +429,16 @@ async function assertContainedWriteInternal(
       },
       async close() {
         if (closed) return;
-        closed = true;
-        await parentHandle.close();
+        if (closePromise) return closePromise;
+        const attempt = closeFileHandleConfirmed(parentHandle, parentFd).then(() => {
+          closed = true;
+        });
+        closePromise = attempt;
+        try {
+          await attempt;
+        } finally {
+          if (closePromise === attempt) closePromise = undefined;
+        }
       },
     };
   } catch (error) {
@@ -674,13 +684,19 @@ interface PinnedAncestor {
   ctimeMs: string;
 }
 
-interface ApprovedPathNode extends PinnedAncestor {
+interface ApprovedPathNode {
+  path: string;
+  dev: string;
+  ino: string;
+  mode: string;
   type: "directory" | "file" | "other";
+  ctimeNs: string;
+  birthtimeNs: string | null;
 }
 
 interface LocationApprovalProof {
   target: string;
-  nodes: readonly ApprovedPathNode[];
+  nodes: ApprovedPathNode[];
 }
 
 interface PublishedLeaf {
@@ -769,7 +785,7 @@ async function prepareAndPublishLeaf(
     }
     await options.onCheck?.("after-leaf-candidate-check-before-mkdir");
     await recheckPinnedAncestors(ancestorPins);
-    await recheckApprovalProof(approvalProof, false);
+    await recheckApprovalProof(approvalProof);
     try {
       await mkdir(candidate, { mode: 0o700 });
       // This synchronous open+fstat is deliberately the first operation after
@@ -795,7 +811,7 @@ async function prepareAndPublishLeaf(
   let leafHandle: FileHandle | undefined;
   try {
     // The synchronous leaf pin must precede this first post-creation await.
-    await recheckApprovalProof(approvalProof, false);
+    approvalProof = await advanceApprovalProofAfterCreation(approvalProof, dirname(publishedPath));
     await options.onCheck?.("after-final-leaf-sync-pin-before-path-check");
     await assertExpectedDirectory(publishedPath, first);
     await options.onCheck?.("after-final-leaf-path-check-before-secondary-open");
@@ -849,15 +865,14 @@ async function prepareAndPublishLeaf(
       await recheckPinnedAncestors(ancestorPins);
       markerStat = await markerHandle.stat();
       if (!markerStat.isFile() || markerStat.nlink !== 1) fail("run-root.unsafe-link");
-      await durability(options, markerHandle, "marker-synced");
-      await assertExpectedDirectory(publishedPath, first);
-      const markerPathAfterSync = await safeLstat(canonicalMarkerPath);
-      const markerAfterSync = await markerHandle.stat();
-      if (
-        markerPathAfterSync.isSymbolicLink() || markerPathAfterSync.nlink !== 1 ||
-        !sameStableFileObservation(markerPathAfterSync, markerStat) ||
-        !sameStableFileObservation(markerAfterSync, markerStat)
-      ) fail("run-root.replaced");
+      await verifiedMarkerDurability(
+        options,
+        markerHandle,
+        canonicalMarkerPath,
+        markerStat,
+        publishedPath,
+        first,
+      );
       await recheckPinnedAncestors(ancestorPins);
     } finally {
       await markerHandle.close().catch(() => undefined);
@@ -885,7 +900,9 @@ async function prepareAndPublishLeaf(
     } finally {
       await parentHandle.close().catch(() => undefined);
     }
+    approvalProof = await advanceApprovalProofAfterCreation(approvalProof, parent);
     await options.onCheck?.("after-leaf-parent-synced-before-return");
+    await recheckApprovalProof(approvalProof);
     await recheckPinnedAncestors(ancestorPins);
     await leafHandle.close();
     leafHandle = undefined;
@@ -1006,8 +1023,9 @@ async function authorizeLocation(
   trustedProject: string,
   options: CreateOwnedRunRootOptions,
 ): Promise<LocationApprovalProof> {
-  const proof = await observeApprovalChain(target);
-  if (isStrictDescendantOrEqual(trustedProject, target)) return proof;
+  if (isStrictDescendantOrEqual(trustedProject, target)) {
+    return { target, nodes: [] };
+  }
 
   const allowlist = options.approvedOutsideRoots ?? [];
   for (const entry of allowlist) {
@@ -1015,25 +1033,26 @@ async function authorizeLocation(
     const canonical = await canonicalExistingDirectory(entry);
     await assertIntrinsicUnsafeRoot(canonical);
     if (isStrictDescendantOrEqual(canonical, target)) {
-      await recheckApprovalProof(proof, false);
+      const proof = await observeApprovalChain(target, canonical);
+      await recheckApprovalProof(proof);
       return proof;
     }
   }
   if (!options.approveOutside) fail("run-root.outside-denied");
+  const approvalAnchor = await nearestExistingDirectoryPath(target);
+  const proof = await observeApprovalChain(target, approvalAnchor);
   const approved = await options.approveOutside(target);
   if (approved !== true) fail("run-root.outside-denied");
-  await recheckApprovalProof(proof, true);
+  await recheckApprovalProof(proof);
   return proof;
 }
 
-async function observeApprovalChain(target: string): Promise<LocationApprovalProof> {
+async function observeApprovalChain(target: string, approvalAnchor: string): Promise<LocationApprovalProof> {
   const canonicalTarget = await canonicalCandidate(target);
-  if (canonicalTarget !== target) fail("run-root.replaced");
-  const absolute = resolve(target);
-  const root = parsePath(absolute).root;
-  const paths = [root];
-  let current = root;
-  for (const segment of absolute.slice(root.length).split(sep).filter(Boolean)) {
+  if (canonicalTarget !== target || !isStrictDescendantOrEqual(approvalAnchor, target)) fail("run-root.replaced");
+  const paths = [approvalAnchor];
+  let current = approvalAnchor;
+  for (const segment of relative(approvalAnchor, target).split(sep).filter(Boolean)) {
     current = join(current, segment);
     paths.push(current);
   }
@@ -1041,42 +1060,62 @@ async function observeApprovalChain(target: string): Promise<LocationApprovalPro
 
   const nodes: ApprovedPathNode[] = [];
   for (const path of paths) {
-    let info: Awaited<ReturnType<typeof lstat>>;
+    let node: ApprovedPathNode;
     try {
-      info = await lstat(path);
+      node = await observeApprovedPathNode(path);
     } catch (error) {
       if (isNodeError(error, "ENOENT")) break;
       throw wrap(error);
     }
-    if (info.isSymbolicLink()) fail("run-root.symlink");
-    const type = info.isDirectory() ? "directory" : info.isFile() ? "file" : "other";
-    nodes.push({
-      path,
-      dev: Number(info.dev),
-      ino: Number(info.ino),
-      ctimeMs: String(info.ctimeMs),
-      type,
-    });
-    if (type !== "directory") break;
+    nodes.push(node);
+    if (node.type !== "directory") break;
   }
   return { target, nodes };
 }
 
-async function recheckApprovalProof(proof: LocationApprovalProof, requireStableCtime: boolean): Promise<void> {
-  for (let index = 0; index < proof.nodes.length; index += 1) {
-    const expected = proof.nodes[index]!;
-    const info = await safeLstat(expected.path);
-    const type = info.isDirectory() ? "directory" : info.isFile() ? "file" : "other";
-    if (
-      info.isSymbolicLink() || Number(info.dev) !== expected.dev || Number(info.ino) !== expected.ino ||
-      type !== expected.type ||
-      (requireStableCtime && index === proof.nodes.length - 1 && String(info.ctimeMs) !== expected.ctimeMs)
-    ) fail("run-root.replaced");
+async function observeApprovedPathNode(path: string): Promise<ApprovedPathNode> {
+  const info = await lstat(path, { bigint: true });
+  if (info.isSymbolicLink()) fail("run-root.symlink");
+  return {
+    path,
+    dev: String(info.dev),
+    ino: String(info.ino),
+    mode: String(info.mode),
+    type: info.isDirectory() ? "directory" : info.isFile() ? "file" : "other",
+    ctimeNs: String(info.ctimeNs),
+    birthtimeNs: info.birthtimeNs > 0n ? String(info.birthtimeNs) : null,
+  };
+}
+
+function sameApprovedNode(expected: ApprovedPathNode, observed: ApprovedPathNode): boolean {
+  return expected.path === observed.path && expected.dev === observed.dev && expected.ino === observed.ino &&
+    expected.mode === observed.mode && expected.type === observed.type && expected.ctimeNs === observed.ctimeNs &&
+    expected.birthtimeNs === observed.birthtimeNs;
+}
+
+async function recheckApprovalProof(proof: LocationApprovalProof): Promise<void> {
+  if (proof.nodes.length > MAX_PATH_BYTES + 1) fail("run-root.path-too-long");
+  for (const expected of proof.nodes) {
+    const observed = await observeApprovedPathNode(expected.path).catch((error: unknown) => { throw wrap(error); });
+    if (!sameApprovedNode(expected, observed)) fail("run-root.replaced");
   }
-  if (requireStableCtime) {
-    const current = await observeApprovalChain(proof.target);
-    if (current.nodes.length !== proof.nodes.length) fail("run-root.replaced");
+}
+
+async function advanceApprovalProofAfterCreation(
+  proof: LocationApprovalProof,
+  changedParent: string,
+): Promise<LocationApprovalProof> {
+  const nodes: ApprovedPathNode[] = [];
+  for (const expected of proof.nodes) {
+    const observed = await observeApprovedPathNode(expected.path).catch((error: unknown) => { throw wrap(error); });
+    const expectedWithoutCtime = { ...expected, ctimeNs: observed.ctimeNs };
+    if (expected.path !== changedParent ? !sameApprovedNode(expected, observed) : !sameApprovedNode(expectedWithoutCtime, observed)) {
+      fail("run-root.replaced");
+    }
+    nodes.push(observed);
   }
+  proof.nodes = nodes;
+  return proof;
 }
 
 async function assertForbiddenRoot(
@@ -1154,6 +1193,24 @@ async function inspectContainedPath(root: string, rel: string): Promise<{
     current = next;
   }
   fail("run-root.invalid-path");
+}
+
+async function nearestExistingDirectoryPath(path: string): Promise<string> {
+  let current = resolve(path);
+  for (;;) {
+    try {
+      const info = await lstat(current);
+      if (info.isSymbolicLink()) fail("run-root.symlink");
+      if (info.isDirectory()) return realpath(current);
+      current = dirname(current);
+    } catch (error) {
+      if (error instanceof RunRootError) throw error;
+      if (!isNodeError(error, "ENOENT")) throw wrap(error);
+      const parent = dirname(current);
+      if (parent === current) fail("run-root.invalid-path");
+      current = parent;
+    }
+  }
 }
 
 async function canonicalCandidate(input: string): Promise<string> {
@@ -1298,6 +1355,14 @@ function sanitizeTopicSlug(topic: string): string {
   return slug || "research";
 }
 
+async function closeFileHandleConfirmed(handle: FileHandle, originalFd: number): Promise<void> {
+  try {
+    await handle.close();
+  } catch (error) {
+    if (!descriptorIsConfirmedClosed(originalFd)) throw error;
+  }
+}
+
 function descriptorIsConfirmedClosed(fd: number): boolean {
   try {
     fstatSync(fd);
@@ -1395,6 +1460,53 @@ async function invokeCheck(
   } catch (error) {
     throw wrap(error);
   }
+}
+
+async function verifiedMarkerDurability(
+  options: CreateOwnedRunRootOptions,
+  handle: FileHandle,
+  markerPath: string,
+  expectedMarker: Awaited<ReturnType<FileHandle["stat"]>>,
+  rootPath: string,
+  expectedRoot: { dev: number | bigint; ino: number | bigint },
+): Promise<void> {
+  await assertVerifiedMarkerPair(handle, markerPath, expectedMarker, rootPath, expectedRoot);
+  await invokeCheck(options.onCheck, "before-marker-synced-marker-sync-verification");
+  await assertVerifiedMarkerPair(handle, markerPath, expectedMarker, rootPath, expectedRoot);
+  await durability(options, handle, "marker-synced");
+  await assertVerifiedMarkerPair(handle, markerPath, expectedMarker, rootPath, expectedRoot);
+}
+
+async function assertVerifiedMarkerPair(
+  handle: FileHandle,
+  markerPath: string,
+  expectedMarker: Awaited<ReturnType<FileHandle["stat"]>>,
+  rootPath: string,
+  expectedRoot: { dev: number | bigint; ino: number | bigint },
+): Promise<void> {
+  await assertExpectedDirectory(rootPath, expectedRoot);
+  const descriptorStat = await handle.stat();
+  const pathStat = await safeLstat(markerPath);
+  if (
+    !descriptorStat.isFile() || descriptorStat.nlink !== 1 ||
+    pathStat.isSymbolicLink() || !pathStat.isFile() || pathStat.nlink !== 1 ||
+    !sameStableFileObservation(descriptorStat, expectedMarker) ||
+    !sameStableFileObservation(pathStat, expectedMarker)
+  ) fail("run-root.replaced");
+  const reopened = await openReadNoFollow(markerPath);
+  try {
+    const reopenedStat = await reopened.stat();
+    if (!sameStableFileObservation(reopenedStat, expectedMarker) || reopenedStat.nlink !== 1) fail("run-root.replaced");
+  } finally {
+    await reopened.close().catch(() => undefined);
+  }
+  await assertExpectedDirectory(rootPath, expectedRoot);
+  const finalDescriptor = await handle.stat();
+  const finalPath = await safeLstat(markerPath);
+  if (
+    !sameStableFileObservation(finalDescriptor, expectedMarker) ||
+    !sameStableFileObservation(finalPath, expectedMarker)
+  ) fail("run-root.replaced");
 }
 
 async function verifiedDirectoryDurability(
