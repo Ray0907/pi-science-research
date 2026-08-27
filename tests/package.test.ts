@@ -107,6 +107,7 @@ describe("Pi package manifest", () => {
       "src/acquisition/providers/pubmed.ts",
       "src/acquisition/providers/pmc.ts",
       "src/acquisition/planner-internal.ts",
+      "src/acquisition/planner-scheduler-friend-internal.ts",
       "src/acquisition/scheduler-internal.ts",
       "src/scholarly/source-identity.ts",
       "src/evidence/lineage.ts",
