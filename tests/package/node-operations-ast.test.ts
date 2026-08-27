@@ -51,7 +51,39 @@ function insideVariableInitializer(node:ts.Node,name:string):boolean{
   for(let current:ts.Node|undefined=node.parent;current;current=current.parent){if(ts.isVariableDeclaration(current)&&ts.isIdentifier(current.name)&&current.name.text===name)return true;if(ts.isSourceFile(current))return false;}
   return false;
 }
-function staticStringValue(expression:ts.Expression):string|undefined{let current=expression;while(ts.isParenthesizedExpression(current)||ts.isAsExpression(current)||ts.isNonNullExpression(current))current=current.expression;if(ts.isStringLiteral(current)||ts.isNoSubstitutionTemplateLiteral(current))return current.text;if(ts.isBinaryExpression(current)&&current.operatorToken.kind===ts.SyntaxKind.PlusToken){const left=staticStringValue(current.left);const right=staticStringValue(current.right);return left===undefined||right===undefined?undefined:left+right;}return undefined;}
+const constantStringMaxBindings=4_096;const constantStringMaxDepth=32;const constantStringMaxNodes=64;const constantStringMaxLength=256;
+type ConstantStringResult={readonly kind:"value";readonly value:string}|{readonly kind:"unknown"}|{readonly kind:"unsafe"};
+const constantUnknown:ConstantStringResult=Object.freeze({kind:"unknown"});const constantUnsafe:ConstantStringResult=Object.freeze({kind:"unsafe"});
+function unwrapAuditExpression(expression:ts.Expression):ts.Expression{let current=expression;while(ts.isParenthesizedExpression(current)||ts.isAsExpression(current)||ts.isNonNullExpression(current))current=current.expression;return current;}
+function constructorTaintAuditErrors(file:ts.SourceFile):string[]{
+  type Binding={readonly declaration:ts.VariableDeclaration;readonly initializer:ts.Expression|null;readonly scope:ts.Node};
+  const errors:string[]=[];const bindings=new Map<string,Binding[]>();const assignments:Array<readonly [string,ts.Expression]>=[];let bindingCount=0;let assignmentCount=0;
+  const boundedUnwrap=(expression:ts.Expression):ts.Expression|null=>{let current=expression;for(let depth=0;depth<=constantStringMaxDepth;depth+=1){if(!ts.isParenthesizedExpression(current)&&!ts.isAsExpression(current)&&!ts.isNonNullExpression(current))return current;current=current.expression;}return null;};
+  const lexicalScope=(declaration:ts.Node):ts.Node=>{for(let current:ts.Node|undefined=declaration.parent;current;current=current.parent)if(ts.isBlock(current)||ts.isSourceFile(current)||ts.isCaseBlock(current)||ts.isForStatement(current)||ts.isForInStatement(current)||ts.isForOfStatement(current)||ts.isCatchClause(current)||ts.isFunctionLike(current))return current;return file;};
+  const collect=(node:ts.Node):void=>{
+    if(ts.isVariableDeclaration(node)&&ts.isIdentifier(node.name)){bindingCount+=1;const declarationList=node.parent;const isConst=ts.isVariableDeclarationList(declarationList)&&(declarationList.flags&ts.NodeFlags.Const)!==0;if(bindingCount<=constantStringMaxBindings){const records=bindings.get(node.name.text)??[];records.push({declaration:node,initializer:isConst&&node.initializer?node.initializer:null,scope:lexicalScope(node)});bindings.set(node.name.text,records);}if(node.initializer){assignmentCount+=1;if(assignmentCount<=constantStringMaxBindings)assignments.push([node.name.text,node.initializer]);}}
+    if(ts.isBinaryExpression(node)&&node.operatorToken.kind===ts.SyntaxKind.EqualsToken){const left=boundedUnwrap(node.left as ts.Expression);if(left===null)errors.push("constructor taint bound");else if(ts.isIdentifier(left)){assignmentCount+=1;if(assignmentCount<=constantStringMaxBindings)assignments.push([left.text,node.right]);}}
+    ts.forEachChild(node,collect);
+  };collect(file);
+  const bindingFor=(identifier:ts.Identifier):Binding|ConstantStringResult=>{const candidates=(bindings.get(identifier.text)??[]).filter((binding)=>binding.scope.pos<=identifier.pos&&identifier.end<=binding.scope.end);if(candidates.length===0)return constantUnknown;let span=Number.POSITIVE_INFINITY;for(const candidate of candidates)span=Math.min(span,candidate.scope.end-candidate.scope.pos);const nearest=candidates.filter((candidate)=>candidate.scope.end-candidate.scope.pos===span);return nearest.length===1?nearest[0]!:constantUnsafe;};
+  const evaluate=(expression:ts.Expression,stack:Set<ts.VariableDeclaration>,depth:number,budget:{nodes:number}):ConstantStringResult=>{
+    budget.nodes+=1;if(depth>constantStringMaxDepth||budget.nodes>constantStringMaxNodes)return constantUnsafe;const current=expression;if(ts.isParenthesizedExpression(current)||ts.isAsExpression(current)||ts.isNonNullExpression(current))return evaluate(current.expression,stack,depth+1,budget);
+    if(ts.isStringLiteral(current)||ts.isNoSubstitutionTemplateLiteral(current))return current.text.length<=constantStringMaxLength?{kind:"value",value:current.text}:constantUnsafe;
+    if(ts.isIdentifier(current)){const binding=bindingFor(current);if("kind" in binding)return binding;if(binding.initializer===null)return constantUnknown;if(stack.has(binding.declaration))return constantUnsafe;stack.add(binding.declaration);const result=evaluate(binding.initializer,stack,depth+1,budget);stack.delete(binding.declaration);return result;}
+    if(ts.isBinaryExpression(current)&&current.operatorToken.kind===ts.SyntaxKind.PlusToken){const left=evaluate(current.left,stack,depth+1,budget);if(left.kind!=="value")return left;const right=evaluate(current.right,stack,depth+1,budget);if(right.kind!=="value")return right;const value=left.value+right.value;return value.length<=constantStringMaxLength?{kind:"value",value}:constantUnsafe;}
+    return constantUnknown;
+  };
+  const evaluateKey=(expression:ts.Expression):ConstantStringResult=>bindingCount>constantStringMaxBindings?constantUnsafe:evaluate(expression,new Set(),0,{nodes:0});
+  const constructorAccess=(expression:ts.Expression):boolean=>{const current=boundedUnwrap(expression);if(current===null){errors.push("constructor taint bound");return true;}if(ts.isPropertyAccessExpression(current))return current.name.text==="constructor";if(ts.isElementAccessExpression(current)&&current.argumentExpression){const key=evaluateKey(current.argumentExpression);return key.kind==="value"&&key.value==="constructor";}return false;};
+  const tainted=new Set<string>();if(assignmentCount>constantStringMaxBindings)errors.push("constructor taint bound");else for(let pass=0;pass<=assignments.length;pass+=1){let changed=false;for(const [name,expression] of assignments){const current=boundedUnwrap(expression);if(current===null){errors.push("constructor taint bound");continue;}if((constructorAccess(current)||ts.isIdentifier(current)&&tainted.has(current.text))&&!tainted.has(name)){tainted.add(name);changed=true;}}if(!changed)break;if(pass===assignments.length)errors.push("constructor taint bound");}
+  const inspect=(node:ts.Node):void=>{
+    if(ts.isElementAccessExpression(node)&&node.argumentExpression){const key=evaluateKey(node.argumentExpression);if(key.kind==="unsafe")errors.push("constructor key resolution");else if(key.kind==="value"&&key.value==="constructor")errors.push("constructor access");}
+    if(ts.isPropertyAccessExpression(node)&&node.name.text==="constructor")errors.push("constructor access");
+    if(ts.isCallExpression(node)||ts.isNewExpression(node)){const target=boundedUnwrap(node.expression);if(target===null)errors.push("constructor taint bound");else if(ts.isIdentifier(target)&&tainted.has(target.text))errors.push("constructor tainted use");}
+    if(ts.isPropertyAccessExpression(node)||ts.isElementAccessExpression(node)){const target=boundedUnwrap(node.expression);if(target===null)errors.push("constructor taint bound");else if(ts.isIdentifier(target)&&tainted.has(target.text))errors.push("constructor tainted use");}
+    ts.forEachChild(node,inspect);
+  };inspect(file);return errors;
+}
 function isPropertyName(node:ts.Identifier):boolean{const parent=node.parent;return(ts.isPropertyAccessExpression(parent)&&parent.name===node)||(ts.isPropertyAssignment(parent)&&parent.name===node)||(ts.isPropertyDeclaration(parent)&&parent.name===node)||(ts.isPropertySignature(parent)&&parent.name===node)||(ts.isMethodDeclaration(parent)&&parent.name===node)||(ts.isMethodSignature(parent)&&parent.name===node)||(ts.isBindingElement(parent)&&parent.propertyName===node);}
 function isExactTestGlobalUrl(node:ts.Identifier):boolean{const access=node.parent;return node.text==="globalThis"&&ts.isPropertyAccessExpression(access)&&!access.questionDotToken&&access.expression===node&&access.name.text==="URL"&&ts.isNewExpression(access.parent)&&access.parent.expression===access;}
 function isObjectCall(call:ts.CallExpression,name:string):boolean{
@@ -88,7 +120,7 @@ function auditAdapterWireShape(source:string):string[]{
 function auditAdapter(source:string):string[]{
   const file=ts.createSourceFile("adapter.ts",source,ts.ScriptTarget.Latest,true,ts.ScriptKind.TS);
   const trackedBindings=trackedNodeImports(file);
-  const errors:string[]=[];
+  const errors:string[]=constructorTaintAuditErrors(file);
   const imports=new Set<string>();const importCounts=new Map<string,number>();const importedMembers=new Map<string,Set<string>>();
   const dangerousAliases=new Set(["require","fetch","eval","Function"]);
   let strictHeaders=false;let exactCa=false;let caClone=false;let headerMapOverride=false;let sharedDestroy=false;let constructsResolver=false;
@@ -186,7 +218,7 @@ function auditAdapter(source:string):string[]{
       if(forbiddenMemberNames.has(node.name.text)&&root!==undefined&&!moduleBindings.has(root)&&root!=="Object")errors.push(`forbidden member ${node.name.text}`);
     }
     if(ts.isElementAccessExpression(node)){
-      const root=rootIdentifier(node.expression);const argument=node.argumentExpression;if(argument&&staticStringValue(argument)==="constructor")errors.push("constructor access");
+      const root=rootIdentifier(node.expression);const argument=node.argumentExpression;
       if(root&&moduleBindings.has(root))errors.push("computed module access");
       if(argument&&ts.isStringLiteral(argument)&&forbiddenMemberNames.has(argument.text))errors.push(`forbidden computed ${argument.text}`);
       if(!argument||!ts.isStringLiteral(argument)){
@@ -252,7 +284,7 @@ function auditAdapter(source:string):string[]{
 function isNetworkCapableSpecifier(specifier:string):boolean{const normalized=specifier.startsWith("node:")?specifier.slice(5):specifier;return["http","https","http2","net","tls","dgram","dns","child_process","worker_threads","vm","undici"].some((base)=>normalized===base||normalized.startsWith(`${base}/`))||isForbiddenPackage(normalized);}
 function exactUtilImport(node:ts.ImportDeclaration):boolean{return ts.isStringLiteral(node.moduleSpecifier)&&node.moduleSpecifier.text==="node:util"&&JSON.stringify(importedNames(node.importClause).sort())===JSON.stringify(["utilTypes"]);}
 function auditNonAdapterSource(source:string):string[]{
-  const file=ts.createSourceFile("non-adapter.ts",source,ts.ScriptTarget.Latest,true,ts.ScriptKind.TS);const errors:string[]=[];let utilImports=0;
+  const file=ts.createSourceFile("non-adapter.ts",source,ts.ScriptTarget.Latest,true,ts.ScriptKind.TS);const errors:string[]=constructorTaintAuditErrors(file);let utilImports=0;
   for(const statement of file.statements)if(ts.isImportDeclaration(statement)&&ts.isStringLiteral(statement.moduleSpecifier)&&statement.moduleSpecifier.text==="node:util"&&exactUtilImport(statement))utilImports+=1;
   if(utilImports>1)errors.push("duplicate util import");
   const visit=(node:ts.Node):void=>{
@@ -270,12 +302,12 @@ function auditNonAdapterSource(source:string):string[]{
     if(ts.isIdentifier(node)&&globalObjectIdentifiers.has(node.text)&&!isPropertyName(node))errors.push("production global object denied");
     if(ts.isIdentifier(node)&&(forbiddenExecutionIdentifiers.has(node.text)||node.text==="process"||node.text==="module")&&!isPropertyName(node))errors.push("production execution binding denied");
     if(ts.isPropertyAccessExpression(node)){if(node.name.text==="constructor")errors.push("constructor access");const root=rootIdentifier(node.expression);if((root==="globalThis"||root==="window"||root==="self")&&["fetch","WebSocket","EventSource","XMLHttpRequest"].includes(node.name.text))errors.push("production global denied");if(root==="navigator"&&node.name.text==="sendBeacon")errors.push("production beacon denied");}
-    if(ts.isElementAccessExpression(node)){const root=rootIdentifier(node.expression);if(node.argumentExpression&&staticStringValue(node.argumentExpression)==="constructor")errors.push("constructor access");if(root==="globalThis"||root==="window"||root==="self"){const argument=node.argumentExpression;if(!argument||!ts.isStringLiteral(argument)||["fetch","WebSocket","EventSource","XMLHttpRequest"].includes(argument.text))errors.push("production computed global denied");}}
+    if(ts.isElementAccessExpression(node)){const root=rootIdentifier(node.expression);if(root==="globalThis"||root==="window"||root==="self"){const argument=node.argumentExpression;if(!argument||!ts.isStringLiteral(argument)||["fetch","WebSocket","EventSource","XMLHttpRequest"].includes(argument.text))errors.push("production computed global denied");}}
     ts.forEachChild(node,visit);
   };visit(file);return errors;
 }
 function auditTestNetworkSource(source:string):string[]{
-  const file=ts.createSourceFile("unit.ts",source,ts.ScriptTarget.Latest,true,ts.ScriptKind.TS);const errors:string[]=[];
+  const file=ts.createSourceFile("unit.ts",source,ts.ScriptTarget.Latest,true,ts.ScriptKind.TS);const errors:string[]=constructorTaintAuditErrors(file);
   const visit=(node:ts.Node):void=>{
     if(ts.isBindingElement(node)){const key=node.propertyName??node.name;if(ts.isIdentifier(key)&&key.text==="constructor")errors.push("constructor access");}
     if((ts.isImportDeclaration(node)||ts.isExportDeclaration(node))&&node.moduleSpecifier&&ts.isStringLiteral(node.moduleSpecifier)&&isNetworkCapableSpecifier(node.moduleSpecifier.text))errors.push("test network import denied");
@@ -284,7 +316,7 @@ function auditTestNetworkSource(source:string):string[]{
     if(ts.isIdentifier(node)&&globalObjectIdentifiers.has(node.text)&&!isPropertyName(node)&&!isExactTestGlobalUrl(node))errors.push("test global object denied");
     if(ts.isIdentifier(node)&&forbiddenExecutionIdentifiers.has(node.text)&&!isPropertyName(node))errors.push("test network execution denied");
     if(ts.isPropertyAccessExpression(node)){if(node.name.text==="constructor")errors.push("constructor access");const root=rootIdentifier(node.expression);if((root==="globalThis"||root==="window"||root==="self")&&["fetch","WebSocket","EventSource","XMLHttpRequest"].includes(node.name.text))errors.push("test network global denied");if(node.name.text==="createRequire"||node.name.text==="require")errors.push("test require denied");}
-    if(ts.isElementAccessExpression(node)){const root=rootIdentifier(node.expression);if(node.argumentExpression&&staticStringValue(node.argumentExpression)==="constructor")errors.push("constructor access");if(root==="globalThis"||root==="window"||root==="self")errors.push("test computed global denied");}
+    if(ts.isElementAccessExpression(node)){const root=rootIdentifier(node.expression);if(root==="globalThis"||root==="window"||root==="self")errors.push("test computed global denied");}
     ts.forEachChild(node,visit);
   };visit(file);return errors;
 }
@@ -387,6 +419,9 @@ describe("Node operations adapter audit",()=>{
       [`${base}\nconst ctor=({}).constructor.constructor;void ctor;`,"constructor access"],
       [`${base}\nconst ctor=value["constructor"];void ctor;`,"constructor access"],
       [`${base}\nconst ctor=value["con"+"structor"];void ctor;`,"constructor access"],
+      [`${base}\nconst key="constructor";const F=({})[key][key];F("return fetch('https://example.invalid')")();`,"constructor access"],
+      [`${base}\nconst first="con";const second=\`structor\`;const alias=(first+second) as string;const key=(alias)!;void value[key];`,"constructor access"],
+      [`${base}\nconst key=\`constructor\`;let F;F=({})[key];new F();`,"constructor access"],
       [`${base}\nconst {constructor:ctor}=value;void ctor;`,"constructor access"],
       [`${base}\nconst HiddenResolver=Resolver;void HiddenResolver;`,"module alias"],
       [`${base}\nconst hiddenTimer=nodeSetTimeout;void hiddenTimer;`,"function binding escape"],
@@ -421,14 +456,17 @@ describe("Node operations adapter audit",()=>{
     expect(auditAdapterWireShape(base.replace("headers:rawHeaders","headers:[[\"accept\",\"x\"],[\"host\",options.hostHeader]]"))).toContain("adapter raw headers");
     expect(auditAdapterWireShape(base.replace('Object.getOwnPropertyDescriptor(lookupOptions,"all")','undefined'))).toContain("adapter lookup all mode");
     expect(auditAdapter(`${base}\nconst constructor=1;class Safe{constructor(){}}const holder={self:1};void holder.self;void constructor;void Safe;`)).toEqual([]);
+    expect(auditAdapter(`${base}\nconst key=readKey();const descriptor=Object.getOwnPropertyDescriptor(value,key);void descriptor;void value[key];const safe="ordinary";void value[safe];`)).toEqual([]);
   });
 
   test("rejects default-denied production imports and network execution escapes outside the sole adapter",()=>{const cases=[
     'import fs from "node:fs";','import child from "node:child_process";','import workers from "node:worker_threads";','import vm from "node:vm";','import external from "node-fetch";','import cross from "cross-fetch";','import undiciClient from "undici";','import httpProxy from "http-proxy-agent";','import httpsProxy from "https-proxy-agent";','import socksProxy from "socks-proxy-agent";','import anything from "some-external-package";',
     'import net from "node:net";','import http2 from "node:http2";','import https from "https";','import dns from "dns";','import promises from "dns/promises";','import hidden from "node:https/subpath";',
     'const spec="node:net";void import(spec);','void import("./relative.js");','void import("http2");','const load=require;load("https");','module.require("dns");','module.createRequire(import.meta.url);','void globalThis.fetch("https://example.invalid");','import undici from "undici";',
-    'exec("x");','execFile("x");','spawn("x");','fork("x");','new Worker("x");','vm.runInNewContext("x");','eval("x");','Function("x")();','const ctor=Object.constructor;void ctor;','const ctor=({}).constructor.constructor;void ctor;','const ctor=value["constructor"];void ctor;','const {constructor:ctor}=value;void ctor;','const g=globalThis;void g;','let g;g=(globalThis);','const {fetch:renamed}=globalThis;void renamed;','function leak(){return globalThis;}','Reflect.get(globalThis,"fetch");','void window.location;','void self.location;','void global.process;','void navigator.userAgent;','new WebSocket("x");','new EventSource("x");','new XMLHttpRequest();','navigator.sendBeacon("x");','globalThis["WebSocket"]("x");','globalThis.EventSource.bind(null);','window["fetch"]("x");','self.EventSource.call(null,"x");',
-  ];for(const source of cases)expect(auditNonAdapterSource(source),source).not.toEqual([]);expect(auditNonAdapterSource('const constructor=1;class Safe{constructor(){}}const holder={self:1};void holder.self;void constructor;void Safe;')).toEqual([]);expect(auditNonAdapterSource('import {types as utilTypes} from "node:util";import value from "./local.js";void utilTypes.isProxy(value);')).toEqual([]);expect(auditNonAdapterSource('import {types as utilTypes} from "node:util";const proxyCheck=utilTypes.isProxy;void proxyCheck;')).not.toEqual([]);});
+    'exec("x");','execFile("x");','spawn("x");','fork("x");','new Worker("x");','vm.runInNewContext("x");','eval("x");','Function("x")();','const ctor=Object.constructor;void ctor;','const ctor=({}).constructor.constructor;void ctor;','const ctor=value["constructor"];void ctor;','const key="constructor";const F=({})[key][key];F("return fetch(\\"https://example.invalid\\")")();','const first="con";const second=`structor`;const alias=(first+second) as string;const key=(alias)!;void value[key];','const key=`constructor`;let F;F=({})[key];new F();','const {constructor:ctor}=value;void ctor;','const g=globalThis;void g;','let g;g=(globalThis);','const {fetch:renamed}=globalThis;void renamed;','function leak(){return globalThis;}','Reflect.get(globalThis,"fetch");','void window.location;','void self.location;','void global.process;','void navigator.userAgent;','new WebSocket("x");','new EventSource("x");','new XMLHttpRequest();','navigator.sendBeacon("x");','globalThis["WebSocket"]("x");','globalThis.EventSource.bind(null);','window["fetch"]("x");','self.EventSource.call(null,"x");',
+  ];for(const source of cases)expect(auditNonAdapterSource(source),source).not.toEqual([]);expect(auditNonAdapterSource('const constructor=1;class Safe{constructor(){}}const holder={self:1};void holder.self;void constructor;void Safe;')).toEqual([]);expect(auditNonAdapterSource('const key=readKey();const descriptor=Object.getOwnPropertyDescriptor(value,key);void descriptor;void value[key];const safe="ordinary";void value[safe];')).toEqual([]);expect(auditNonAdapterSource('import {types as utilTypes} from "node:util";import value from "./local.js";void utilTypes.isProxy(value);')).toEqual([]);expect(auditNonAdapterSource('import {types as utilTypes} from "node:util";const proxyCheck=utilTypes.isProxy;void proxyCheck;')).not.toEqual([]);});
+
+  test("bounds constant constructor-key propagation and taints aliases",()=>{const reviewer='const key="constructor";const F=({})[key][key];F("return fetch(\\"https://example.invalid\\")")();';const reviewerErrors=constructorTaintAuditErrors(ts.createSourceFile("reviewer.ts",reviewer,ts.ScriptTarget.Latest,true,ts.ScriptKind.TS));expect(reviewerErrors).toContain("constructor access");expect(reviewerErrors).toContain("constructor tainted use");const transitive='const key="constructor";let F;F=value[key];const G=(F as unknown)!;void G.safe;';expect(constructorTaintAuditErrors(ts.createSourceFile("transitive.ts",transitive,ts.ScriptTarget.Latest,true,ts.ScriptKind.TS))).toContain("constructor tainted use");const cyclic='const first=second;const second=first;void value[first];';expect(constructorTaintAuditErrors(ts.createSourceFile("cycle.ts",cyclic,ts.ScriptTarget.Latest,true,ts.ScriptKind.TS))).toContain("constructor key resolution");const chain=['const key0="constructor";',...Array.from({length:34},(_,index)=>`const key${index+1}=key${index};`),'void value[key34];'].join("");expect(constructorTaintAuditErrors(ts.createSourceFile("depth.ts",chain,ts.ScriptTarget.Latest,true,ts.ScriptKind.TS))).toContain("constructor key resolution");});
 
   test("recursively audits nested source extensions and rejects symlink entries",()=>{const temporary=fs.mkdtempSync(path.join(process.env.TMPDIR??"/tmp","pi-acquisition-audit-"));try{const nested=path.join(temporary,"nested","deeper");fs.mkdirSync(nested,{recursive:true});fs.writeFileSync(path.join(nested,"escape.mts"),'import net from "node:net";void globalThis.fetch;');const nestedFindings=auditProductionTree(temporary);expect(nestedFindings.some((finding)=>finding.includes("production import denied"))).toBe(true);expect(nestedFindings.some((finding)=>finding.includes("production global object denied"))).toBe(true);const outside=path.join(temporary,"outside.ts");fs.writeFileSync(outside,"export {};\n");fs.symlinkSync(outside,path.join(nested,"linked.ts"));expect(()=>auditProductionTree(temporary)).toThrow(/symlink/u);}finally{fs.rmSync(temporary,{recursive:true,force:true});}});
 
@@ -454,6 +492,9 @@ describe("Node operations adapter audit",()=>{
     for(const source of cases)expect(auditAcquisitionUnitSource(source)).not.toEqual([]);
     expect(auditAcquisitionUnitSource('const ctor=Object.constructor;void ctor;')).not.toEqual([]);
     expect(auditAcquisitionUnitSource('const ctor=value["constructor"];void ctor;')).not.toEqual([]);
+    expect(auditAcquisitionUnitSource('const key="constructor";const F=({})[key][key];F("return fetch(\\"https://example.invalid\\")")();')).not.toEqual([]);
+    expect(auditAcquisitionUnitSource('const first="con";const second=`structor`;const alias=(first+second) as string;const key=(alias)!;void value[key];')).not.toEqual([]);
+    expect(auditAcquisitionUnitSource('const key=`constructor`;let F;F=({})[key];new F();')).not.toEqual([]);
     expect(auditAcquisitionUnitSource('const {constructor:ctor}=value;void ctor;')).not.toEqual([]);
     expect(auditAcquisitionUnitSource('const g=globalThis;const h=(g);Reflect.get(g,"fetch");void h["WebSocket"];')).not.toEqual([]);
     expect(auditAcquisitionUnitSource('const URLCtor=globalThis.URL;void URLCtor;')).not.toEqual([]);
@@ -462,6 +503,7 @@ describe("Node operations adapter audit",()=>{
     expect(auditAcquisitionUnitSource('let g;g=globalThis;new g.WebSocket("x");')).not.toEqual([]);
     expect(auditAcquisitionUnitSource('Reflect.get(globalThis,"fetch");')).not.toEqual([]);
     expect(auditAcquisitionUnitSource('const holder={self:1};void holder.self;new globalThis.URL("https://example.invalid");')).toEqual([]);
+    expect(auditAcquisitionUnitSource('const key=readKey();const descriptor=Object.getOwnPropertyDescriptor(value,key);void descriptor;void value[key];const safe="ordinary";void value[safe];')).toEqual([]);
     expect(auditAcquisitionUnitSource('import fetcher from "node-fetch";void fetcher;')).not.toEqual([]);
     expect(auditAcquisitionUnitSource('new WebSocket("wss://example.invalid");')).not.toEqual([]);
     expect(auditAcquisitionUnitSource('import {describe} from "vitest";void describe;')).toEqual([]);
