@@ -37,7 +37,7 @@ async function asyncCode(action: () => Promise<unknown>): Promise<NetworkPolicyE
 }
 function resolverWith(value: readonly AcquisitionDnsAddress[] | Error) {
   const resolveAll = vi.fn(async (_hostname: string, _signal: AbortSignal) => {
-    if (value instanceof Error) throw value;
+    if (!Array.isArray(value)) throw value;
     return value;
   });
   const close = vi.fn();
@@ -137,10 +137,19 @@ describe("fixed-origin URL, IP, and DNS policy", () => {
   });
 
   test("counts raw duplicate A and AAAA answers before validation or deduplication", async () => {
-    const answers = Array.from({ length: 65 }, () => ({ address: "8.8.8.8", family: 4 as const }));
-    const fake = resolverWith(answers);
+    let addressReads = 0; let familyReads = 0;
+    const hostile = Object.defineProperties({}, {
+      address: { enumerable: true, get() { addressReads += 1; throw new Error("SECRET address getter"); } },
+      family: { enumerable: true, get() { familyReads += 1; throw new Error("SECRET family getter"); } },
+    });
+    const answers = [
+      ...Array.from({ length: 32 }, () => ({ address: "8.8.8.8", family: 4 as const })),
+      ...Array.from({ length: 32 }, () => ({ address: "2606:4700:4700::1111", family: 6 as const })),
+      hostile,
+    ];
+    const fake = resolverWith(answers as unknown as readonly AcquisitionDnsAddress[]);
     expect(await asyncCode(() => resolveAllSafeProviderAddressesInternal(validated(), { maxDnsAddresses: 64 }, fake.resolver))).toBe("network.dns-too-many-addresses");
-    expect(fake.resolveAll).toHaveBeenCalledOnce();
+    expect(fake.resolveAll).toHaveBeenCalledOnce(); expect({ addressReads, familyReads }).toEqual({ addressReads: 0, familyReads: 0 });
   });
 
   test("maps empty temporary SERVFAIL NXDOMAIN invalid family all-unsafe and mixed-unsafe answers exactly", async () => {
@@ -187,16 +196,31 @@ describe("fixed-origin URL, IP, and DNS policy", () => {
   });
 
   test("accepts undefined signal and validates genuine signal only when present while isolating fake resolver cancellation", async () => {
+    const nativeAborted = Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")!.get!;
     const seen: AbortSignal[] = [];
-    const fake = createAcquisitionDnsResolver({ resolveAll: async (_hostname, signal) => { seen.push(signal); if (signal.aborted) throw Object.assign(new Error("SECRET"), { code: "ABORT_ERR" }); return [{ address: "8.8.8.8", family: 4 }]; }, close: () => undefined });
+    const fake = createAcquisitionDnsResolver({ resolveAll: async (_hostname, signal) => { seen.push(signal); if (nativeAborted.call(signal)) throw Object.assign(new Error("SECRET"), { code: "ABORT_ERR" }); return [{ address: "8.8.8.8", family: 4 }]; }, close: () => undefined });
     await resolveAllSafeProviderAddressesInternal(validated(), undefined, fake);
     await resolveAllSafeProviderAddressesInternal(validated(), undefined, fake);
     expect(seen).toHaveLength(2); expect(seen[0]).not.toBe(seen[1]); expect(seen.every((signal) => signal instanceof AbortSignal)).toBe(true);
-    const aborted = new AbortController(); aborted.abort();
+
+    const aborted = new AbortController(); aborted.abort(new Error("SECRET abort reason"));
+    Object.defineProperties(aborted.signal, { aborted: { value: false }, throwIfAborted: { value: () => undefined } });
     expect(await asyncCode(() => resolveAllSafeProviderAddressesInternal(validated(), undefined, fake, aborted.signal))).toBe("network.cancelled");
+    expect(await asyncCode(() => resolveAllSafeProviderAddressesInternal(validated(), undefined, fake, Object.create(AbortSignal.prototype) as AbortSignal))).toBe("network.invalid-input");
     expect(await asyncCode(() => resolveAllSafeProviderAddressesInternal(validated(), undefined, fake, { aborted: false } as AbortSignal))).toBe("network.invalid-input");
     expect(utilTypes.isProxy(new Proxy(aborted.signal, {}))).toBe(true);
     expect(await asyncCode(() => resolveAllSafeProviderAddressesInternal(validated(), undefined, fake, new Proxy(aborted.signal, {})))).toBe("network.invalid-input");
+
+    const pending: Array<{ resolve:(value:readonly AcquisitionDnsAddress[])=>void;reject:(error:Error)=>void }> = [];
+    const isolated = createAcquisitionDnsResolver({ resolveAll: (_hostname, signal) => new Promise((resolve, reject) => { pending.push({ resolve, reject });signal.addEventListener("abort", () => reject(Object.assign(new Error("SECRET"), { code: "ABORT_ERR" })), { once: true }); }), close: () => undefined });
+    const firstController = new AbortController(); const siblingController = new AbortController();
+    const first = asyncCode(() => resolveAllSafeProviderAddressesInternal(validated(), undefined, isolated, firstController.signal));
+    const sibling = resolveAllSafeProviderAddressesInternal(validated(), undefined, isolated, siblingController.signal);
+    firstController.abort(new Error("SECRET first reason"));pending[1]!.resolve([{ address: "8.8.8.8", family: 4 }]);
+    expect(await first).toBe("network.cancelled");expect((await sibling).addresses).toEqual([{ address: "8.8.8.8", family: 4 }]);expect(siblingController.signal.aborted).toBe(false);
+
+    const known = [["ENODATA", "network.dns-empty"], ["EAI_NODATA", "network.dns-empty"], ["ENOTFOUND", "network.dns-nxdomain"], ["EAI_NONAME", "network.dns-nxdomain"], ["ETIMEOUT", "network.dns-temporary"], ["EAI_AGAIN", "network.dns-temporary"], ["SERVFAIL", "network.dns-temporary"], ["ESERVFAIL", "network.dns-temporary"], ["UNKNOWN", "network.dns-temporary"]] as const;
+    for (const [resolverCode, expected] of known) { const controller = new AbortController();const concurrent = createAcquisitionDnsResolver({ resolveAll: async () => { controller.abort(new Error("SECRET concurrent reason"));throw resolverError(resolverCode); }, close: () => undefined });expect(await asyncCode(() => resolveAllSafeProviderAddressesInternal(validated(), undefined, concurrent, controller.signal))).toBe(expected); }
   });
 
   test("rejects hostile closed options before URL or DNS access", async () => {
@@ -209,6 +233,22 @@ describe("fixed-origin URL, IP, and DNS policy", () => {
   });
 
   test("reports exact redacted NetworkPolicyError codes", async () => {
+    expect(code(() => validateFixedProviderUrl("crossref", "https://api.crossref.org/\ud800"))).toBe("network.invalid-input");
+    expect(await asyncCode(() => resolveAllSafeProviderAddressesInternal(validated(), undefined, resolverWith([{ address: "8.8.8.8\udfff", family: 4 }]).resolver))).toBe("network.dns-invalid-address");
+    expect(await asyncCode(() => resolveAllSafeProviderAddressesInternal(validated(), { ["\ud800"]: 1 } as never, resolverWith([]).resolver))).toBe("network.invalid-options");
+    let errorTraps = 0;const proxiedError = new Proxy(resolverError("ENOTFOUND"), { getPrototypeOf() { errorTraps += 1;throw new Error("SECRET trap"); }, getOwnPropertyDescriptor() { errorTraps += 1;throw new Error("SECRET trap"); }, get() { errorTraps += 1;throw new Error("SECRET trap"); } });
+    expect(await asyncCode(() => resolveAllSafeProviderAddressesInternal(validated(), undefined, resolverWith(proxiedError).resolver))).toBe("network.dns-temporary");expect(errorTraps).toBe(0);
+    let aggregateReads = 0;const hostileAggregate = new AggregateError([]);Object.defineProperty(hostileAggregate, "errors", { get() { aggregateReads += 1;throw new Error("SECRET aggregate getter"); } });
+    expect(await asyncCode(() => resolveAllSafeProviderAddressesInternal(validated(), undefined, resolverWith(hostileAggregate).resolver))).toBe("network.dns-temporary");expect(aggregateReads).toBe(0);
+    const forgedAggregate = Object.create(AggregateError.prototype);Object.defineProperty(forgedAggregate, "errors", { value: [resolverError("ENOTFOUND")], enumerable: false });
+    expect(await asyncCode(() => resolveAllSafeProviderAddressesInternal(validated(), undefined, resolverWith(forgedAggregate as Error).resolver))).toBe("network.dns-temporary");
+    let nestedReads = 0;const nestedAccessor = Object.defineProperty(new Error("SECRET"), "code", { get() { nestedReads += 1;throw new Error("SECRET nested code"); } });
+    expect(await asyncCode(() => resolveAllSafeProviderAddressesInternal(validated(), undefined, resolverWith(new AggregateError([resolverError("ENOTFOUND"), resolverError("ENODATA"), nestedAccessor])).resolver))).toBe("network.dns-temporary");expect(nestedReads).toBe(0);
+    const nativeAbort = new DOMException("SECRET abort detail", "AbortError");Object.defineProperty(nativeAbort, "name", { value: "NotAbort", configurable: true });
+    expect(await asyncCode(() => resolveAllSafeProviderAddressesInternal(validated(), undefined, resolverWith(nativeAbort).resolver))).toBe("network.cancelled");
+    const accessorCode = Object.defineProperty(new Error("SECRET"), "code", { get() { throw new Error("SECRET code getter"); } });
+    expect(await asyncCode(() => resolveAllSafeProviderAddressesInternal(validated(), undefined, resolverWith(accessorCode).resolver))).toBe("network.dns-temporary");
+
     const urls = ["network.scheme-forbidden", "network.origin-forbidden", "network.credentials-forbidden", "network.fragment-forbidden", "network.ip-literal-forbidden"] as const;
     const inputs = ["http://api.crossref.org", "https://evil.example", "https://SECRET@api.crossref.org", "https://api.crossref.org/#SECRET", "https://127.0.0.1"];
     for (let index = 0; index < urls.length; index += 1) expect(code(() => validateFixedProviderUrl("crossref", inputs[index]!))).toBe(urls[index]);
