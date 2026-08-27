@@ -90,9 +90,11 @@ function adaptNodeRequest(protocol:"http:"|"https:",options:NodeRequestOptionsIn
   let destroyed=false;
   let request!:http.ClientRequest;
   const destroyOnce=()=>{if(destroyed)return;destroyed=true;request.destroy();};
+  const rawHeaders:string[]=[];for(const {name,value} of options.headers)rawHeaders.push(name,value);rawHeaders.push("host",options.hostHeader);Object.freeze(rawHeaders);
+  const pinnedLookupAll=Object.freeze([Object.freeze({address:options.pinnedAddress,family:options.family})]);
   const requestOptions={
     agent:(realAgents.get(options.agent as object)??options.agent) as never,
-    headers:[...options.headers.map(({name,value})=>[name,value] as const),["Host",options.hostHeader] as const],
+    headers:rawHeaders,
     setHost:false,
     servername:options.servername,
     ca:options.ca,
@@ -100,9 +102,10 @@ function adaptNodeRequest(protocol:"http:"|"https:",options:NodeRequestOptionsIn
     maxHeaderSize:options.maxHeaderSize,
     insecureHTTPParser:options.insecureHTTPParser,
     joinDuplicateHeaders:options.joinDuplicateHeaders,
-    lookup:(_hostname:string,_opts:unknown,callback:(error:Error|null,address:string,family:number)=>void)=>{
-      if(lookupUsed){callback(new Error("Pinned lookup replayed"),"",options.family);return;}
-      lookupUsed=true;callback(null,options.pinnedAddress,options.family);
+    lookup:(_hostname:string,lookupOptions:unknown,callback:(error:Error|null,address?:string|readonly Readonly<{address:string;family:4|6}>[],family?:number)=>void)=>{
+      if(lookupUsed){callback(new Error("Pinned lookup replayed"));return;}
+      lookupUsed=true;const allDescriptor=lookupOptions!==null&&typeof lookupOptions==="object"?Object.getOwnPropertyDescriptor(lookupOptions,"all"):undefined;
+      if(allDescriptor&&"value" in allDescriptor&&allDescriptor.value===true)callback(null,pinnedLookupAll);else callback(null,options.pinnedAddress,options.family);
     },
     checkServerIdentity:options.checkServerIdentity,
   };
@@ -379,6 +382,8 @@ function openHop(ownerId:`hop-owner-v1-${string}`,target:PinnedProviderTargetInt
   try{startMonotonic=node.ops.clock.monotonicNow();startedAt=node.ops.clock.timestampNow();}catch{return transportFail("transport.invalid-capability");}
   const startEpochMs=exactTimestampEpoch(startedAt);
   if(startEpochMs===null)transportFail("transport.invalid-capability");
+  const connectDeadlineAt=startMonotonic+Math.min(request.connectTimeoutMs,remaining);
+  if(!Number.isFinite(connectDeadlineAt)||connectDeadlineAt>Number.MAX_SAFE_INTEGER)transportFail("transport.invalid-capability");
   let rawAgent:NodeRequestOwnedAgentInternal;
   try{rawAgent=node.ops.createRequestOwnedAgent("https:");}catch{return transportFail("transport.invalid-capability");}
   const agent=validateAgent(rawAgent,"https:",node);
@@ -388,7 +393,7 @@ function openHop(ownerId:`hop-owner-v1-${string}`,target:PinnedProviderTargetInt
   const state:HopState={
     gate:true,settled:false,request:null,agent,timer:null,deadline,
     deadlineListener:()=>{if(state.gate)settleHop(handle,state,cancelledSettlement(state));},
-    resolve:resolveCompletion,startedAt,startEpochMs,startMonotonic,lastSafeMonotonic:startMonotonic,connectDeadlineAt:startMonotonic+Math.min(request.connectTimeoutMs,remaining),
+    resolve:resolveCompletion,startedAt,startEpochMs,startMonotonic,lastSafeMonotonic:startMonotonic,connectDeadlineAt,
     peer:null,callbacks:upper,ops:node.ops,
   };
   const fail=(failureCode:NodePinnedHopFailureCodeInternal)=>{
@@ -453,13 +458,18 @@ function openHop(ownerId:`hop-owner-v1-${string}`,target:PinnedProviderTargetInt
   ADD_EVENT.call(deadline.signal,"abort",state.deadlineListener,{once:true});
   if(ABORTED_GETTER.call(deadline.signal))state.deadlineListener();
   if(!state.gate)return handle;
-  try{
-    state.timer=node.ops.clock.setTimer(()=>{
-      if(!state.gate)return;
-      try{deadline.throwIfExpired();}catch{settleHop(handle,state,cancelledSettlement(state));return;}
-      fail("hop.connect-timeout");
-    },Math.min(request.connectTimeoutMs,remaining));
-  }catch{fail("hop.protocol-failed");return handle;}
+  if(!callbackAllowed(state.peer===null))return handle;
+  if(state.peer===null){
+    let connectNow:number;try{connectNow=node.ops.clock.monotonicNow();state.lastSafeMonotonic=connectNow;}catch{fail("hop.protocol-failed");return handle;}
+    const connectRemaining=Math.ceil(state.connectDeadlineAt-connectNow);if(connectRemaining<=0){fail("hop.connect-timeout");return handle;}
+    try{
+      state.timer=node.ops.clock.setTimer(()=>{
+        if(!state.gate)return;
+        try{deadline.throwIfExpired();}catch{settleHop(handle,state,cancelledSettlement(state));return;}
+        fail("hop.connect-timeout");
+      },connectRemaining);
+    }catch{fail("hop.protocol-failed");return handle;}
+  }
   try{state.request.end();}catch{fail("hop.connect-failed");}
   return handle;
 }
