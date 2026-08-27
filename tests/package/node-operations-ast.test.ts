@@ -33,13 +33,41 @@ function rootIdentifier(expression:ts.Expression):string|undefined{
   while(ts.isParenthesizedExpression(current)||ts.isAsExpression(current)||ts.isNonNullExpression(current))current=current.expression;
   return ts.isIdentifier(current)?current.text:undefined;
 }
+function outerTransparent(node:ts.Node):ts.Node{
+  let current=node;
+  while((ts.isParenthesizedExpression(current.parent)||ts.isAsExpression(current.parent)||ts.isNonNullExpression(current.parent))&&current.parent.expression===current)current=current.parent;
+  return current;
+}
+function insideNamedFunction(node:ts.Node,name:string):boolean{
+  for(let current:ts.Node|undefined=node.parent;current;current=current.parent){if(ts.isFunctionDeclaration(current))return current.name?.text===name;if(ts.isSourceFile(current))return false;}
+  return false;
+}
+function insideVariableInitializer(node:ts.Node,name:string):boolean{
+  for(let current:ts.Node|undefined=node.parent;current;current=current.parent){if(ts.isVariableDeclaration(current)&&ts.isIdentifier(current.name)&&current.name.text===name)return true;if(ts.isSourceFile(current))return false;}
+  return false;
+}
+function isObjectCall(call:ts.CallExpression,name:string):boolean{
+  const expression=call.expression;return ts.isPropertyAccessExpression(expression)&&!expression.questionDotToken&&ts.isIdentifier(expression.expression)&&expression.expression.text==="Object"&&expression.name.text===name;
+}
+type TrackedNodeBinding={readonly module:string;readonly imported:string};
+function trackedNodeImports(file:ts.SourceFile):Map<string,TrackedNodeBinding>{
+  const output=new Map<string,TrackedNodeBinding>();
+  for(const statement of file.statements){
+    if(!ts.isImportDeclaration(statement)||!ts.isStringLiteral(statement.moduleSpecifier)||!allowedNodeImports.has(statement.moduleSpecifier.text))continue;
+    const clause=statement.importClause;if(clause?.name)output.set(clause.name.text,{module:statement.moduleSpecifier.text,imported:"default"});
+    const bindings=clause?.namedBindings;if(bindings&&ts.isNamedImports(bindings))for(const element of bindings.elements)output.set(element.name.text,{module:statement.moduleSpecifier.text,imported:element.propertyName?.text??element.name.text});
+    if(bindings&&ts.isNamespaceImport(bindings))output.set(bindings.name.text,{module:statement.moduleSpecifier.text,imported:"*"});
+  }
+  return output;
+}
 function auditAdapter(source:string):string[]{
   const file=ts.createSourceFile("adapter.ts",source,ts.ScriptTarget.Latest,true,ts.ScriptKind.TS);
+  const trackedBindings=trackedNodeImports(file);
   const errors:string[]=[];
   const imports=new Set<string>();const importCounts=new Map<string,number>();const importedMembers=new Map<string,Set<string>>();
   const dangerousAliases=new Set(["require","fetch","eval","Function"]);
   let strictHeaders=false;let exactCa=false;let caClone=false;let headerMapOverride=false;let sharedDestroy=false;let constructsResolver=false;
-  const realResolverMembers=new Set<string>();const productionFeatureKeys=new Set<string>();const productionIdentifiers=new Set<string>();
+  const realResolverMembers=new Set<string>();let realOperationsDeclarations=0;const adapterFunctionCounts=new Map<string,number>();const productionFeatureKeys=new Set<string>();const productionIdentifiers=new Set<string>();
   let productionUsesOwnDescriptors=false;let productionUsesPrototype=false;let unsupportedBranch=false;
   const visitProduction=(node:ts.Node):void=>{
     if(ts.isStringLiteral(node))productionFeatureKeys.add(node.text);
@@ -48,7 +76,46 @@ function auditAdapter(source:string):string[]{
     if(ts.isPropertyAccessExpression(node)&&ts.isIdentifier(node.expression)&&node.expression.text==="Object"&&node.name.text==="getPrototypeOf")productionUsesPrototype=true;
     ts.forEachChild(node,visitProduction);
   };
+  const auditTrackedNodeUse=(node:ts.Identifier,binding:TrackedNodeBinding):void=>{
+    const parent=node.parent;if(ts.isImportClause(parent)||ts.isImportSpecifier(parent)||ts.isNamespaceImport(parent))return;
+    if(ts.isQualifiedName(parent)&&parent.left===node){const allowedTypes:Record<string,readonly string[]>={"node:http":["Agent","ClientRequest","IncomingMessage"],"node:https":["Agent"],"node:tls":["PeerCertificate","TLSSocket"]};if(allowedTypes[binding.module]?.includes(parent.right.text))return;errors.push("node type context");return;}
+    const outer=outerTransparent(node);
+    if(binding.module==="node:dns/promises"&&binding.imported==="Resolver"){
+      if(ts.isNewExpression(outer.parent)&&outer.parent.expression===outer&&insideVariableInitializer(outer,"realNodeOperations"))return;
+      if(ts.isTypeOfExpression(outer.parent)&&insideNamedFunction(outer,"productionFeaturesAvailable"))return;
+      if(ts.isCallExpression(outer.parent)&&outer.parent.arguments[0]===outer&&isObjectCall(outer.parent,"getOwnPropertyDescriptor")&&ts.isStringLiteral(outer.parent.arguments[1])&&outer.parent.arguments[1].text==="prototype"&&insideNamedFunction(outer,"productionFeaturesAvailable"))return;
+      errors.push("node constructor context");return;
+    }
+    if(binding.module==="node:timers"){
+      if(ts.isCallExpression(outer.parent)&&outer.parent.expression===outer&&insideVariableInitializer(outer,"realNodeOperations"))return;
+      if((ts.isTypeOfExpression(outer.parent)||ts.isTypeQueryNode(outer.parent))&&insideNamedFunction(outer,"productionFeaturesAvailable"))return;
+      if(ts.isTypeQueryNode(outer.parent))return;
+      errors.push("node function context");return;
+    }
+    if(ts.isPropertyAccessExpression(parent)&&parent.expression===node){
+      if(parent.questionDotToken){errors.push("node member context");return;}
+      const member=parent.name.text;const memberOuter=outerTransparent(parent);
+      const directCall=ts.isCallExpression(memberOuter.parent)&&memberOuter.parent.expression===memberOuter;
+      const directNew=ts.isNewExpression(memberOuter.parent)&&memberOuter.parent.expression===memberOuter;
+      if((binding.module==="node:http"||binding.module==="node:https")&&member==="request"&&directCall&&insideNamedFunction(memberOuter,"adaptNodeRequest"))return;
+      if((binding.module==="node:http"||binding.module==="node:https")&&member==="Agent"&&directNew&&insideVariableInitializer(memberOuter,"realNodeOperations"))return;
+      if(binding.module==="node:tls"&&member==="checkServerIdentity"&&directCall&&insideVariableInitializer(memberOuter,"realNodeOperations"))return;
+      if(binding.module==="node:tls"&&member==="rootCertificates"&&ts.isReturnStatement(memberOuter.parent)&&insideNamedFunction(memberOuter,"readProductionBundledRoots"))return;
+      if(binding.module==="node:perf_hooks"&&member==="now"&&directCall&&insideVariableInitializer(memberOuter,"realNodeOperations"))return;
+      if(binding.module==="node:util"&&member==="types"){errors.push("node member context");return;}
+      if(binding.module==="node:util"&&member==="isProxy"&&directCall)return;
+      errors.push("node member context");return;
+    }
+    if(ts.isElementAccessExpression(parent)&&parent.expression===node){errors.push("node member context");return;}
+    if(insideNamedFunction(outer,"productionFeaturesAvailable")){
+      if(ts.isCallExpression(outer.parent)&&outer.parent.arguments[0]===outer&&isObjectCall(outer.parent,"getOwnPropertyDescriptor")&&ts.isStringLiteral(outer.parent.arguments[1])){const allowedFeatures:Record<string,readonly string[]>={"node:http":["Agent","request"],"node:https":["Agent","request"],"node:tls":["checkServerIdentity","rootCertificates"]};if(allowedFeatures[binding.module]?.includes(outer.parent.arguments[1].text))return;errors.push("node feature context");return;}
+      if(binding.module==="node:perf_hooks"&&ts.isCallExpression(outer.parent)&&outer.parent.arguments[0]===outer&&isObjectCall(outer.parent,"getPrototypeOf"))return;
+      if(binding.module==="node:perf_hooks"&&(ts.isTypeOfExpression(outer.parent)||ts.isBinaryExpression(outer.parent)))return;
+    }
+    errors.push("node binding context");
+  };
   const visit=(node:ts.Node):void=>{
+    if(ts.isIdentifier(node)){const tracked=trackedBindings.get(node.text);if(tracked)auditTrackedNodeUse(node,tracked);}
     if(ts.isImportDeclaration(node)&&ts.isStringLiteral(node.moduleSpecifier)){
       const specifier=node.moduleSpecifier.text;
       if(specifier.startsWith("node:")){
@@ -113,11 +180,11 @@ function auditAdapter(source:string):string[]{
       if(ts.isPropertyAccessExpression(node.expression)&&forbiddenMemberNames.has(node.expression.name.text))errors.push(`forbidden call ${node.expression.name.text}`);
       if(ts.isElementAccessExpression(node.expression)){const argument=node.expression.argumentExpression;if(argument&&ts.isStringLiteral(argument)&&forbiddenMemberNames.has(argument.text))errors.push(`forbidden call ${argument.text}`);}
     }
-    if(ts.isFunctionDeclaration(node)&&node.name?.text==="productionFeaturesAvailable"){visitProduction(node);}
+    if(ts.isFunctionDeclaration(node)&&node.name){if(["adaptNodeRequest","readProductionBundledRoots","productionFeaturesAvailable"].includes(node.name.text))adapterFunctionCounts.set(node.name.text,(adapterFunctionCounts.get(node.name.text)??0)+1);if(node.name.text==="productionFeaturesAvailable")visitProduction(node);}
     if(ts.isCallExpression(node)&&ts.isIdentifier(node.expression)&&node.expression.text==="productionFeaturesAvailable"){
       const parent=node.parent;if(ts.isPrefixUnaryExpression(parent)&&parent.operator===ts.SyntaxKind.ExclamationToken){let ancestor:ts.Node|undefined=parent.parent;while(ancestor&&!ts.isIfStatement(ancestor))ancestor=ancestor.parent;if(ancestor)unsupportedBranch=source.slice(ancestor.pos,ancestor.end).includes("transport.unsupported-runtime");}
     }
-    if(ts.isVariableDeclaration(node)&&ts.isIdentifier(node.name)&&node.name.text==="realNodeOperations"&&node.initializer){
+    if(ts.isVariableDeclaration(node)&&ts.isIdentifier(node.name)&&node.name.text==="realNodeOperations"&&node.initializer){realOperationsDeclarations+=1;
       const inspect=(child:ts.Node):void=>{if(ts.isNewExpression(child)&&ts.isIdentifier(child.expression)&&child.expression.text==="Resolver")constructsResolver=true;if(ts.isPropertyAccessExpression(child)&&ts.isIdentifier(child.expression)&&child.expression.text==="resolver")realResolverMembers.add(child.name.text);ts.forEachChild(child,inspect);};inspect(node.initializer);
     }
     if(ts.isReturnStatement(node)&&node.expression&&ts.isObjectLiteralExpression(node.expression)){
@@ -139,6 +206,7 @@ function auditAdapter(source:string):string[]{
   visit(file);
   for(const required of networkNodeImports){if(!imports.has(required))errors.push(`missing import ${required}`);if((importCounts.get(required)??0)!==1)errors.push(`import count ${required}`);}
   for(const [binding,expected] of exactImportedMembers){const actual=[...(importedMembers.get(binding)??new Set())].sort();if(JSON.stringify(actual)!==JSON.stringify([...expected].sort()))errors.push(`member use ${binding}`);}
+  if(realOperationsDeclarations!==1||["adaptNodeRequest","readProductionBundledRoots","productionFeaturesAvailable"].some((name)=>(adapterFunctionCounts.get(name)??0)!==1))errors.push("adapter declaration context");
   const requiredFeatureKeys=["prototype","resolve4","resolve6","cancel","Agent","request","checkServerIdentity","rootCertificates","now"];
   const requiredFeatureIdentifiers=["Resolver","http","https","tls","nodeSetTimeout","nodeClearTimeout","nodePerformance"];
   if(requiredFeatureKeys.some((key)=>!productionFeatureKeys.has(key))||requiredFeatureIdentifiers.some((key)=>!productionIdentifiers.has(key))||!productionUsesOwnDescriptors||!productionUsesPrototype||!unsupportedBranch)errors.push("production feature audit");
@@ -151,18 +219,55 @@ function auditAdapter(source:string):string[]{
   return errors;
 }
 
+const defaultFactoryRequiredArguments=new Map<string,readonly number[]>([
+  ["createNodeRuntimeCapabilitiesInternal",[0]],
+  ["createNodeDnsResolver",[0]],
+  ["createNodeRequestDeadlineSchedulerCapabilitiesInternal",[0]],
+  ["createPinnedHopRuntimeInternal",[1]],
+]);
+function hasExplicitNonDefaultArguments(call:ts.CallExpression,positions:readonly number[]):boolean{
+  return positions.every((position)=>{const argument=call.arguments[position];if(!argument||ts.isSpreadElement(argument))return false;let current:ts.Expression=argument;while(ts.isParenthesizedExpression(current)||ts.isAsExpression(current)||ts.isNonNullExpression(current))current=current.expression;return !(ts.isIdentifier(current)&&current.text==="undefined")&&!ts.isVoidExpression(current);});
+}
+function auditAcquisitionUnitSource(source:string,name="fixture.ts"):string[]{
+  const file=ts.createSourceFile(name,source,ts.ScriptTarget.Latest,true,ts.ScriptKind.TS);
+  const errors:string[]=[];const factoryBindings=new Map<string,readonly number[]>();const factoryNamespaces=new Set<string>();
+  for(const statement of file.statements){
+    if(!ts.isImportDeclaration(statement)||!ts.isStringLiteral(statement.moduleSpecifier))continue;
+    if(["node:http","node:https","node:dns","node:dns/promises","node:tls"].includes(statement.moduleSpecifier.text))errors.push(`${name}: network builtin import`);
+    const acquisitionModule=statement.moduleSpecifier.text.endsWith("/node-pinned-hop-internal.js")||statement.moduleSpecifier.text.endsWith("/request-deadline-internal.js");
+    if(acquisitionModule&&statement.importClause?.name)errors.push(`${name}: default acquisition import`);
+    const bindings=statement.importClause?.namedBindings;
+    if(bindings&&ts.isNamespaceImport(bindings)&&acquisitionModule){factoryNamespaces.add(bindings.name.text);continue;}
+    if(!bindings||!ts.isNamedImports(bindings))continue;
+    for(const element of bindings.elements){const imported=element.propertyName?.text??element.name.text;const required=defaultFactoryRequiredArguments.get(imported);if(required!==undefined)factoryBindings.set(element.name.text,required);if(imported==="realNodeOperations")errors.push(`${name}: real adapter reference`);}
+  }
+  const visit=(node:ts.Node):void=>{
+    if(ts.isIdentifier(node)&&factoryNamespaces.has(node.text)){
+      const parent=node.parent;
+      if(!ts.isNamespaceImport(parent)){
+        const outer=outerTransparent(node);
+        if(ts.isPropertyAccessExpression(outer.parent)&&outer.parent.expression===outer){const memberOuter=outerTransparent(outer.parent);const required=defaultFactoryRequiredArguments.get(outer.parent.name.text);if(required!==undefined&&ts.isCallExpression(memberOuter.parent)&&memberOuter.parent.expression===memberOuter){if(!hasExplicitNonDefaultArguments(memberOuter.parent,required))errors.push(`${name}: default runtime invocation`);}else errors.push(`${name}: factory namespace escape`);}
+        else errors.push(`${name}: factory namespace escape`);
+      }
+    }
+    if(ts.isIdentifier(node)){
+      const required=factoryBindings.get(node.text);
+      if(required!==undefined){
+        const parent=node.parent;
+        if(!ts.isImportSpecifier(parent)){
+          const outer=outerTransparent(node);
+          if(ts.isCallExpression(outer.parent)&&outer.parent.expression===outer){if(!hasExplicitNonDefaultArguments(outer.parent,required))errors.push(`${name}: default runtime invocation`);}
+          else errors.push(`${name}: factory binding escape`);
+        }
+      }
+    }
+    ts.forEachChild(node,visit);
+  };
+  visit(file);return errors;
+}
 function acquisitionUnitIsolationErrors():string[]{
   const errors:string[]=[];const directory=path.join(root,"tests/acquisition");
-  const defaultedFactories=new Map([["createNodeRuntimeCapabilitiesInternal",1],["createNodeDnsResolver",1],["createNodeRequestDeadlineSchedulerCapabilitiesInternal",1],["createPinnedHopRuntimeInternal",2]]);
-  for(const name of fs.readdirSync(directory).filter((file)=>file.endsWith(".ts"))){
-    const file=ts.createSourceFile(name,fs.readFileSync(path.join(directory,name),"utf8"),ts.ScriptTarget.Latest,true,ts.ScriptKind.TS);
-    const visit=(node:ts.Node):void=>{
-      if(ts.isImportDeclaration(node)&&ts.isStringLiteral(node.moduleSpecifier)&&["node:http","node:https","node:dns","node:dns/promises","node:tls"].includes(node.moduleSpecifier.text))errors.push(`${name}: network builtin import`);
-      if(ts.isIdentifier(node)&&node.text==="realNodeOperations")errors.push(`${name}: real adapter reference`);
-      if(ts.isCallExpression(node)&&ts.isIdentifier(node.expression)){const minimum=defaultedFactories.get(node.expression.text);if(minimum!==undefined&&node.arguments.length<minimum)errors.push(`${name}: default runtime invocation`);}
-      ts.forEachChild(node,visit);
-    };visit(file);
-  }
+  for(const name of fs.readdirSync(directory).filter((file)=>file.endsWith(".ts")))errors.push(...auditAcquisitionUnitSource(fs.readFileSync(path.join(directory,name),"utf8"),name));
   return errors;
 }
 
@@ -179,12 +284,22 @@ describe("Node operations adapter audit",()=>{
     const cases:Array<readonly[string,string]>=[
       [`${base}\nimport net from "node:net";`,"forbidden import node:net"],
       [`${base}\nimport hiddenHttp from "node:http";void hiddenHttp.request;`,"import binding node:http"],
+      [`${base}\nfunction adaptNodeRequest(){void https.request("https://example.invalid");}`,"adapter declaration context"],
+      [`${base}\nvoid https.request("https://example.invalid");`,"node member context"],
       [`${base}\nvoid https.globalAgent;`,"forbidden member https.globalAgent"],
       [`${base}\nvoid https["globalAgent"];`,"computed module access"],
       [`${base}\nvoid https["request"];`,"computed module access"],
       [`${base}\nvoid https?.request;`,"optional module access"],
       [`${base}\nconst hiddenHttps=https;void hiddenHttps.request;`,"module alias"],
       [`${base}\nconst hiddenRequest=https.request;void hiddenRequest;`,"member alias"],
+      [`${base}\nlet assigned;assigned=https.request;assigned("x");`,"node member context"],
+      [`${base}\nlet assigned;assigned=(https.request);assigned("x");`,"node member context"],
+      [`${base}\nconsume(https.request);`,"node member context"],
+      [`${base}\nhttps.request.call(null,"x");`,"node member context"],
+      [`${base}\nhttps.request.bind(null);`,"node member context"],
+      [`${base}\nhttps.request.apply(null,[]);`,"node member context"],
+      [`${base}\nfunction capture(){return https.request;}void capture;`,"node member context"],
+      [`${base}\nnew https.request.constructor();`,"node member context"],
       [`${base}\nconst HiddenResolver=Resolver;void HiddenResolver;`,"module alias"],
       [`${base}\nconst hiddenTimer=nodeSetTimeout;void hiddenTimer;`,"function binding escape"],
       [`${base}\nconst {globalAgent:renamed}=https;void renamed;`,"destructured alias"],
@@ -202,5 +317,28 @@ describe("Node operations adapter audit",()=>{
       [base.replace('Object.getOwnPropertyDescriptor(resolverBase as object,"cancel")','undefined'),"production feature audit"],
     ];
     for(const [source,error] of cases)expect(auditAdapter(source),error).toContain(error);
+  });
+
+  test("rejects aliases captures nested calls and implicit defaults for imported unit-test factories",()=>{
+    const modulePath='../../src/acquisition/node-pinned-hop-internal.js';
+    const cases=[
+      `import {createNodeRuntimeCapabilitiesInternal} from "${modulePath}";const make=createNodeRuntimeCapabilitiesInternal;make();`,
+      `import {createNodeRuntimeCapabilitiesInternal} from "${modulePath}";const make=(createNodeRuntimeCapabilitiesInternal);make();`,
+      `import {createNodeRuntimeCapabilitiesInternal} from "${modulePath}";let make;make=createNodeRuntimeCapabilitiesInternal;make();`,
+      `import {createNodeRuntimeCapabilitiesInternal} from "${modulePath}";createNodeRuntimeCapabilitiesInternal.call(null,{});`,
+      `import {createNodeRuntimeCapabilitiesInternal} from "${modulePath}";createNodeRuntimeCapabilitiesInternal.bind(null);`,
+      `import {createNodeRuntimeCapabilitiesInternal} from "${modulePath}";createNodeRuntimeCapabilitiesInternal.apply(null,[{}]);`,
+      `import {createNodeRuntimeCapabilitiesInternal} from "${modulePath}";consume(createNodeRuntimeCapabilitiesInternal);`,
+      `import {createNodeRuntimeCapabilitiesInternal} from "${modulePath}";new createNodeRuntimeCapabilitiesInternal.constructor();`,
+      `import {createNodeRuntimeCapabilitiesInternal} from "${modulePath}";createNodeRuntimeCapabilitiesInternal();`,
+      `import {createNodeRuntimeCapabilitiesInternal} from "${modulePath}";createNodeRuntimeCapabilitiesInternal(undefined);`,
+      `import {createNodeRuntimeCapabilitiesInternal} from "${modulePath}";createNodeRuntimeCapabilitiesInternal(...[]);`,
+      `import {createPinnedHopRuntimeInternal as makePinned} from "${modulePath}";makePinned(undefined);`,
+      `import {createPinnedHopRuntimeInternal as makePinned} from "${modulePath}";makePinned(undefined,undefined);`,
+      `import * as internals from "${modulePath}";internals.createNodeRuntimeCapabilitiesInternal();`,
+      `import * as internals from "${modulePath}";const make=internals.createNodeRuntimeCapabilitiesInternal;make({});`,
+    ];
+    for(const source of cases)expect(auditAcquisitionUnitSource(source)).not.toEqual([]);
+    expect(auditAcquisitionUnitSource(`import {createNodeRuntimeCapabilitiesInternal as make} from "${modulePath}";make(fakeOps);`)).toEqual([]);
   });
 });
