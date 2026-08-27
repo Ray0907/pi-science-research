@@ -1,6 +1,25 @@
 const RADIX = 256;
-const MAX_ITEMS_INTERNAL = 1_000_000;
-const MAX_TOTAL_KEY_CODE_UNITS_INTERNAL = 134_217_728;
+
+export type CodeUnitOrderErrorCodeInternal =
+  | "code-unit-order.invalid-bound"
+  | "code-unit-order.too-many-items"
+  | "code-unit-order.invalid-key"
+  | "code-unit-order.accounting-overflow";
+
+/** Package-internal closed failure for bounded radix ordering. */
+export class CodeUnitOrderErrorInternal extends Error {
+  readonly code: CodeUnitOrderErrorCodeInternal;
+  constructor(code: CodeUnitOrderErrorCodeInternal) {
+    super(`Code-unit ordering rejected (${code})`);
+    this.name = "CodeUnitOrderErrorInternal";
+    this.code = code;
+  }
+}
+
+export interface CodeUnitOrderBoundsInternal {
+  /** A ceiling already validated by the calling module before this utility allocates. */
+  readonly maxItems: number;
+}
 
 interface KeyedValue<T> {
   readonly key: string;
@@ -20,28 +39,29 @@ type Frame<T> =
 export function stableSortByCodeUnitKeyInternal<T>(
   values: readonly T[],
   keyForValue: (value: T) => string,
+  bounds: CodeUnitOrderBoundsInternal,
 ): T[] {
-  if (!Number.isSafeInteger(values.length) || values.length > MAX_ITEMS_INTERNAL) throw new RangeError("Code-unit ordering input exceeds internal bounds");
+  if (!Number.isSafeInteger(bounds.maxItems) || bounds.maxItems < 0) fail("code-unit-order.invalid-bound");
+  if (!Number.isSafeInteger(values.length) || values.length > bounds.maxItems) fail("code-unit-order.too-many-items");
   const keyed = new Array<KeyedValue<T>>(values.length);
   let totalKeyCodeUnits = 0;
   for (let index = 0; index < values.length; index += 1) {
     const value = values[index]!;
     const key = keyForValue(value);
-    if (typeof key !== "string") throw new TypeError("Code-unit ordering key must be a string");
+    if (typeof key !== "string") fail("code-unit-order.invalid-key");
     totalKeyCodeUnits += key.length;
-    if (!Number.isSafeInteger(totalKeyCodeUnits) || totalKeyCodeUnits > MAX_TOTAL_KEY_CODE_UNITS_INTERNAL)
-      throw new RangeError("Code-unit ordering keys exceed internal bounds");
+    if (!Number.isSafeInteger(totalKeyCodeUnits)) fail("code-unit-order.accounting-overflow");
     keyed[index] = { key, value };
   }
   if (keyed.length < 2) return keyed.map(({ value }) => value);
 
   const frameLimit = values.length * 2 + 1;
-  if (!Number.isSafeInteger(frameLimit)) throw new RangeError("Code-unit ordering work exceeds internal bounds");
+  if (!Number.isSafeInteger(frameLimit)) fail("code-unit-order.accounting-overflow");
   const stack: Frame<T>[] = [{ kind: "high", items: keyed, offset: 0 }];
   const output = new Array<T>(values.length);
   let outputIndex = 0;
   const push = (frame: Frame<T>): void => {
-    if (stack.length >= frameLimit) throw new RangeError("Code-unit ordering work exceeds internal bounds");
+    if (stack.length >= frameLimit) fail("code-unit-order.accounting-overflow");
     stack.push(frame);
   };
 
@@ -83,12 +103,14 @@ export function stableSortByCodeUnitKeyInternal<T>(
     }
     if (terminal !== undefined) push({ kind: "emit", items: terminal });
   }
-  if (outputIndex !== output.length) throw new RangeError("Code-unit ordering work was incomplete");
+  if (outputIndex !== output.length) fail("code-unit-order.accounting-overflow");
   return output;
 }
 
 /** Fixed-width encoding for non-negative safe integers used in composite radix keys. */
 export function encodeNonNegativeSafeIntegerInternal(value: number): string {
-  if (!Number.isSafeInteger(value) || value < 0) throw new RangeError("Code-unit ordering integer is invalid");
+  if (!Number.isSafeInteger(value) || value < 0) fail("code-unit-order.invalid-key");
   return value.toString(10).padStart(16, "0");
 }
+
+function fail(code: CodeUnitOrderErrorCodeInternal): never { throw new CodeUnitOrderErrorInternal(code); }

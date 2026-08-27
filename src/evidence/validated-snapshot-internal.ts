@@ -14,7 +14,7 @@ import {
   type VerificationRecord,
 } from "../domain/research-records.js";
 import { parse } from "../domain/schema.js";
-import { encodeNonNegativeSafeIntegerInternal, stableSortByCodeUnitKeyInternal } from "../scholarly/code-unit-order-internal.js";
+import { CodeUnitOrderErrorInternal, encodeNonNegativeSafeIntegerInternal, stableSortByCodeUnitKeyInternal } from "../scholarly/code-unit-order-internal.js";
 import {
   buildLineageGraphFromValidatedSourcesForEvidenceSnapshotInternal,
   getLineageDependencyComponentCountInternal, LineageError, type LineageErrorCode, type LineageGraph,
@@ -57,6 +57,8 @@ export class EvidenceSnapshotBuildFailureInternal extends Error {
 
 export interface ValidatedSnapshotIndexes {
   readonly snapshotSha256: string;
+  readonly maxPerKind: Readonly<Record<SnapshotRecordKind, number>>;
+  readonly maxReferences: number;
   readonly optionsSha256: string;
   readonly policySha256: string;
   readonly requestProvenanceIndex: RequestProvenanceIndex;
@@ -169,7 +171,7 @@ export function buildBoundedValidatedEvidenceSnapshotInternal(
         };
         const canonicalBytes = measureCanonicalSet(preparedByKind, normalized.limits.maxCanonicalEvidenceSetBytes);
         const referenceCount = preflightReferences(preparedByKind, normalized.limits.maxReferences);
-        preflightLineageComponents(prepared.sources, normalized.limits.maxLineageComponents);
+        preflightLineageComponents(prepared.sources, normalized.limits.maxLineageComponents, normalized.limits.maxPerKind.sources);
         task4Preflight = Object.freeze({ claims, evidence, verifications, calculations, preparedByKind, canonicalBytes, referenceCount });
       },
     );
@@ -192,7 +194,7 @@ export function buildBoundedValidatedEvidenceSnapshotInternal(
   });
   const task2Records = validatedProvenanceRecordsForSnapshot(requestProvenanceIndex);
   bump(diagnostics, "canonicalRecordVisits", task2Records.sources.length + task2Records.requests.length);
-  auditSourceIdentities(task2Records.sources, diagnostics);
+  auditSourceIdentities(task2Records.sources, normalized.limits.maxPerKind.sources, diagnostics);
   for (const source of task2Records.sources) {
     try { validateSourceCanonicalUrlProvenanceFromSnapshotInternal(source, requestProvenanceIndex); }
     catch (error) { return translateSourceError(error); }
@@ -204,8 +206,8 @@ export function buildBoundedValidatedEvidenceSnapshotInternal(
   preparedByKind.requests = task2Records.requests.map((record, index) => Object.freeze({ record, json: task2Records.requestCanonicalJson[index]!, bytes: Buffer.byteLength(task2Records.requestCanonicalJson[index]!, "utf8") }));
   const canonicalBytes = completedPreflight.canonicalBytes;
   const preflightReferenceCount = completedPreflight.referenceCount;
-  claims = orderPrepared("claims", claims); evidence = orderPrepared("evidence", evidence);
-  verifications = orderPrepared("verifications", verifications); calculations = orderPrepared("calculations", calculations);
+  claims = orderPrepared("claims", claims, normalized.limits.maxPerKind.claims); evidence = orderPrepared("evidence", evidence, normalized.limits.maxPerKind.evidence);
+  verifications = orderPrepared("verifications", verifications, normalized.limits.maxPerKind.verifications); calculations = orderPrepared("calculations", calculations, normalized.limits.maxPerKind.calculations);
   preparedByKind.claims = claims; preparedByKind.evidence = evidence;
   preparedByKind.verifications = verifications; preparedByKind.calculations = calculations;
   const canonicalSetString = assembleCanonicalSet(preparedByKind);
@@ -317,7 +319,7 @@ function buildIndexes(
   let referenceCount = 0;
   for (const kind of Object.keys(records) as SnapshotRecordKind[]) for (const record of records[kind] as readonly any[]) {
     const key = keyForRecord(kind, record);
-    const refs = referencesFor(kind, record, latest);
+    const refs = referencesFor(kind, record, latest, options.limits.maxReferences);
     referenceCount = checkedAdd(referenceCount, refs.length, "evidence.too-many-references");
     if (referenceCount > options.limits.maxReferences) fail("evidence.too-many-references");
     for (const ref of refs) if (!exact.has(recordKey(ref))) fail("evidence.unresolved-ref");
@@ -338,13 +340,14 @@ function makePublicIndexes(
   const getOutgoingReferences = (key: SnapshotRecordKey) => built.outgoing.get(recordKey(validateKey(key))) ?? Object.freeze([]);
   const getCanonicalRecordString = (key: SnapshotRecordKey) => built.canonical.get(recordKey(validateKey(key)));
   return Object.freeze({
-    snapshotSha256, optionsSha256: options.optionsSha256, policySha256: options.policySha256,
+    snapshotSha256, maxPerKind: options.limits.maxPerKind, maxReferences: options.limits.maxReferences,
+    optionsSha256: options.optionsSha256, policySha256: options.policySha256,
     requestProvenanceIndex, lineageGraph, getExactRecord, getLatestRevision, getOutgoingReferences, getCanonicalRecordString,
   });
 }
 
-function orderPrepared<T>(kind: SnapshotRecordKind, values: readonly Prepared<T>[]): Prepared<T>[] {
-  return stableSortByCodeUnitKeyInternal(values, ({ record }) => `${stableId(kind, record)}\0${encodeNonNegativeSafeIntegerInternal((record as { revision?: number }).revision ?? 0)}`);
+function orderPrepared<T>(kind: SnapshotRecordKind, values: readonly Prepared<T>[], maxItems: number): Prepared<T>[] {
+  return orderSnapshotValues(values, ({ record }) => `${stableId(kind, record)}\0${encodeNonNegativeSafeIntegerInternal((record as { revision?: number }).revision ?? 0)}`, maxItems, "evidence.too-many-records");
 }
 function prepareEvidenceKind(
   inputs: readonly unknown[], expected: "claim" | "evidence" | "verification", maxBytes: number,
@@ -481,8 +484,8 @@ function preflightReferences(prepared: Record<SnapshotRecordKind, readonly Prepa
   for (const { record } of prepared.requests as readonly Prepared<RequestRecord>[]) add(record.resultSourceIds.length);
   return count;
 }
-function preflightLineageComponents(sources: readonly SourceRecord[], maximum: number): void {
-  const ids = stableSortByCodeUnitKeyInternal([...new Set(sources.map(({ sourceId }) => sourceId))], (value) => value);
+function preflightLineageComponents(sources: readonly SourceRecord[], maximum: number, maxSources: number): void {
+  const ids = orderSnapshotValues([...new Set(sources.map(({ sourceId }) => sourceId))], (value) => value, maxSources, "evidence.too-many-records");
   const indexById = new Map(ids.map((id, index) => [id, index] as const));
   const parent = ids.map((_, index) => index);
   const find = (value: number): number => { let root = value; while (parent[root] !== root) root = parent[root]!; while (parent[value] !== value) { const next = parent[value]!; parent[value] = root; value = next; } return root; };
@@ -525,8 +528,8 @@ function measureCanonicalSet(prepared: Record<SnapshotRecordKind, readonly Prepa
 function assembleCanonicalSet(prepared: Record<SnapshotRecordKind, readonly Prepared<unknown>[]>): string {
   return `{${KIND_ORDER.map((kind) => `${canonicalJson(kind)}:[${prepared[kind].map(({ json }) => json).join(",")}]`).join(",")}}`;
 }
-function auditSourceIdentities(sources: readonly SourceRecord[], diagnostics?: EvidenceSnapshotDiagnostics): void {
-  const sourceIds = stableSortByCodeUnitKeyInternal([...new Set(sources.map(({ sourceId }) => sourceId))], (value) => value);
+function auditSourceIdentities(sources: readonly SourceRecord[], maxSources: number, diagnostics?: EvidenceSnapshotDiagnostics): void {
+  const sourceIds = orderSnapshotValues([...new Set(sources.map(({ sourceId }) => sourceId))], (value) => value, maxSources, "evidence.too-many-records");
   const indexById = new Map(sourceIds.map((id, index) => [id, index] as const));
   const parent = sourceIds.map((_, index) => index);
   const find = (value: number): number => { let root = value; while (parent[root] !== root) root = parent[root]!; while (parent[value] !== value) { const next = parent[value]!; parent[value] = root; value = next; } return root; };
@@ -576,7 +579,7 @@ function validateClaimIdentity(records: ClaimRecord[]): void {
     || record.evidenceRule.primarySourceRequired !== base.evidenceRule.primarySourceRequired
     || record.evidenceRule.fullTextRequired !== base.evidenceRule.fullTextRequired) fail("evidence.invalid-prospective-record");
 }
-function referencesFor(kind: SnapshotRecordKind, record: any, latest: Map<string, number>): SnapshotRecordKey[] {
+function referencesFor(kind: SnapshotRecordKind, record: any, latest: Map<string, number>, maxReferences: number): SnapshotRecordKey[] {
   const refs: SnapshotRecordKey[] = [];
   const latestRef = (targetKind: "sources" | "claims" | "evidence" | "verifications", id: string) => ({ kind: targetKind, id, revision: latest.get(latestKey(targetKind, id)) ?? -1 });
   if (kind === "sources") { for (const id of record.lineage.relatedSourceIds) refs.push(latestRef("sources", id)); for (const id of record.retrievalRequestIds) refs.push({ kind: "requests", id, revision: null }); for (const step of record.metadataProvenance) refs.push({ kind: "requests", id: step.requestId, revision: null }); }
@@ -584,7 +587,7 @@ function referencesFor(kind: SnapshotRecordKind, record: any, latest: Map<string
   if (kind === "evidence") { refs.push({ kind: "claims", id: record.claimRef.claimId, revision: record.claimRef.revision }); if (record.sourceRef) refs.push({ kind: "sources", id: record.sourceRef.sourceId, revision: record.sourceRef.revision }); if (record.calculationId) refs.push({ kind: "calculations", id: record.calculationId, revision: null }); for (const id of record.conflictsWith) refs.push(latestRef("evidence", id)); }
   if (kind === "verifications") { for (const ref of record.checkedClaims) refs.push({ kind: "claims", id: ref.claimId, revision: ref.revision }); for (const ref of record.checkedEvidence) refs.push({ kind: "evidence", id: ref.evidenceId, revision: ref.revision }); for (const id of record.requestIds) refs.push({ kind: "requests", id, revision: null }); for (const id of record.calculationIds) refs.push({ kind: "calculations", id, revision: null }); for (const c of record.corrections) refs.push(latestRef("claims", c.claimId)); for (const id of record.independentEvidenceIds) refs.push(latestRef("evidence", id)); }
   if (kind === "requests") for (const id of record.resultSourceIds) refs.push(latestRef("sources", id));
-  return stableSortByCodeUnitKeyInternal(refs, snapshotRecordOrderKey).map((ref) => deepFreeze(ref));
+  return orderSnapshotValues(refs, snapshotRecordOrderKey, maxReferences, "evidence.too-many-references").map((ref) => deepFreeze(ref));
 }
 function validateSymmetricConflicts(records: CanonicalEvidenceSet, latest: Map<string, number>): void {
   const latestClaims = new Map(records.claims.filter((r) => latest.get(latestKey("claims", r.claimId)) === r.revision).map((r) => [r.claimId, r]));
@@ -666,4 +669,13 @@ function sumCounts(values: number[], code: any): number { let total = 0; for (co
 function checkedAdd(left: number, right: number, code: any): number { const result = left + right; if (!Number.isSafeInteger(result)) fail(code); return result; }
 function isPlain(value: unknown): value is Record<string, any> { return value !== null && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype; }
 function deepFreeze<T>(value: T): T { if (value && typeof value === "object" && !Object.isFrozen(value)) { for (const child of Object.values(value as any)) deepFreeze(child); Object.freeze(value); } return value; }
+function orderSnapshotValues<T>(values: readonly T[], key: (value: T) => string, maxItems: number, tooManyCode: "evidence.too-many-records" | "evidence.too-many-references"): T[] {
+  try { return stableSortByCodeUnitKeyInternal(values, key, { maxItems }); }
+  catch (error) {
+    if (!(error instanceof CodeUnitOrderErrorInternal)) throw error;
+    if (error.code === "code-unit-order.too-many-items") fail(tooManyCode);
+    if (error.code === "code-unit-order.accounting-overflow") fail("evidence.input-too-large");
+    fail("evidence.invalid-input");
+  }
+}
 function fail(code: any): never { throw new EvidenceAdmissionError(code); }

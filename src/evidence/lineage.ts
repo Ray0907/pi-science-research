@@ -4,7 +4,7 @@ import { canonicalJson } from "../crypto/canonical-json.js";
 import { ID_PATTERNS } from "../domain/ids.js";
 import { type SourceRecord } from "../domain/research-records.js";
 import { assertBoundedStructure } from "../storage/bounded-structure.js";
-import { stableSortByCodeUnitKeyInternal } from "../scholarly/code-unit-order-internal.js";
+import { CodeUnitOrderErrorInternal, stableSortByCodeUnitKeyInternal } from "../scholarly/code-unit-order-internal.js";
 import {
   SourceIdentityError,
   getValidatedSourceRecordsInternal,
@@ -292,7 +292,7 @@ function buildPreparedGraph(
   const nodeCount = checkedAdd(prepared.length, revisionsBySource.size, "lineage.too-many-sources");
   if (nodeCount > options.maxGraphNodes) fail("lineage.too-many-sources");
 
-  const sourceIds = stableSortByCodeUnitKeyInternal([...revisionsBySource.keys()], (value) => value);
+  const sourceIds = orderLineageValues([...revisionsBySource.keys()], (value) => value, options.maxStableSources);
   const ordered: PreparedSource[] = [];
   const latestBySource = new Map<string, PreparedSource>();
   for (const sourceId of sourceIds) {
@@ -318,9 +318,8 @@ function buildPreparedGraph(
     const { relatedSourceIds, relationTypes } = record.lineage;
     const latest = latestBySource.get(record.sourceId)!;
     const activeKeys = latestDuplicateKeys.get(record.sourceId) ?? new Set<string>();
-    for (let index = 0; index < relatedSourceIds.length; index += 1) {
-      const target = relatedSourceIds[index]!;
-      const relation = relationTypes[index]!;
+    const orderedEdges = orderLineageValues(relatedSourceIds.map((target, index) => ({ target, relation: relationTypes[index]! })), ({ target, relation }) => `${target}\0${relation}`, options.maxEdges, "lineage.too-many-edges");
+    for (const { target, relation } of orderedEdges) {
       if (target === record.sourceId) fail("lineage.self-edge");
       if (!revisionsBySource.has(target)) fail("lineage.unresolved-ref");
       const activeKey = `${relation}\0${target}`;
@@ -528,6 +527,15 @@ function checkedAdd(left: number, right: number, code: LineageErrorCode): number
 }
 function isPlain(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
+}
+function orderLineageValues<T>(values: readonly T[], key: (value: T) => string, maxItems: number, tooManyCode: "lineage.too-many-sources" | "lineage.too-many-edges" = "lineage.too-many-sources"): T[] {
+  try { return stableSortByCodeUnitKeyInternal(values, key, { maxItems }); }
+  catch (error) {
+    if (!(error instanceof CodeUnitOrderErrorInternal)) throw error;
+    if (error.code === "code-unit-order.too-many-items") fail(tooManyCode);
+    if (error.code === "code-unit-order.accounting-overflow") fail("lineage.input-too-large");
+    fail("lineage.invalid-input");
+  }
 }
 function fail(code: LineageErrorCode): never { throw new LineageError(code); }
 
