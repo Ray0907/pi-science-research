@@ -104,6 +104,8 @@ describe("Pi package manifest", () => {
       "extensions/research/index.ts",
       "src/index.ts",
       "src/scholarly/identifiers.ts",
+      "src/acquisition/providers/pubmed.ts",
+      "src/acquisition/providers/pmc.ts",
       "src/scholarly/source-identity.ts",
       "src/evidence/lineage.ts",
       "src/evidence/admission.ts",

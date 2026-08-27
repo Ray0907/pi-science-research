@@ -1,0 +1,1 @@
+{"source":"PMC","date":"20240101","key":"synthetic","infons":{"doi":"10.5555/pmc.9","pmid":"9"},"documents":[{"id":"PMC9","infons":{"pmcid":"PMC9"},"passages":[{"offset":0,"infons":{"section_type":"title"},"text":"Synthetic title"},{"offset":16,"infons":{"section_type":"results"},"text":"Literal untrusted result text."}]}]}
