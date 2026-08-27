@@ -23,13 +23,13 @@ import {
   createBlockedTraceSettlementInternal,
   createProviderPartitionKey,
   createProviderPartitionPlanOwnerInternal,
-  createProviderRequestPartitionFixtureInternal,
   lookupProviderRequestPartitionInternal,
   lookupProviderRequestPartitionOwnerInternal,
   normalizeAcquisitionOptions,
   registerProviderRequestPartitionInternal,
   validateAcademicAcquisitionResult,
   type AcademicAcquisitionResult,
+  type AcquisitionProvenanceHandle,
   type AcademicCandidate,
   type AcademicCandidateGroup,
   type AcquisitionTrace,
@@ -338,7 +338,7 @@ describe("immutable acquisition contracts", () => {
     expect(errorCode(() => lookupProviderRequestPartitionInternal(item))).toBe("acquisition-contract.invalid-capability");
   });
 
-  test("indexes identical production and fixture partitions atomically with live-owner semantics", () => {
+  test("ref-counts minimal bindings and preserves authentic outputs after owner close", () => {
     const preimage = partitionPreimage({ normalizedInput: { kind: "query", query: "indexed", limit: 1 }, requestedUrl: "https://api.crossref.org/works?query=indexed" });
     const snapshot = partitionSnapshot(preimage);
     const ownerA = createProviderPartitionPlanOwnerInternal({ planId: `plan-v1-${HASH_A}`, options: PARTITION_LIMITS });
@@ -349,27 +349,38 @@ describe("immutable acquisition contracts", () => {
     const indexedSettlement = settlement({ ...key, requestedUrl: preimage.requestedUrl, finalUrl: preimage.requestedUrl, redirectWitnesses: [] });
     const indexedProjected = acquisitionTraceSettlementInternalExported(indexedSettlement, PROJECTION_LIMITS);
     const indexedTraceInput = { provider: "crossref" as const, operation: "search" as const, endpointClass: "works-search", ...key, accessLevel: "metadata-only" as const, settlement: indexedProjected, warnings: [] };
-    expect(createAcquisitionTrace(indexedTraceInput).settlement.outcome).toBe("success");
+    const indexedTrace = createAcquisitionTrace(indexedTraceInput);
+    const validated = validateAcademicAcquisitionResult(result({ candidates: [], candidateGroups: [], traces: [indexedTrace] }));
     closeProviderPartitionPlanOwnerInternal(ownerA);
     expect(errorCode(() => lookupProviderRequestPartitionInternal(partitionA))).toBe("acquisition-contract.invalid-capability");
     expect(acquisitionTraceSettlementInternalExported(indexedSettlement, PROJECTION_LIMITS).outcome).toBe("success");
     closeProviderPartitionPlanOwnerInternal(ownerB);
     expect(errorCode(() => acquisitionTraceSettlementInternalExported(indexedSettlement, PROJECTION_LIMITS))).toBe("acquisition-contract.invalid-capability");
-    expect(errorCode(() => createAcquisitionTrace(indexedTraceInput))).toBe("acquisition-contract.invalid-capability");
+    expect(createAcquisitionTrace(indexedTraceInput).traceKey).toBe(indexedTrace.traceKey);
+    expect(validateAcademicAcquisitionResult(validated).traces[0]?.traceKey).toBe(indexedTrace.traceKey);
 
-    const fixturePreimage = partitionPreimage({ normalizedInput: { kind: "query", query: "fixture-index", limit: 1 }, requestedUrl: "https://api.crossref.org/works?query=fixture-index" });
-    const fixture = createProviderRequestPartitionFixtureInternal({ partition: partitionSnapshot(fixturePreimage), options: PARTITION_LIMITS });
-    const fixtureKey = createProviderPartitionKey(fixturePreimage);
-    const fixtureSettlement = settlement({ ...fixtureKey, requestedUrl: fixturePreimage.requestedUrl, finalUrl: fixturePreimage.requestedUrl, redirectWitnesses: [] });
-    expect(acquisitionTraceSettlementInternalExported(fixtureSettlement, PROJECTION_LIMITS).outcome).toBe("success");
-    closeProviderPartitionPlanOwnerInternal(lookupProviderRequestPartitionOwnerInternal(fixture));
-    expect(errorCode(() => acquisitionTraceSettlementInternalExported(fixtureSettlement, PROJECTION_LIMITS))).toBe("acquisition-contract.invalid-capability");
+    const ownerC = createProviderPartitionPlanOwnerInternal({ planId: `plan-v1-${"c".repeat(64)}`, options: PARTITION_LIMITS });
+    registerProviderRequestPartitionInternal(ownerC, snapshot);
+    expect(acquisitionTraceSettlementInternalExported(indexedSettlement, PROJECTION_LIMITS).outcome).toBe("success");
+    closeProviderPartitionPlanOwnerInternal(ownerC);
+
+    const blockedPreimage = partitionPreimage({ normalizedInput: { kind: "query", query: "blocked-index", limit: 1 }, requestedUrl: "https://api.crossref.org/works?query=blocked-index" });
+    const blockedOwner = createProviderPartitionPlanOwnerInternal({ planId: `plan-v1-${"d".repeat(64)}`, options: PARTITION_LIMITS });
+    registerProviderRequestPartitionInternal(blockedOwner, partitionSnapshot(blockedPreimage));
+    const blockedKey = createProviderPartitionKey(blockedPreimage);
+    const blockedSettlement = createBlockedTraceSettlementInternal({ requestedUrl: blockedPreimage.requestedUrl, retrievedAt: AT, limits: PROJECTION_LIMITS });
+    const blockedTraceInput = { provider: "crossref" as const, operation: "search" as const, endpointClass: "works-search", ...blockedKey, accessLevel: null, settlement: blockedSettlement, warnings: [] };
+    const blockedTrace = createAcquisitionTrace(blockedTraceInput);
+    closeProviderPartitionPlanOwnerInternal(blockedOwner);
+    expect(createAcquisitionTrace(blockedTraceInput).traceKey).toBe(blockedTrace.traceKey);
   });
 
   test("keeps timestamp out of trace key while every deterministic settlement fact changes it", () => {
-    const a = trace(); const b = trace({ settlement: { ...a.settlement, retrievedAt: AT } }); expect(a.traceKey).toBe(b.traceKey);
-    expect(trace({ accessLevel: "abstract-only" }).traceKey).not.toBe(a.traceKey);
-    expect(trace({ settlement: { ...a.settlement, decodedBytes: a.settlement.decodedBytes + 1 } }).traceKey).not.toBe(a.traceKey);
+    const key = createProviderPartitionKey(partitionPreimage()); registeredPartition();
+    const makeTrace = (transportOverrides: Partial<TransportSettlement>, accessLevel: "metadata-only" | "abstract-only" = "metadata-only") => createAcquisitionTrace({ provider: "crossref", operation: "search", endpointClass: "works-search", ...key, accessLevel, settlement: acquisitionTraceSettlementInternalExported(settlement(transportOverrides), PROJECTION_LIMITS), warnings: [] });
+    const a = makeTrace({}); const b = makeTrace({ settledAt: AT }); expect(a.traceKey).toBe(b.traceKey);
+    expect(makeTrace({}, "abstract-only").traceKey).not.toBe(a.traceKey);
+    expect(makeTrace({ payloadUtf8: "123", decodedBytes: 3 }).traceKey).not.toBe(a.traceKey);
   });
 
   test("keeps the exact two-argument projector API and validates payload bytes separately", () => {
@@ -387,6 +398,22 @@ describe("immutable acquisition contracts", () => {
     expect(errorCode(() => acquisitionTraceSettlementInternalExported(settlement(), { ...PROJECTION_LIMITS, maxDecodedBodyBytes: 8 } as never))).toBe("acquisition-contract.invalid-input");
   });
 
+  test("authenticates limits and binding fields before hostile nested settlement data", () => {
+    let touched = false;
+    const hostileNested = new Proxy({}, { ownKeys() { touched = true; throw new Error("untouched"); } });
+    const hostileSettlement = settlement({ responseHeaders: hostileNested as never });
+    expect(errorCode(() => acquisitionTraceSettlementInternalExported(hostileSettlement, { ...PROJECTION_LIMITS, excess: true } as never))).toBe("acquisition-contract.invalid-input");
+    expect(touched).toBe(false);
+    expect(errorCode(() => acquisitionTraceSettlementInternalExported({ ...hostileSettlement, partitionKey: `partition-v1-${HASH_B}`, partitionKeySha256: HASH_B } as TransportSettlement, PROJECTION_LIMITS))).toBe("acquisition-contract.invalid-capability");
+    expect(touched).toBe(false);
+
+    const original = trace(); const { schemaVersion: _schema, traceKey: _key, provenanceStatus: _provenance, ...traceInput } = original;
+    const forgedSettlement = { ...traceInput.settlement };
+    const hostileWarnings = new Proxy([], { ownKeys() { touched = true; throw new Error("untouched"); } });
+    expect(errorCode(() => createAcquisitionTrace({ ...traceInput, settlement: forgedSettlement, warnings: hostileWarnings } as never))).toBe("acquisition-contract.invalid-capability");
+    expect(touched).toBe(false);
+  });
+
   test("authenticates settlement claims with a live partition and permits only fixed redirect origins", () => {
     const pubmedInput = { provider: "pubmed", operation: "search", endpointClass: "opaque-v1", target: "ncbi", normalizedInput: { kind: "query", query: "cancer", limit: 10 }, requestedUrl: "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?term=x" } as const;
     registeredPartition(pubmedInput);
@@ -397,7 +424,7 @@ describe("immutable acquisition contracts", () => {
     expect(projectedForward.redirects).toHaveLength(1);
     const publicPubmedInput = { provider: "pubmed" as const, operation: "search" as const, endpointClass: "opaque-v1", ...pubmedKey, accessLevel: "metadata-only" as const, settlement: projectedForward, warnings: [] };
     expect(createAcquisitionTrace(publicPubmedInput).settlement.finalUrl?.canonicalUrl).toBe("https://www.ncbi.nlm.nih.gov/result");
-    expect(errorCode(() => createAcquisitionTrace({ ...publicPubmedInput, settlement: { ...projectedForward, finalUrl: { ...projectedForward.finalUrl!, canonicalUrl: "https://foo.ncbi.nlm.nih.gov/result" } } }))).toBe("acquisition-contract.invalid-input");
+    expect(errorCode(() => createAcquisitionTrace({ ...publicPubmedInput, settlement: { ...projectedForward, finalUrl: { ...projectedForward.finalUrl!, canonicalUrl: "https://foo.ncbi.nlm.nih.gov/result" } } }))).toBe("acquisition-contract.invalid-capability");
 
     const reverseInput = { ...pubmedInput, requestedUrl: "https://www.ncbi.nlm.nih.gov/start" };
     registeredPartition(reverseInput);
@@ -432,7 +459,7 @@ describe("immutable acquisition contracts", () => {
     expect(errorCode(() => acquisitionTraceSettlementInternalExported(settlement({ redirectWitnesses: new Proxy([], {}) }), PROJECTION_LIMITS))).toBe("acquisition-contract.invalid-input");
     const publicTrace = trace(); const { schemaVersion: _s, traceKey: _k, provenanceStatus: _p, ...input } = publicTrace;
     const publicHostile = Array(6).fill(undefined); Object.defineProperty(publicHostile, "5", { enumerable: true, get() { touched = true; throw new Error("untouched"); } });
-    expect(errorCode(() => createAcquisitionTrace({ ...input, settlement: { ...input.settlement, redirects: publicHostile } } as never))).toBe("acquisition-contract.result-too-large");
+    expect(errorCode(() => createAcquisitionTrace({ ...input, settlement: { ...input.settlement, redirects: publicHostile } } as never))).toBe("acquisition-contract.invalid-capability");
     expect(touched).toBe(false);
     expect(errorCode(() => validateAcademicAcquisitionResult(result({ traces: [{ ...publicTrace, settlement: { ...publicTrace.settlement, redirects: publicHostile } } as AcquisitionTrace] })))).toBe("acquisition-contract.result-too-large");
     expect(touched).toBe(false);
@@ -549,7 +576,9 @@ describe("immutable acquisition contracts", () => {
     expect(errorCode(() => validateAcademicAcquisitionResult(new Proxy(result(), {})))).toBe("acquisition-contract.invalid-input");
   });
 
-  test("exposes opaque sink type without a public factory or staged constructor", () => {
+  test("exports the exact provenance handle while deferring sink executables", () => {
+    const handle: AcquisitionProvenanceHandle = { correlationKey: "correlation-1" };
+    expect(handle).toEqual({ correlationKey: "correlation-1" });
     expect("createAcquisitionProvenanceSinkInternal" in contractsModule).toBe(false);
     expect("acquisitionSinkBeforeDispatchInternal" in contractsModule).toBe(false);
     expect("acquisitionSinkSettledInternal" in contractsModule).toBe(false);
@@ -608,21 +637,30 @@ describe("immutable acquisition contracts", () => {
     expect(errorCode(() => acquisitionTraceSettlementInternal(settlement(), { maxCanonicalUrlBytes: 10, maxRedirects: 5 }))).toBe("acquisition-contract.result-too-large");
     const original = trace(); const { schemaVersion: _schemaVersion, traceKey: _traceKey, provenanceStatus: _status, ...input } = original;
     const forgedUrl = { canonicalUrl: "https://example.org/works?secret=value", canonicalUrlSha256: HASH_A };
-    expect(errorCode(() => createAcquisitionTrace({ ...input, settlement: { ...input.settlement, requestedUrl: forgedUrl } } as never))).toBe("acquisition-contract.invalid-input");
-    expect(errorCode(() => createAcquisitionTrace({ ...input, settlement: { ...input.settlement, requestedUrl: { ...input.settlement.requestedUrl, canonicalUrl: "https://api.crossref.org/works?secret=value" } } } as never))).toBe("acquisition-contract.invalid-input");
-    expect(errorCode(() => createAcquisitionTrace({ ...input, settlement: { ...input.settlement, redirects: [{ ...input.settlement.redirects[0]!, ordinal: 2 }] } } as never))).toBe("acquisition-contract.invalid-input");
-    expect(errorCode(() => createAcquisitionTrace({ ...input, settlement: { ...input.settlement, redirects: [{ ...input.settlement.redirects[0]!, from: { ...input.settlement.redirects[0]!.from, canonicalUrlSha256: HASH_B } }] } } as never))).toBe("acquisition-contract.invalid-input");
+    expect(errorCode(() => createAcquisitionTrace({ ...input, settlement: { ...input.settlement, requestedUrl: forgedUrl } } as never))).toBe("acquisition-contract.invalid-capability");
+    expect(errorCode(() => createAcquisitionTrace({ ...input, settlement: { ...input.settlement, requestedUrl: { ...input.settlement.requestedUrl, canonicalUrl: "https://api.crossref.org/works?secret=value" } } } as never))).toBe("acquisition-contract.invalid-capability");
+    expect(errorCode(() => createAcquisitionTrace({ ...input, settlement: { ...input.settlement, redirects: [{ ...input.settlement.redirects[0]!, ordinal: 2 }] } } as never))).toBe("acquisition-contract.invalid-capability");
+    expect(errorCode(() => createAcquisitionTrace({ ...input, settlement: { ...input.settlement, redirects: [{ ...input.settlement.redirects[0]!, from: { ...input.settlement.redirects[0]!.from, canonicalUrlSha256: HASH_B } }] } } as never))).toBe("acquisition-contract.invalid-capability");
     expect(errorCode(() => createAcquisitionTrace({ ...input, provider: "openalex" } as never))).toBe("acquisition-contract.invalid-key");
     expect(errorCode(() => createAcquisitionTrace({ ...input, operation: "fetch" } as never))).toBe("acquisition-contract.invalid-key");
     expect(errorCode(() => createAcquisitionTrace({ ...input, endpointClass: "opaque-endpoint-v1" } as never))).toBe("acquisition-contract.invalid-key");
   });
 
-  test("keeps retrieval timestamps out of trace keys while deterministic URL hashes and access change keys", () => {
-    const a = trace(); const b = trace({ settlement: { ...a.settlement, retrievedAt: "2030-01-01T00:00:00.000Z" } });
-    expect(a.traceKey).toBe(b.traceKey); const changedUrl = { ...a.settlement.requestedUrl, canonicalUrlSha256: HASH_B };
-    expect(errorCode(() => trace({ settlement: { ...a.settlement, requestedUrl: changedUrl, finalUrl: { ...changedUrl }, redirects: [] } }))).toBe("acquisition-contract.invalid-key");
+  test("uses structural ceilings rather than an unlisted trace-warning cap", () => {
+    const original = trace(); const { schemaVersion: _schema, traceKey: _key, provenanceStatus: _provenance, ...input } = original;
+    const warnings = Array.from({ length: 1_201 }, (_, recordOrdinal) => ({ code: "provider.invalid-url-omitted" as const, recordOrdinal, field: "URL" as const }));
+    expect(createAcquisitionTrace({ ...input, warnings }).warnings).toHaveLength(1_201);
+    let touched = false; const overflow = Array(100_001); Object.defineProperty(overflow, "100000", { enumerable: true, get() { touched = true; throw new Error("untouched"); } });
+    expect(errorCode(() => createAcquisitionTrace({ ...input, warnings: overflow } as never))).toBe("acquisition-contract.result-too-large");
+    expect(touched).toBe(false);
+  });
+
+  test("keeps retrieval timestamps out of trace keys and rejects forged settlement clones", () => {
+    registeredPartition(); const key = createProviderPartitionKey(partitionPreimage());
+    const build = (settledAt: string) => createAcquisitionTrace({ provider: "crossref", operation: "search", endpointClass: "works-search", ...key, accessLevel: "metadata-only", settlement: acquisitionTraceSettlementInternalExported(settlement({ settledAt }), PROJECTION_LIMITS), warnings: [] });
+    const a = build(LATER); const b = build("2030-01-01T00:00:00.000Z"); expect(a.traceKey).toBe(b.traceKey);
     const { schemaVersion: _schemaVersion, traceKey: _traceKey, provenanceStatus: _status, ...input } = a;
-    expect(errorCode(() => createAcquisitionTrace({ ...input, settlement: { ...a.settlement, outcome: "blocked", code: "success" } } as never))).toBe("acquisition-contract.invalid-input");
+    expect(errorCode(() => createAcquisitionTrace({ ...input, settlement: { ...a.settlement } }))).toBe("acquisition-contract.invalid-capability");
   });
 
   test("tracks requested dispatched succeeded failed and blocked partition counts independent of candidates", () => {
