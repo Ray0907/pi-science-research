@@ -1,0 +1,20 @@
+{
+  "status": "ok",
+  "message": {
+    "items": [
+      {
+        "DOI": "10.5555/SYNTHETIC.1",
+        "URL": "https://example.org/crossref/1",
+        "title": ["", "Synthetic Crossref Record"],
+        "author": [
+          {"family": "Example", "given": "Ada", "ORCID": "https://orcid.org/0000-0002-1825-0097"},
+          {"name": "Synthetic Collaboration", "ORCID": "0000-0002-1694-233X"}
+        ],
+        "container-title": ["Synthetic Journal"],
+        "publisher": "Synthetic Press",
+        "published-print": {"date-parts": [[2024, 2, 29]]},
+        "type": "journal-article"
+      }
+    ]
+  }
+}

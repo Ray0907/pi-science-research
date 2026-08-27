@@ -1,0 +1,22 @@
+{
+  "meta": {"count": 1},
+  "results": [
+    {
+      "id": "https://openalex.org/W123456789",
+      "doi": "https://doi.org/10.5555/synthetic.2",
+      "ids": {
+        "openalex": "https://openalex.org/W123456789",
+        "doi": "10.5555/SYNTHETIC.2",
+        "pmid": "https://pubmed.ncbi.nlm.nih.gov/12345/",
+        "pmcid": "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC67890/"
+      },
+      "display_name": "Synthetic OpenAlex Record",
+      "authorships": [{"author": {"display_name": "Grace Example"}}],
+      "primary_location": {"landing_page_url": "https://example.org/openalex/2", "source": {"display_name": "Synthetic Venue"}},
+      "publication_date": "2023-07-14",
+      "publication_year": 2023,
+      "type": "review",
+      "abstract_inverted_index": {"bounded": [0], "synthetic": [1], "abstract": [2]}
+    }
+  ]
+}
