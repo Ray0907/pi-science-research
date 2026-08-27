@@ -689,7 +689,23 @@ describe("immutable acquisition contracts", () => {
     expect(errorCode(() => registerProviderRequestPartitionInternal(owner, { ...nestedPartition, normalizedInput: { ...nestedPartition.normalizedInput, [oversizedUnknown]: true } }))).toBe("acquisition-contract.invalid-input");
   });
 
-  test("preflights nested array lengths before proxy enumeration or descriptor-map allocation", () => {
+  test("rejects oversized proxy arrays before every trap in options results and constructors", () => {
+    const hostile = () => {
+      let traps = 0;
+      const failTrap = () => { traps += 1; throw new Error("SECRET proxy trap"); };
+      const value = new Proxy(Array(100_001), {
+        getOwnPropertyDescriptor: failTrap, ownKeys: failTrap, getPrototypeOf: failTrap, get: failTrap,
+        set: failTrap, has: failTrap, defineProperty: failTrap, deleteProperty: failTrap,
+        setPrototypeOf: failTrap, isExtensible: failTrap, preventExtensions: failTrap,
+      });
+      return { value, traps: () => traps };
+    };
+    const options = hostile(); expect(errorCode(() => normalizeAcquisitionOptions(options.value))).toBe("acquisition-contract.invalid-options"); expect(options.traps()).toBe(0);
+    const publicResult = hostile(); expect(errorCode(() => validateAcademicAcquisitionResult(publicResult.value))).toBe("acquisition-contract.invalid-input"); expect(publicResult.traps()).toBe(0);
+    const constructor = hostile(); expect(errorCode(() => createAcademicCandidate(constructor.value as never))).toBe("acquisition-contract.invalid-input"); expect(constructor.traps()).toBe(0);
+  });
+
+  test("rejects nested proxy arrays before length or descriptor enumeration", () => {
     const dense = Array.from({ length: 17 }, (_, index) => String(index + 1));
     let lengthReads = 0; let ownKeysReads = 0; let otherDescriptorReads = 0; let prototypeReads = 0;
     const hostile = new Proxy(dense, {
@@ -700,12 +716,12 @@ describe("immutable acquisition contracts", () => {
     const preimage = partitionPreimage({ provider: "pubmed", endpointClass: "pubmed-search", target: "ncbi", normalizedInput: { kind: "pmid-list", pmids: dense }, requestedUrl: "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?id=1" });
     const owner = createProviderPartitionPlanOwnerInternal({ planId: `plan-v1-${"f".repeat(64)}`, options: { ...PARTITION_LIMITS, maxStructureNodes: 16 } });
     const snapshot = partitionSnapshot(preimage);
-    expect(errorCode(() => registerProviderRequestPartitionInternal(owner, { ...snapshot, normalizedInput: { kind: "pmid-list", pmids: hostile } }))).toBe("acquisition-contract.input-too-large");
-    expect({ lengthReads, ownKeysReads, otherDescriptorReads, prototypeReads }).toEqual({ lengthReads: 1, ownKeysReads: 0, otherDescriptorReads: 0, prototypeReads: 0 });
-    let throwingOwnKeys = 0;
-    const throwingLength = new Proxy(dense, { getOwnPropertyDescriptor() { throw new Error("SECRET length trap"); }, ownKeys() { throwingOwnKeys += 1; throw new Error("unexpected ownKeys enumeration"); } });
+    expect(errorCode(() => registerProviderRequestPartitionInternal(owner, { ...snapshot, normalizedInput: { kind: "pmid-list", pmids: hostile } }))).toBe("acquisition-contract.invalid-input");
+    expect({ lengthReads, ownKeysReads, otherDescriptorReads, prototypeReads }).toEqual({ lengthReads: 0, ownKeysReads: 0, otherDescriptorReads: 0, prototypeReads: 0 });
+    let throwingDescriptors = 0; let throwingOwnKeys = 0;
+    const throwingLength = new Proxy(dense, { getOwnPropertyDescriptor() { throwingDescriptors += 1; throw new Error("SECRET length trap"); }, ownKeys() { throwingOwnKeys += 1; throw new Error("unexpected ownKeys enumeration"); } });
     expect(errorCode(() => registerProviderRequestPartitionInternal(owner, { ...snapshot, normalizedInput: { kind: "pmid-list", pmids: throwingLength } }))).toBe("acquisition-contract.invalid-input");
-    expect(throwingOwnKeys).toBe(0);
+    expect({ throwingDescriptors, throwingOwnKeys }).toEqual({ throwingDescriptors: 0, throwingOwnKeys: 0 });
   });
 
   test("bounds nested snapshot arrays from their length descriptor before a second descriptor map", () => {
@@ -726,13 +742,13 @@ describe("immutable acquisition contracts", () => {
     expect({ lengthReads, descriptorMaps }).toEqual({ lengthReads: 2, descriptorMaps: 1 });
   });
 
-  test("applies explicit array caps to proxy arrays before enumeration", () => {
+  test("rejects proxy arrays before explicit array caps or enumeration", () => {
     registeredPartition();
     const redirects = Array.from({ length: 6 }, () => ({ ordinal: 1, status: 302 as const, fromUrl: URL, fromOrigin: "https://api.crossref.org", toUrl: URL, toOrigin: "https://api.crossref.org" }));
     let lengthReads = 0; let ownKeysReads = 0;
     const hostile = new Proxy(redirects, { getOwnPropertyDescriptor(target, key) { if (key === "length") { lengthReads += 1; return Reflect.getOwnPropertyDescriptor(target, key); } throw new Error("unexpected descriptor enumeration"); }, ownKeys() { ownKeysReads += 1; throw new Error("unexpected ownKeys enumeration"); } });
-    expect(errorCode(() => acquisitionTraceSettlementInternalExported(settlement({ redirectWitnesses: hostile }), PROJECTION_LIMITS))).toBe("acquisition-contract.result-too-large");
-    expect({ lengthReads, ownKeysReads }).toEqual({ lengthReads: 1, ownKeysReads: 0 });
+    expect(errorCode(() => acquisitionTraceSettlementInternalExported(settlement({ redirectWitnesses: hostile }), PROJECTION_LIMITS))).toBe("acquisition-contract.invalid-input");
+    expect({ lengthReads, ownKeysReads }).toEqual({ lengthReads: 0, ownKeysReads: 0 });
   });
 
   test("rejects overlong strings and keys before canonical expansion", () => {
