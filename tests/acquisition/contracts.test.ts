@@ -12,7 +12,7 @@ import { canonicalJson } from "../../src/crypto/canonical-json.js";
 import { sha256Hex } from "../../src/crypto/hash.js";
 import {
   AcquisitionContractError,
-  acquisitionTraceSettlementInternal,
+  acquisitionTraceSettlementInternal as acquisitionTraceSettlementInternalExported,
   assertNormalizedAcquisitionOptionsInternal,
   assertProviderRequestPartitionInternal,
   assertProviderRequestPartitionOwnedByInternal,
@@ -33,6 +33,7 @@ import {
   type AcademicCandidateGroup,
   type AcquisitionTrace,
   type ProviderPartitionRegistryOptionsInternal,
+  type ProviderRequestPartitionInternal,
   type TransportSettlement,
 } from "../../src/acquisition/contracts.js";
 
@@ -79,20 +80,39 @@ function partitionSnapshot(overrides: Record<string, unknown> = {}) {
     url: requestedUrl,
   };
 }
+function registeredPartition(overrides: Record<string, unknown> = {}): ProviderRequestPartitionInternal {
+  const owner = createProviderPartitionPlanOwnerInternal({ planId: `plan-v1-${sha256Hex(canonicalJson(overrides))}`, options: PARTITION_LIMITS });
+  return registerProviderRequestPartitionInternal(owner, partitionSnapshot(overrides));
+}
+const PROJECTION_LIMITS = { maxCanonicalUrlBytes: 4_096, maxRedirects: 5, maxDecodedBodyBytes: 16_777_216 } as const;
+const projectSettlementInternal = acquisitionTraceSettlementInternalExported as unknown as (
+  partition: ProviderRequestPartitionInternal,
+  settlement: TransportSettlement,
+  limits: { maxCanonicalUrlBytes: number; maxRedirects: number; maxDecodedBodyBytes: number },
+) => AcquisitionTrace["settlement"];
+function acquisitionTraceSettlementInternal(
+  value: TransportSettlement,
+  limits: { maxCanonicalUrlBytes: number; maxRedirects: number; maxDecodedBodyBytes?: number },
+  partition = registeredPartition(),
+): AcquisitionTrace["settlement"] {
+  const descriptors = Object.getOwnPropertyDescriptors(limits);
+  if (Object.values(descriptors).some((descriptor) => !("value" in descriptor))) return projectSettlementInternal(partition, value, limits as Required<typeof limits>);
+  return projectSettlementInternal(partition, value, { ...limits, maxDecodedBodyBytes: limits.maxDecodedBodyBytes ?? 16_777_216 });
+}
 function settlement(overrides: Partial<TransportSettlement> = {}): TransportSettlement {
   const key = createProviderPartitionKey(partitionPreimage());
   return {
     schemaVersion: 1, ...key, provider: "crossref", operation: "search", endpointClass: "works-search",
     normalizedOrigin: "https://api.crossref.org", requestedUrl: URL, finalUrl: "https://api.crossref.org/works?page=2",
     redirectWitnesses: [{ ordinal: 1, status: 302, fromUrl: URL, fromOrigin: "https://api.crossref.org", toUrl: "https://api.crossref.org/works?page=2", toOrigin: "https://api.crossref.org" }],
-    httpStatus: 200, encodedBytes: 12, decodedBytes: 12, responsePayloadSha256: HASH_A,
+    httpStatus: 200, encodedBytes: 2, decodedBytes: 2, responsePayloadSha256: HASH_A,
     responseHeaders: { contentType: "application/json", retryAfter: null, etag: null, lastModified: null },
     responseHeadersSha256: HASH_B, connectedPeer: { address: "93.184.216.34", family: 4 },
     startedAt: AT, settledAt: LATER, outcome: "success", failureCode: null, payloadUtf8: "{}", ...overrides,
   } as TransportSettlement;
 }
 function trace(overrides: Record<string, unknown> = {}): AcquisitionTrace {
-  const projected = acquisitionTraceSettlementInternal(settlement(), { maxCanonicalUrlBytes: 4_096, maxRedirects: 5 });
+  const projected = projectSettlementInternal(registeredPartition(), settlement(), PROJECTION_LIMITS);
   const key = createProviderPartitionKey(partitionPreimage());
   return createAcquisitionTrace({
     provider: "crossref", operation: "search", endpointClass: "works-search", ...key,
@@ -119,7 +139,7 @@ function providerTrace(input: Readonly<{
     outcome: "success", failureCode: null, payloadUtf8: "{}",
   };
   return createAcquisitionTrace({ provider: input.provider, operation: input.operation, endpointClass: input.endpointClass, ...key, accessLevel: input.accessLevel,
-    settlement: acquisitionTraceSettlementInternal(transport, { maxCanonicalUrlBytes: 4_096, maxRedirects: 5 }), warnings: [] });
+    settlement: projectSettlementInternal(registeredPartition({ provider: input.provider, operation: input.operation, endpointClass: input.endpointClass, target: input.target, normalizedInput: input.normalizedInput, requestedUrl: input.url }), transport, PROJECTION_LIMITS), warnings: [] });
 }
 function candidate(overrides: Record<string, unknown> = {}): AcademicCandidate {
   const t = trace();
@@ -329,6 +349,73 @@ describe("immutable acquisition contracts", () => {
     expect(trace({ settlement: { ...a.settlement, decodedBytes: a.settlement.decodedBytes + 1 } }).traceKey).not.toBe(a.traceKey);
   });
 
+  test("validates transport payload bytes separately from bounded metadata", () => {
+    const partition = registeredPartition();
+    const lower = { maxCanonicalUrlBytes: 4_096, maxRedirects: 5, maxDecodedBodyBytes: 8 };
+    expect(projectSettlementInternal(partition, settlement({ payloadUtf8: "12345678", decodedBytes: 8 }), lower).decodedBytes).toBe(8);
+    expect(projectSettlementInternal(partition, settlement({ payloadUtf8: "éé", decodedBytes: 4 }), lower).decodedBytes).toBe(4);
+    expect(errorCode(() => projectSettlementInternal(partition, settlement({ payloadUtf8: "123456789", decodedBytes: 9 }), lower))).toBe("acquisition-contract.result-too-large");
+    expect(errorCode(() => projectSettlementInternal(partition, settlement({ payloadUtf8: "éé", decodedBytes: 2 }), lower))).toBe("acquisition-contract.invalid-input");
+    expect(errorCode(() => projectSettlementInternal(partition, settlement({ payloadUtf8: null } as never), lower))).toBe("acquisition-contract.invalid-input");
+    expect(errorCode(() => projectSettlementInternal(partition, settlement({ outcome: "failure", failureCode: "transport.http-terminal", payloadUtf8: "x" } as never), lower))).toBe("acquisition-contract.invalid-input");
+    let payloadGetterTouched = false;
+    const accessor = Object.defineProperty({ ...settlement() }, "payloadUtf8", { enumerable: true, get() { payloadGetterTouched = true; return "{}"; } });
+    expect(errorCode(() => projectSettlementInternal(partition, accessor as TransportSettlement, lower))).toBe("acquisition-contract.invalid-input");
+    expect(payloadGetterTouched).toBe(false);
+    const failed = settlement({ outcome: "failure", failureCode: "transport.http-terminal", payloadUtf8: null, decodedBytes: 0, responsePayloadSha256: null, finalUrl: null, redirectWitnesses: [], httpStatus: null });
+    expect(projectSettlementInternal(partition, failed, { ...lower, maxDecodedBodyBytes: 67_108_864 }).outcome).toBe("failure");
+    expect(errorCode(() => projectSettlementInternal(partition, failed, { ...lower, maxDecodedBodyBytes: 67_108_865 }))).toBe("acquisition-contract.invalid-input");
+  });
+
+  test("authenticates settlement claims with a live partition and permits only fixed redirect origins", () => {
+    const pubmedInput = { provider: "pubmed", operation: "search", endpointClass: "opaque-v1", target: "ncbi", normalizedInput: { kind: "query", query: "cancer", limit: 10 }, requestedUrl: "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?term=x" } as const;
+    const pubmedPartition = registeredPartition(pubmedInput);
+    const pubmedKey = createProviderPartitionKey(pubmedInput);
+    const base = settlement({ ...pubmedKey, provider: "pubmed", endpointClass: "opaque-v1", normalizedOrigin: "https://eutils.ncbi.nlm.nih.gov", requestedUrl: pubmedInput.requestedUrl,
+      finalUrl: "https://www.ncbi.nlm.nih.gov/result", redirectWitnesses: [{ ordinal: 1, status: 302, fromUrl: pubmedInput.requestedUrl, fromOrigin: "https://eutils.ncbi.nlm.nih.gov", toUrl: "https://www.ncbi.nlm.nih.gov/result", toOrigin: "https://www.ncbi.nlm.nih.gov" }] });
+    const projectedForward = projectSettlementInternal(pubmedPartition, base, PROJECTION_LIMITS);
+    expect(projectedForward.redirects).toHaveLength(1);
+    const publicPubmedInput = { provider: "pubmed" as const, operation: "search" as const, endpointClass: "opaque-v1", ...pubmedKey, accessLevel: "metadata-only" as const, settlement: projectedForward, warnings: [] };
+    expect(createAcquisitionTrace(publicPubmedInput).settlement.finalUrl?.canonicalUrl).toBe("https://www.ncbi.nlm.nih.gov/result");
+    expect(errorCode(() => createAcquisitionTrace({ ...publicPubmedInput, settlement: { ...projectedForward, finalUrl: { ...projectedForward.finalUrl!, canonicalUrl: "https://foo.ncbi.nlm.nih.gov/result" } } }))).toBe("acquisition-contract.invalid-input");
+
+    const reverseInput = { ...pubmedInput, requestedUrl: "https://www.ncbi.nlm.nih.gov/start" };
+    const reversePartition = registeredPartition(reverseInput);
+    const reverseKey = createProviderPartitionKey(reverseInput);
+    const reverse = settlement({ ...reverseKey, provider: "pubmed", endpointClass: "opaque-v1", normalizedOrigin: "https://www.ncbi.nlm.nih.gov", requestedUrl: reverseInput.requestedUrl,
+      finalUrl: "https://eutils.ncbi.nlm.nih.gov/end", redirectWitnesses: [{ ordinal: 1, status: 307, fromUrl: reverseInput.requestedUrl, fromOrigin: "https://www.ncbi.nlm.nih.gov", toUrl: "https://eutils.ncbi.nlm.nih.gov/end", toOrigin: "https://eutils.ncbi.nlm.nih.gov" }] });
+    expect(projectSettlementInternal(reversePartition, reverse, PROJECTION_LIMITS).redirects).toHaveLength(1);
+    const sibling = { ...base, finalUrl: "https://foo.ncbi.nlm.nih.gov/result", redirectWitnesses: [{ ...base.redirectWitnesses[0]!, toUrl: "https://foo.ncbi.nlm.nih.gov/result", toOrigin: "https://foo.ncbi.nlm.nih.gov" }] } as TransportSettlement;
+    expect(errorCode(() => projectSettlementInternal(pubmedPartition, sibling, PROJECTION_LIMITS))).toBe("acquisition-contract.invalid-input");
+    expect(errorCode(() => projectSettlementInternal({ capabilityKind: "provider-request-partition" }, settlement(), PROJECTION_LIMITS))).toBe("acquisition-contract.invalid-capability");
+    expect(errorCode(() => projectSettlementInternal(pubmedPartition, settlement(), PROJECTION_LIMITS))).toBe("acquisition-contract.invalid-key");
+    for (const mismatch of [
+      { provider: "openalex" }, { operation: "fetch" }, { endpointClass: "other" },
+      { partitionKey: `partition-v1-${HASH_B}` }, { partitionKeySha256: HASH_B },
+      { requestedUrl: "https://eutils.ncbi.nlm.nih.gov/other", finalUrl: "https://eutils.ncbi.nlm.nih.gov/other", redirectWitnesses: [] },
+    ]) expect(errorCode(() => projectSettlementInternal(pubmedPartition, { ...base, ...mismatch } as TransportSettlement, PROJECTION_LIMITS))).toBe("acquisition-contract.invalid-key");
+    const closed = registeredPartition(); closeProviderPartitionPlanOwnerInternal(lookupProviderRequestPartitionOwnerInternal(closed));
+    expect(errorCode(() => projectSettlementInternal(closed, settlement(), PROJECTION_LIMITS))).toBe("acquisition-contract.invalid-capability");
+  });
+
+  test("preflights redirect counts before copying hostile arrays", () => {
+    const partition = registeredPartition(); let touched = false;
+    const hostile = Array(6).fill(undefined) as unknown[];
+    for (let index = 0; index < 5; index += 1) hostile[index] = settlement().redirectWitnesses[0];
+    Object.defineProperty(hostile, "5", { enumerable: true, get() { touched = true; throw new Error("untouched"); } });
+    expect(errorCode(() => projectSettlementInternal(partition, settlement({ redirectWitnesses: hostile as never }), PROJECTION_LIMITS))).toBe("acquisition-contract.result-too-large");
+    expect(touched).toBe(false);
+    const sparse = Array(6); sparse[0] = settlement().redirectWitnesses[0];
+    expect(errorCode(() => projectSettlementInternal(partition, settlement({ redirectWitnesses: sparse as never }), PROJECTION_LIMITS))).toBe("acquisition-contract.result-too-large");
+    expect(errorCode(() => projectSettlementInternal(partition, settlement({ redirectWitnesses: new Proxy([], {}) }), PROJECTION_LIMITS))).toBe("acquisition-contract.invalid-input");
+    const publicTrace = trace(); const { schemaVersion: _s, traceKey: _k, provenanceStatus: _p, ...input } = publicTrace;
+    const publicHostile = Array(6).fill(undefined); Object.defineProperty(publicHostile, "5", { enumerable: true, get() { touched = true; throw new Error("untouched"); } });
+    expect(errorCode(() => createAcquisitionTrace({ ...input, settlement: { ...input.settlement, redirects: publicHostile } } as never))).toBe("acquisition-contract.result-too-large");
+    expect(touched).toBe(false);
+    expect(errorCode(() => validateAcademicAcquisitionResult(result({ traces: [{ ...publicTrace, settlement: { ...publicTrace.settlement, redirects: publicHostile } } as AcquisitionTrace] })))).toBe("acquisition-contract.result-too-large");
+    expect(touched).toBe(false);
+  });
+
   test("projects requested final redirect URLs with query redaction hashes bounds status access and retrieval time", () => {
     const projected = acquisitionTraceSettlementInternal(settlement(), { maxCanonicalUrlBytes: 4_096, maxRedirects: 5 });
     expect(projected.requestedUrl.canonicalUrl).toBe("https://api.crossref.org/works?redacted");
@@ -338,7 +425,7 @@ describe("immutable acquisition contracts", () => {
     const limits = Object.defineProperty({ maxRedirects: 5 }, "maxCanonicalUrlBytes", { enumerable: true, get() { throw new Error("getter"); } });
     expect(errorCode(() => acquisitionTraceSettlementInternal(settlement(), limits as never))).toBe("acquisition-contract.invalid-input");
     expect(errorCode(() => acquisitionTraceSettlementInternal(settlement({ responseHeaders: { contentType: 42 as never, retryAfter: null, etag: null, lastModified: null } }), { maxCanonicalUrlBytes: 4_096, maxRedirects: 5 }))).toBe("acquisition-contract.invalid-input");
-    expect(errorCode(() => acquisitionTraceSettlementInternal(settlement({ normalizedOrigin: "https://example.org", requestedUrl: "https://example.org/works", finalUrl: "https://example.org/works", redirectWitnesses: [] }), { maxCanonicalUrlBytes: 4_096, maxRedirects: 5 }))).toBe("acquisition-contract.invalid-input");
+    expect(errorCode(() => acquisitionTraceSettlementInternal(settlement({ normalizedOrigin: "https://example.org", requestedUrl: "https://example.org/works", finalUrl: "https://example.org/works", redirectWitnesses: [] }), { maxCanonicalUrlBytes: 4_096, maxRedirects: 5 }))).toBe("acquisition-contract.invalid-key");
     expect(errorCode(() => acquisitionTraceSettlementInternal(settlement({ finalUrl: "https://api.crossref.org/unrelated" }), { maxCanonicalUrlBytes: 4_096, maxRedirects: 5 }))).toBe("acquisition-contract.invalid-input");
     expect(errorCode(() => acquisitionTraceSettlementInternal(settlement({ redirectWitnesses: [{ ordinal: 2, status: 302, fromUrl: URL, fromOrigin: "https://api.crossref.org", toUrl: "https://api.crossref.org/works?page=2", toOrigin: "https://api.crossref.org" }] }), { maxCanonicalUrlBytes: 4_096, maxRedirects: 5 }))).toBe("acquisition-contract.invalid-input");
   });
@@ -379,6 +466,36 @@ describe("immutable acquisition contracts", () => {
     const reverse = validateAcademicAcquisitionResult(result({ candidates: [bridgeC, bridgeB, bridgeA], candidateGroups: [bridgeGroup] }));
     expect(forward.candidateGroups).toEqual(reverse.candidateGroups);
     expect(errorCode(() => validateAcademicAcquisitionResult(result({ candidates: [conflictA, conflictB], candidateGroups: [{ ...conflictGroup, status: "compatible", groupKey: group([conflictA, conflictB], { identityKind: "canonical-url", identityValueSha256: sha256Hex(canonicalJson(conflictA.canonicalUrl)), status: "compatible" }).groupKey }] })))).toBe("acquisition-contract.invalid-key");
+  });
+
+  test("preflights result collection hard counts and groups with linear diagnostics", () => {
+    let touched = false; const hostile = Array(1_001).fill(candidate());
+    Object.defineProperty(hostile, "1000", { enumerable: true, get() { touched = true; throw new Error("untouched"); } });
+    expect(errorCode(() => validateAcademicAcquisitionResult(result({ candidates: hostile as never })))).toBe("acquisition-contract.result-too-large");
+    expect(touched).toBe(false);
+
+    const validateWithDiagnostics = (contractsModule as unknown as { validateAcademicAcquisitionResultWithDiagnosticsInternal?: (input: unknown, diagnostics: Record<string, number>) => AcademicAcquisitionResult }).validateAcademicAcquisitionResultWithDiagnosticsInternal;
+    expect(typeof validateWithDiagnostics).toBe("function");
+    if (validateWithDiagnostics !== undefined) {
+      const measure = (count: number) => {
+        const candidates = Array.from({ length: count }, (_, index) => candidate({ providerRecordId: `scale-${index}`, identifiers: { doi: `10.1234/scale-${index}`, pmid: null, pmcid: null }, canonicalUrl: `https://example.org/scale/${index}` }));
+        const diagnostics: Record<string, number> = {};
+        validateWithDiagnostics(result({ candidates, candidateGroups: candidates.map((item) => group(item)).sort((left, right) => left.groupKey < right.groupKey ? -1 : left.groupKey > right.groupKey ? 1 : 0) }), diagnostics);
+        return diagnostics;
+      };
+      const small = measure(64); const large = measure(128);
+      expect(small.candidateCount).toBe(64); expect(large.candidateCount).toBe(128);
+      expect(large.identityReferences!).toBeLessThanOrEqual(small.identityReferences! * 2);
+      expect(large.unionFindOperations!).toBeLessThanOrEqual(small.unionFindOperations! * 2 + 128);
+      expect(large.orderingCodeUnits!).toBeLessThanOrEqual(small.orderingCodeUnits! * 2 + 128 * 128);
+    }
+  });
+
+  test("does not apply the scalar ceiling as a hidden serialized-object ceiling", () => {
+    const scalar = "x".repeat(9_000);
+    const authors = Array.from({ length: 1_024 }, () => ({ family: null, given: null, literal: scalar, orcid: null }));
+    const { schemaVersion: _schemaVersion, candidateKey: _candidateKey, provenanceStatus: _provenanceStatus, ...input } = candidate();
+    expect(createAcademicCandidate({ ...input, authors }).authors).toHaveLength(1_024);
   });
 
   test("constructors require PMCID candidate partition and payload hashes plus every claimed field", () => {
@@ -470,14 +587,16 @@ describe("immutable acquisition contracts", () => {
     expect(errorCode(() => createAcquisitionTrace({ ...input, settlement: { ...input.settlement, requestedUrl: forgedUrl } } as never))).toBe("acquisition-contract.invalid-input");
     expect(errorCode(() => createAcquisitionTrace({ ...input, settlement: { ...input.settlement, requestedUrl: { ...input.settlement.requestedUrl, canonicalUrl: "https://api.crossref.org/works?secret=value" } } } as never))).toBe("acquisition-contract.invalid-input");
     expect(errorCode(() => createAcquisitionTrace({ ...input, settlement: { ...input.settlement, redirects: [{ ...input.settlement.redirects[0]!, ordinal: 2 }] } } as never))).toBe("acquisition-contract.invalid-input");
+    expect(errorCode(() => createAcquisitionTrace({ ...input, settlement: { ...input.settlement, redirects: [{ ...input.settlement.redirects[0]!, from: { ...input.settlement.redirects[0]!.from, canonicalUrlSha256: HASH_B } }] } } as never))).toBe("acquisition-contract.invalid-input");
     expect(errorCode(() => createAcquisitionTrace({ ...input, provider: "openalex" } as never))).toBe("acquisition-contract.invalid-input");
-    expect(errorCode(() => createAcquisitionTrace({ ...input, operation: "fetch" } as never))).toBe("acquisition-contract.invalid-input");
-    expect(errorCode(() => createAcquisitionTrace({ ...input, endpointClass: "unrelated" } as never))).toBe("acquisition-contract.invalid-input");
+    expect(createAcquisitionTrace({ ...input, operation: "fetch" } as never).operation).toBe("fetch");
+    expect(createAcquisitionTrace({ ...input, endpointClass: "opaque-endpoint-v1" } as never).endpointClass).toBe("opaque-endpoint-v1");
   });
 
   test("keeps retrieval timestamps out of trace keys while deterministic URL hashes and access change keys", () => {
     const a = trace(); const b = trace({ settlement: { ...a.settlement, retrievedAt: "2030-01-01T00:00:00.000Z" } });
-    expect(a.traceKey).toBe(b.traceKey); expect(trace({ settlement: { ...a.settlement, requestedUrl: { ...a.settlement.requestedUrl, canonicalUrlSha256: HASH_B } } }).traceKey).not.toBe(a.traceKey);
+    expect(a.traceKey).toBe(b.traceKey); const changedUrl = { ...a.settlement.requestedUrl, canonicalUrlSha256: HASH_B };
+    expect(trace({ settlement: { ...a.settlement, requestedUrl: changedUrl, finalUrl: { ...changedUrl }, redirects: [] } }).traceKey).not.toBe(a.traceKey);
     const { schemaVersion: _schemaVersion, traceKey: _traceKey, provenanceStatus: _status, ...input } = a;
     expect(errorCode(() => createAcquisitionTrace({ ...input, settlement: { ...a.settlement, outcome: "blocked", code: "success" } } as never))).toBe("acquisition-contract.invalid-input");
   });
@@ -497,7 +616,7 @@ describe("immutable acquisition contracts", () => {
   test("reports exact redacted AcquisitionContractError codes", () => {
     expect(errorCode(() => normalizeAcquisitionOptions({ maxQueries: 0 }))).toBe("acquisition-contract.invalid-options");
     expect(errorCode(() => createProviderPartitionKey({ ...partitionPreimage(), requestedUrl: "https://user:SECRET@api.crossref.org/" }))).toBe("acquisition-contract.invalid-input");
-    expect(errorCode(() => createBlockedTraceSettlementInternal({ requestedUrl: URL, retrievedAt: "bad", limits: { maxCanonicalUrlBytes: 4_096, maxRedirects: 5 } }))).toBe("acquisition-contract.invalid-input");
+    expect(errorCode(() => createBlockedTraceSettlementInternal({ requestedUrl: URL, retrievedAt: "bad", limits: PROJECTION_LIMITS }))).toBe("acquisition-contract.invalid-input");
     expect(errorCode(() => acquisitionTraceSettlementInternal(settlement({ outcome: "failure", failureCode: "transport.unknown" as never, payloadUtf8: null }), { maxCanonicalUrlBytes: 4_096, maxRedirects: 5 }))).toBe("acquisition-contract.invalid-input");
     expect(acquisitionTraceSettlementInternal(settlement({ outcome: "failure", failureCode: "transport.json-root-invalid", payloadUtf8: null }), { maxCanonicalUrlBytes: 4_096, maxRedirects: 5 }).code).toBe("invalid-response");
   });
