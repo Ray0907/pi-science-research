@@ -143,6 +143,7 @@ function auditAdapter(source:string):string[]{
   let strictHeaders=false;let exactCa=false;let caClone=false;let headerMapOverride=false;let sharedDestroy=false;let constructsResolver=false;
   const realResolverMembers=new Set<string>();let realOperationsDeclarations=0;const adapterFunctionCounts=new Map<string,number>();const productionFeatureKeys=new Set<string>();const productionIdentifiers=new Set<string>();
   let productionUsesOwnDescriptors=false;let productionUsesPrototype=false;let unsupportedBranch=false;
+  const responseListenerPositions=new Map<string,number>();let removesResponseError=false;let responseFailureGate=false;let responseFailureLatch=false;let responseFailureSocket=false;let responseFailureDestroy=false;
   const visitProduction=(node:ts.Node):void=>{
     if(ts.isStringLiteral(node))productionFeatureKeys.add(node.text);
     if(ts.isIdentifier(node))productionIdentifiers.add(node.text);
@@ -260,6 +261,8 @@ function auditAdapter(source:string):string[]{
       if(ts.isElementAccessExpression(node.expression)){const argument=node.expression.argumentExpression;if(argument&&ts.isStringLiteral(argument)&&forbiddenMemberNames.has(argument.text))errors.push(`forbidden call ${argument.text}`);}
     }
     if(ts.isFunctionDeclaration(node)&&node.name){if(["adaptNodeRequest","readProductionBundledRoots","productionFeaturesAvailable"].includes(node.name.text))adapterFunctionCounts.set(node.name.text,(adapterFunctionCounts.get(node.name.text)??0)+1);if(node.name.text==="productionFeaturesAvailable")visitProduction(node);}
+    if(ts.isCallExpression(node)&&ts.isPropertyAccessExpression(node.expression)&&ts.isIdentifier(node.expression.expression)&&node.expression.expression.text==="response"&&insideNamedFunction(node,"adaptNodeRequest")){const event=node.arguments[0];if(event&&ts.isStringLiteral(event)){if(node.expression.name.text==="on"&&!responseListenerPositions.has(event.text)){const listener=node.arguments[1];if(["aborted","error"].includes(event.text)&&(!listener||!ts.isIdentifier(listener)||listener.text!=="responseSocketFailure"))errors.push(`response ${event.text} listener binding`);responseListenerPositions.set(event.text,node.pos);}if(node.expression.name.text==="removeListener"&&event.text==="error")removesResponseError=true;}}
+    if(ts.isVariableDeclaration(node)&&ts.isIdentifier(node.name)&&node.name.text==="responseSocketFailure"&&node.initializer&&ts.isArrowFunction(node.initializer)){const inspectFailure=(child:ts.Node):void=>{if(ts.isIfStatement(child)&&ts.isPrefixUnaryExpression(child.expression)&&child.expression.operator===ts.SyntaxKind.ExclamationToken&&ts.isIdentifier(child.expression.operand)&&child.expression.operand.text==="callbackGate"&&ts.isReturnStatement(child.thenStatement))responseFailureGate=true;if(ts.isBinaryExpression(child)&&child.operatorToken.kind===ts.SyntaxKind.EqualsToken&&ts.isIdentifier(child.left)&&child.left.text==="callbackGate"&&child.right.kind===ts.SyntaxKind.FalseKeyword)responseFailureLatch=true;if(ts.isCallExpression(child)&&ts.isPropertyAccessExpression(child.expression)&&ts.isIdentifier(child.expression.expression)&&child.expression.expression.text==="callbacks"&&child.expression.name.text==="onError"&&child.arguments[0]&&ts.isStringLiteral(child.arguments[0])&&child.arguments[0].text==="socket")responseFailureSocket=true;if(ts.isCallExpression(child)&&ts.isIdentifier(child.expression)&&child.expression.text==="destroyOnce")responseFailureDestroy=true;ts.forEachChild(child,inspectFailure);};inspectFailure(node.initializer.body);}
     if(ts.isCallExpression(node)&&ts.isIdentifier(node.expression)&&node.expression.text==="productionFeaturesAvailable"){
       const parent=node.parent;if(ts.isPrefixUnaryExpression(parent)&&parent.operator===ts.SyntaxKind.ExclamationToken){let ancestor:ts.Node|undefined=parent.parent;while(ancestor&&!ts.isIfStatement(ancestor))ancestor=ancestor.parent;if(ancestor)unsupportedBranch=source.slice(ancestor.pos,ancestor.end).includes("transport.unsupported-runtime");}
     }
@@ -290,6 +293,7 @@ function auditAdapter(source:string):string[]{
   const requiredFeatureIdentifiers=["Resolver","http","https","tls","nodeSetTimeout","nodeClearTimeout","nodePerformance"];
   if(requiredFeatureKeys.some((key)=>!productionFeatureKeys.has(key))||requiredFeatureIdentifiers.some((key)=>!productionIdentifiers.has(key))||!productionUsesOwnDescriptors||!productionUsesPrototype||!unsupportedBranch)errors.push("production feature audit");
   if(!sharedDestroy)errors.push("request destroy path");
+  const abortedPosition=responseListenerPositions.get("aborted");const errorPosition=responseListenerPositions.get("error");const dataPosition=responseListenerPositions.get("data");const endPosition=responseListenerPositions.get("end");if(abortedPosition===undefined||errorPosition===undefined||dataPosition===undefined||endPosition===undefined||abortedPosition>dataPosition||abortedPosition>endPosition||errorPosition>dataPosition||errorPosition>endPosition)errors.push("response listener ordering");if(removesResponseError||!responseFailureGate||!responseFailureLatch||!responseFailureSocket||!responseFailureDestroy)errors.push("response socket quarantine");
   if(!constructsResolver||JSON.stringify([...realResolverMembers].sort())!==JSON.stringify(["cancel","resolve4","resolve6"]))errors.push("resolver adapter usage");
   if(headerMapOverride)errors.push("header map override");
   if(caClone)errors.push("CA clone");
@@ -339,7 +343,6 @@ function auditTestNetworkSource(source:string):string[]{
 }
 
 const defaultFactoryRequiredArguments=new Map<string,readonly number[]>([
-  ["adaptNodeRequestInternal",[3]],
   ["createNodeRuntimeCapabilitiesInternal",[0]],
   ["createNodeDnsResolver",[0]],
   ["createNodeRequestDeadlineSchedulerCapabilitiesInternal",[0]],
@@ -392,6 +395,7 @@ function recursivelyEnumerateAuditFiles(directory:string):readonly string[]{
   walk(normalizedRoot);return Object.freeze(output);
 }
 function auditProductionTree(directory:string,adapterFile?:string):string[]{const normalizedAdapter=adapterFile===undefined?undefined:path.resolve(adapterFile);const errors:string[]=[];for(const file of recursivelyEnumerateAuditFiles(directory)){const source=fs.readFileSync(file,"utf8");const findings=file===normalizedAdapter?[...auditAdapter(source),...auditAdapterWireShape(source)]:auditNonAdapterSource(source);for(const finding of findings)errors.push(`${path.relative(path.resolve(directory),file)}: ${finding}`);}return errors;}
+function directModuleExportNames(source:string):readonly string[]{const file=ts.createSourceFile("direct-module.ts",source,ts.ScriptTarget.Latest,true,ts.ScriptKind.TS);const names:string[]=[];for(const statement of file.statements){if(ts.isExportDeclaration(statement)){if(statement.exportClause&&ts.isNamedExports(statement.exportClause))for(const element of statement.exportClause.elements)names.push(element.name.text);else names.push("<non-named-export>");continue;}const modifiers=ts.canHaveModifiers(statement)?ts.getModifiers(statement):undefined;if(!modifiers?.some((modifier)=>modifier.kind===ts.SyntaxKind.ExportKeyword))continue;if(ts.isVariableStatement(statement)){for(const declaration of statement.declarationList.declarations)if(ts.isIdentifier(declaration.name))names.push(declaration.name.text);continue;}if((ts.isFunctionDeclaration(statement)||ts.isClassDeclaration(statement)||ts.isInterfaceDeclaration(statement)||ts.isTypeAliasDeclaration(statement)||ts.isEnumDeclaration(statement))&&statement.name)names.push(statement.name.text);}return names.sort();}
 function acquisitionUnitIsolationErrors():string[]{
   const errors:string[]=[];
   for(const relativeDirectory of ["tests/acquisition","tests/helpers"]){const directory=path.join(root,relativeDirectory);for(const file of recursivelyEnumerateAuditFiles(directory))errors.push(...auditAcquisitionUnitSource(fs.readFileSync(file,"utf8"),path.relative(root,file)));}
@@ -403,6 +407,8 @@ describe("Node operations adapter audit",()=>{
     expect(auditProductionTree(path.join(root,"src/acquisition"),adapterPath)).toEqual([]);
     expect(acquisitionUnitIsolationErrors()).toEqual([]);
   });
+
+  test("locks the direct pinned-hop module API without exposing the raw adapter",()=>{const source=fs.readFileSync(adapterPath,"utf8");expect(directModuleExportNames(source)).toEqual(["NodeClockInternal","NodeHopProtocolFailureInternal","NodeOperationsInternal","NodePinnedHopCallbacksInternal","NodePinnedHopFailureCodeInternal","NodePinnedHopHandleInternal","NodePinnedHopSettlementInternal","NodeRequestCallbacksInternal","NodeRequestHandleInternal","NodeRequestOptionsInternal","NodeRequestOwnedAgentInternal","NodeResolverInternal","NodeRuntimeCapabilitiesInternal","PinnedHopOpenRequestInternal","PinnedHopRuntimeErrorCodeInternal","PinnedHopRuntimeErrorInternal","PinnedHopRuntimeInternal","PinnedProviderTargetInternal","SecureTransportError","SecureTransportErrorCode","assertPinnedHopRuntimeInternal","createNodeDnsResolver","createNodeRuntimeCapabilitiesInternal","createPinnedHopRuntimeInternal","getNodeRuntimeClockInternal","realNodeOperations"].sort());expect(source).not.toContain("adaptNodeRequestInternal");});
 
   test("rejects computed optional aliased and hidden network access using malicious TypeScript snippets",()=>{
     const base=fs.readFileSync(adapterPath,"utf8");

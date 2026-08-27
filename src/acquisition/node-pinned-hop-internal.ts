@@ -83,8 +83,7 @@ function isTlsErrorCode(code:string):boolean{
     "UNABLE_TO_GET_ISSUER_CERT","UNABLE_TO_GET_ISSUER_CERT_LOCALLY","EPROTO",
   ].includes(code);
 }
-type NodeRequestOperationInternal=(url:string,options:unknown,onResponse:(response:http.IncomingMessage)=>void)=>http.ClientRequest;
-function adaptNodeRequest(protocol:"http:"|"https:",options:NodeRequestOptionsInternal,callbacks:NodeRequestCallbacksInternal,requestOperation?:NodeRequestOperationInternal):NodeRequestHandleInternal{
+function adaptNodeRequest(protocol:"http:"|"https:",options:NodeRequestOptionsInternal,callbacks:NodeRequestCallbacksInternal):NodeRequestHandleInternal{
   let lookupUsed=false;
   let phase:"connect"|"tls"|"secure"="connect";
   let callbackGate=true;
@@ -124,7 +123,7 @@ function adaptNodeRequest(protocol:"http:"|"https:",options:NodeRequestOptionsIn
     if(destroyed){callbackGate=false;cleanupFlow();return;}
     flowAttached=true;response.on("data",responseData);response.on("end",responseEnd);
   };
-  const created=requestOperation?requestOperation(options.url,requestOptions,onResponse):protocol==="https:"?https.request(options.url,requestOptions as never,onResponse):http.request(options.url,requestOptions as never,onResponse);request=created;if(destroyed)request.destroy();
+  const created=protocol==="https:"?https.request(options.url,requestOptions as never,onResponse):http.request(options.url,requestOptions as never,onResponse);request=created;if(destroyed)request.destroy();
   request.on("socket",(socket)=>{
     if(protocol!=="https:")return;
     socket.once("connect",()=>{if(callbackGate&&phase==="connect")phase="tls";});
@@ -154,7 +153,6 @@ function adaptNodeRequest(protocol:"http:"|"https:",options:NodeRequestOptionsIn
   });
   return{end:()=>request!.end(),abort:destroyOnce,destroy:destroyOnce};
 }
-export function adaptNodeRequestInternal(protocol:"http:"|"https:",options:NodeRequestOptionsInternal,callbacks:NodeRequestCallbacksInternal,requestOperation:NodeRequestOperationInternal):NodeRequestHandleInternal{return adaptNodeRequest(protocol,options,callbacks,requestOperation);}
 const unavailableBundledRoots=Object.freeze([] as string[]);
 function readProductionBundledRoots():readonly string[]{try{return tls.rootCertificates;}catch{return unavailableBundledRoots;}}
 const productionBundledRoots=readProductionBundledRoots();
