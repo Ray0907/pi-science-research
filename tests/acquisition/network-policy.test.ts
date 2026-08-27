@@ -2,6 +2,12 @@ import { types as utilTypes } from "node:util";
 
 import { describe, expect, test, vi } from "vitest";
 
+const canonicalCounter = vi.hoisted(() => ({ calls: 0 }));
+vi.mock("../../src/crypto/canonical-json.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/crypto/canonical-json.js")>();
+  return { ...actual, canonicalJson(value: unknown) { canonicalCounter.calls += 1; return actual.canonicalJson(value); } };
+});
+
 import { canonicalJson } from "../../src/crypto/canonical-json.js";
 import { sha256Hex } from "../../src/crypto/hash.js";
 import {
@@ -195,6 +201,27 @@ describe("fixed-origin URL, IP, and DNS policy", () => {
     expect(await asyncCode(() => resolveAllSafeProviderAddressesInternal(validated(), undefined, { capabilityKind: "acquisition-dns-resolver" }))).toBe("network.invalid-input");
   });
 
+  test("validates signal authenticity before URL data while deferring initial cancellation until after URL validation", async () => {
+    const fakeSignal = { aborted: false } as AbortSignal;
+    const prototypeSignal = Object.create(AbortSignal.prototype) as AbortSignal;
+    const genuine = new AbortController();
+    const proxiedSignal = new Proxy(genuine.signal, {});
+    const hostileValidated = {} as never;
+    const originalDescriptors = Object.getOwnPropertyDescriptors;let validatedTouches = 0;
+    const descriptorsSpy = vi.spyOn(Object, "getOwnPropertyDescriptors").mockImplementation((value) => { if (value === hostileValidated) { validatedTouches += 1;throw new Error("SECRET URL touch"); }return originalDescriptors(value); });
+    try {
+      for (const signal of [fakeSignal, prototypeSignal, proxiedSignal]) expect(await asyncCode(() => resolveAllSafeProviderAddressesInternal(hostileValidated, undefined, resolverWith([]).resolver, signal))).toBe("network.invalid-input");
+    } finally { descriptorsSpy.mockRestore(); }
+    expect(validatedTouches).toBe(0);
+
+    let resolverCalls = 0;const noCall = createAcquisitionDnsResolver({ resolveAll: async () => { resolverCalls += 1;return []; }, close: () => undefined });
+    const aborted = new AbortController();aborted.abort(new Error("SECRET abort reason"));
+    const invalidUrl = { ...validated(), url: "https://evil.example/", origin: "https://evil.example", hostname: "evil.example", hostHeader: "evil.example" };
+    expect(await asyncCode(() => resolveAllSafeProviderAddressesInternal(invalidUrl, undefined, noCall, aborted.signal))).toBe("network.origin-forbidden");
+    expect(await asyncCode(() => resolveAllSafeProviderAddressesInternal(validated(), undefined, noCall, aborted.signal))).toBe("network.cancelled");
+    expect(resolverCalls).toBe(0);
+  });
+
   test("accepts undefined signal and validates genuine signal only when present while isolating fake resolver cancellation", async () => {
     const nativeAborted = Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")!.get!;
     const seen: AbortSignal[] = [];
@@ -230,6 +257,16 @@ describe("fixed-origin URL, IP, and DNS policy", () => {
     expect(reads).toBe(0); expect(resolverCalls).toBe(0);
     expect(await asyncCode(() => resolveAllSafeProviderAddressesInternal(validated(), { maxDnsAddresses: 65 }, fake))).toBe("network.invalid-options");
     expect(await asyncCode(() => resolveAllSafeProviderAddressesInternal(validated(), { unknown: 1 } as never, fake))).toBe("network.invalid-options");
+  });
+
+  test("rejects every unpaired surrogate structurally before canonical URL byte checks", () => {
+    const base = "https://api.crossref.org/";
+    const malformed = [
+      `${base}\ud800`, `${base}\udfff`, `${base}a\ud800b`, `${base}a\udfffb`,
+      `${base}${"a".repeat(16_384-base.length-1)}\ud800`,
+      `${base}${"a".repeat(16_385-base.length-1)}\ud800`,
+    ];
+    for (const input of malformed) { canonicalCounter.calls = 0;expect(code(() => validateFixedProviderUrl("crossref", input))).toBe("network.invalid-input");expect(canonicalCounter.calls).toBe(0); }
   });
 
   test("reports exact redacted NetworkPolicyError codes", async () => {
