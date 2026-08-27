@@ -543,6 +543,8 @@ describe("immutable acquisition contracts", () => {
     expect(errorCode(() => validateAcademicAcquisitionResult(result({ candidates: [conflictA, conflictB], candidateGroups: [{ ...conflictGroup, status: "compatible", groupKey: group([conflictA, conflictB], { identityKind: "canonical-url", identityValueSha256: sha256Hex(canonicalJson(conflictA.canonicalUrl)), status: "compatible" }).groupKey }] })))).toBe("acquisition-contract.invalid-key");
   });
 
+  test("allows result aggregate scalars above public 8MiB through the exact 67MiB result preflight", () => { const largeQueries=Array.from({length:9},(_,index)=>`${index}${"x".repeat(949_999)}`);expect(Buffer.byteLength(canonicalJson(result({normalizedQueries:largeQueries})),"utf8")).toBeGreaterThan(8_388_608);expect(validateAcademicAcquisitionResult(result({normalizedQueries:largeQueries})).normalizedQueries).toHaveLength(9); });
+
   test("preflights result collection hard counts and keeps grouping bounded without diagnostic exports", () => {
     let touched = false; const hostile = Array(1_001).fill(candidate());
     Object.defineProperty(hostile, "1000", { enumerable: true, get() { touched = true; throw new Error("untouched"); } });
