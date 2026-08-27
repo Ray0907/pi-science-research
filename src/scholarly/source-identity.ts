@@ -7,6 +7,7 @@ import { RequestRecordSchema, type RequestRecord } from "../domain/events.js";
 import { SourceRecordSchema, type SourceRecord } from "../domain/research-records.js";
 import { parse } from "../domain/schema.js";
 import { assertBoundedStructure, StructuralLimitError } from "../storage/bounded-structure.js";
+import { encodeNonNegativeSafeIntegerInternal, stableSortByCodeUnitKeyInternal } from "./code-unit-order-internal.js";
 import {
   ScholarlyIdentifierError,
   canonicalDoiUrl,
@@ -282,7 +283,7 @@ function buildRequestProvenanceIndexInternal(
   for (const { record } of validatedSources) validateSourceSemantics(record);
   const sourceChains = revisionChains(validatedSources, true);
   const orderedSources = [...sourceChains.values()].flat();
-  const orderedRequests = sortByCodeUnitKey(validatedRequests, ({ record }) => record.requestId);
+  const orderedRequests = stableSortByCodeUnitKeyInternal(validatedRequests, ({ record }) => record.requestId);
   const indexedRequests = orderedRequests.map((request) => indexRequestUrls(request, normalized, diagnostics));
 
   const requestsById = new Map<string, IndexedRequest>();
@@ -658,7 +659,7 @@ function mergeValidated(existing: readonly ValidatedSource[], incoming: readonly
       incoming: true,
     });
   }
-  const orderedNodes = sortByCodeUnitKey(nodes, ({ id }) => id);
+  const orderedNodes = stableSortByCodeUnitKeyInternal(nodes, ({ id }) => id);
   nodes.splice(0, nodes.length, ...orderedNodes);
   const union = new UnionFind(nodes.length);
   const strong = new Map<string, number>();
@@ -711,7 +712,7 @@ function mergeValidated(existing: readonly ValidatedSource[], incoming: readonly
       ? existingById.get(retainedId)!.at(-1)!
       : componentNodes.find(({ id }) => id === retainedId)!.current;
     const base = baseValidated.record;
-    const candidates = sortByCodeUnitKey(componentNodes.map(({ current }) => current),
+    const candidates = stableSortByCodeUnitKeyInternal(componentNodes.map(({ current }) => current),
       ({ record, json }) => `${record.sourceId}\0${json}`).map(({ record }) => record);
     const retainedEffectiveIdentifiers = componentNodes.find(({ id }) => id === retainedId)!.authoritativeIdentifiers;
     const merged = mergeGroup(
@@ -730,10 +731,10 @@ function mergeValidated(existing: readonly ValidatedSource[], incoming: readonly
       output.push(created); changed.push(ref(created));
     }
   }
-  const orderedOutput = [...output].sort(compareSourceRefs);
-  const orderedConflicts = sortByCodeUnitKey(conflicts, (value) => `${value.code}\0${value.field}\0${canonicalJson(value)}`);
-  const orderedChanged = [...changed].sort(compareSourceRefs);
-  const canonicalAliases = Object.fromEntries(sortByCodeUnitKey(Object.entries(aliases), ([sourceId]) => sourceId));
+  const orderedOutput = stableSortByCodeUnitKeyInternal(output, sourceRefOrderKey);
+  const orderedConflicts = stableSortByCodeUnitKeyInternal(conflicts, (value) => `${value.code}\0${value.field}\0${canonicalJson(value)}`);
+  const orderedChanged = stableSortByCodeUnitKeyInternal(changed, sourceRefOrderKey);
+  const canonicalAliases = Object.fromEntries(stableSortByCodeUnitKeyInternal(Object.entries(aliases), ([sourceId]) => sourceId));
   return deepFreeze({ sources: orderedOutput, aliases: canonicalAliases, conflicts: orderedConflicts, changedSourceRefs: orderedChanged });
 }
 
@@ -755,12 +756,12 @@ function revisionChains(records: readonly ValidatedSource[], existing: boolean):
     revisions.set(record.record.revision, record);
     indexed.set(record.record.sourceId, revisions);
   }
-  const orderedIds = sortByCodeUnitKey([...indexed.keys()], (value) => value);
+  const orderedIds = stableSortByCodeUnitKeyInternal([...indexed.keys()], (value) => value);
   const groups = new Map<string, ValidatedSource[]>();
   for (const sourceId of orderedIds) {
     const revisions = indexed.get(sourceId)!;
     if (!existing) {
-      groups.set(sourceId, [...revisions.values()].sort((left, right) => left.record.revision - right.record.revision));
+      groups.set(sourceId, stableSortByCodeUnitKeyInternal([...revisions.values()], ({ record }) => encodeNonNegativeSafeIntegerInternal(record.revision)));
       continue;
     }
     const list: ValidatedSource[] = [];
@@ -834,10 +835,10 @@ function mergeGroup(
       conflicts.push(conflict("source.metadata-conflict", "peerReviewStatus", [merged, candidate], [merged.peerReviewStatus, candidate.peerReviewStatus]));
   }
   merged.authors = sortedCanonicalValues(authors);
-  merged.retrievalRequestIds = sortByCodeUnitKey([...retrievalRequestIds], (value) => value);
+  merged.retrievalRequestIds = stableSortByCodeUnitKeyInternal([...retrievalRequestIds], (value) => value);
   merged.metadataProvenance = sortedCanonicalValues(metadataProvenance);
-  merged.lineage.cohortIds = sortByCodeUnitKey([...cohortIds], (value) => value);
-  merged.lineage.datasetIds = sortByCodeUnitKey([...datasetIds], (value) => value);
+  merged.lineage.cohortIds = stableSortByCodeUnitKeyInternal([...cohortIds], (value) => value);
+  merged.lineage.datasetIds = stableSortByCodeUnitKeyInternal([...datasetIds], (value) => value);
   const sortedRelations = sortedCanonicalValues(relations);
   merged.lineage.relatedSourceIds = sortedRelations.map(({ id }) => id);
   merged.lineage.relationTypes = sortedRelations.map(({ type }) => type);
@@ -847,8 +848,8 @@ function mergeGroup(
 function conflict(code: SourceMergeConflict["code"], field: string, records: readonly SourceRecord[], values: readonly unknown[]): SourceMergeConflict {
   return deepFreeze({
     code, field,
-    sourceIds: sortByCodeUnitKey([...new Set(records.map(({ sourceId }) => sourceId))], (value) => value),
-    canonicalValueHashes: sortByCodeUnitKey([...new Set(values.map((value) => sha256Hex(canonicalJson(value))))], (value) => value),
+    sourceIds: stableSortByCodeUnitKeyInternal([...new Set(records.map(({ sourceId }) => sourceId))], (value) => value),
+    canonicalValueHashes: stableSortByCodeUnitKeyInternal([...new Set(values.map((value) => sha256Hex(canonicalJson(value))))], (value) => value),
   });
 }
 function hasProvenance(record: SourceRecord, field: string): boolean {
@@ -971,7 +972,7 @@ function validatePolicyOptions(policy: Record<string, unknown>): {
     catch (error) { if (error instanceof SourceIdentityError) throw error; return fail("source.invalid-options"); }
     seen.add(host); hosts.push(host);
   }
-  const orderedHosts = sortByCodeUnitKey(hosts, (host) => host);
+  const orderedHosts = stableSortByCodeUnitKeyInternal(hosts, (host) => host);
   return {
     allowHttp: true, approvedHttpHosts: Object.freeze(orderedHosts), accessPolicySha256: policy.accessPolicySha256,
     maxApprovedHttpHosts: maxHosts as number,
@@ -1073,13 +1074,10 @@ function addCanonical<T>(target: Map<string, T>, values: readonly T[]): void {
   }
 }
 function sortedCanonicalValues<T>(values: ReadonlyMap<string, T>): T[] {
-  return sortByCodeUnitKey([...values.keys()], (encoded) => encoded).map((encoded) => JSON.parse(encoded) as T);
+  return stableSortByCodeUnitKeyInternal([...values.keys()], (encoded) => encoded).map((encoded) => JSON.parse(encoded) as T);
 }
 function radixSortWitnesses(values: readonly Witness[]): Witness[] {
-  return sortByCodeUnitKey(values, ({ key }) => key);
-}
-function sortByCodeUnitKey<T>(values: readonly T[], key: (value: T) => string): T[] {
-  return [...values].sort((left, right) => { const leftKey = key(left); const rightKey = key(right); return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0; });
+  return stableSortByCodeUnitKeyInternal(values, ({ key }) => key);
 }
 function checkedAdd(left: number, right: number): number {
   const value = left + right;
@@ -1087,7 +1085,7 @@ function checkedAdd(left: number, right: number): number {
   return value;
 }
 function ref(record: SourceRecord): { sourceId: string; revision: number } { return Object.freeze({ sourceId: record.sourceId, revision: record.revision }); }
-function compareSourceRefs(left: Readonly<{ sourceId: string; revision: number }>, right: Readonly<{ sourceId: string; revision: number }>): number { return left.sourceId < right.sourceId ? -1 : left.sourceId > right.sourceId ? 1 : left.revision - right.revision; }
+function sourceRefOrderKey(value: Readonly<{ sourceId: string; revision: number }>): string { return `${value.sourceId}\0${encodeNonNegativeSafeIntegerInternal(value.revision)}`; }
 function isPlain(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
 }

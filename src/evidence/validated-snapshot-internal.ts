@@ -14,6 +14,7 @@ import {
   type VerificationRecord,
 } from "../domain/research-records.js";
 import { parse } from "../domain/schema.js";
+import { encodeNonNegativeSafeIntegerInternal, stableSortByCodeUnitKeyInternal } from "../scholarly/code-unit-order-internal.js";
 import {
   buildLineageGraphFromValidatedSourcesForEvidenceSnapshotInternal,
   getLineageDependencyComponentCountInternal, LineageError, type LineageErrorCode, type LineageGraph,
@@ -343,7 +344,7 @@ function makePublicIndexes(
 }
 
 function orderPrepared<T>(kind: SnapshotRecordKind, values: readonly Prepared<T>[]): Prepared<T>[] {
-  return [...values].sort((left, right) => { const leftId = stableId(kind, left.record); const rightId = stableId(kind, right.record); if (leftId !== rightId) return leftId < rightId ? -1 : 1; return ((left.record as { revision?: number }).revision ?? 0) - ((right.record as { revision?: number }).revision ?? 0); });
+  return stableSortByCodeUnitKeyInternal(values, ({ record }) => `${stableId(kind, record)}\0${encodeNonNegativeSafeIntegerInternal((record as { revision?: number }).revision ?? 0)}`);
 }
 function prepareEvidenceKind(
   inputs: readonly unknown[], expected: "claim" | "evidence" | "verification", maxBytes: number,
@@ -481,7 +482,7 @@ function preflightReferences(prepared: Record<SnapshotRecordKind, readonly Prepa
   return count;
 }
 function preflightLineageComponents(sources: readonly SourceRecord[], maximum: number): void {
-  const ids = sortByCodeUnitKey([...new Set(sources.map(({ sourceId }) => sourceId))], (value) => value);
+  const ids = stableSortByCodeUnitKeyInternal([...new Set(sources.map(({ sourceId }) => sourceId))], (value) => value);
   const indexById = new Map(ids.map((id, index) => [id, index] as const));
   const parent = ids.map((_, index) => index);
   const find = (value: number): number => { let root = value; while (parent[root] !== root) root = parent[root]!; while (parent[value] !== value) { const next = parent[value]!; parent[value] = root; value = next; } return root; };
@@ -525,7 +526,7 @@ function assembleCanonicalSet(prepared: Record<SnapshotRecordKind, readonly Prep
   return `{${KIND_ORDER.map((kind) => `${canonicalJson(kind)}:[${prepared[kind].map(({ json }) => json).join(",")}]`).join(",")}}`;
 }
 function auditSourceIdentities(sources: readonly SourceRecord[], diagnostics?: EvidenceSnapshotDiagnostics): void {
-  const sourceIds = sortByCodeUnitKey([...new Set(sources.map(({ sourceId }) => sourceId))], (value) => value);
+  const sourceIds = stableSortByCodeUnitKeyInternal([...new Set(sources.map(({ sourceId }) => sourceId))], (value) => value);
   const indexById = new Map(sourceIds.map((id, index) => [id, index] as const));
   const parent = sourceIds.map((_, index) => index);
   const find = (value: number): number => { let root = value; while (parent[root] !== root) root = parent[root]!; while (parent[value] !== value) { const next = parent[value]!; parent[value] = root; value = next; } return root; };
@@ -583,7 +584,7 @@ function referencesFor(kind: SnapshotRecordKind, record: any, latest: Map<string
   if (kind === "evidence") { refs.push({ kind: "claims", id: record.claimRef.claimId, revision: record.claimRef.revision }); if (record.sourceRef) refs.push({ kind: "sources", id: record.sourceRef.sourceId, revision: record.sourceRef.revision }); if (record.calculationId) refs.push({ kind: "calculations", id: record.calculationId, revision: null }); for (const id of record.conflictsWith) refs.push(latestRef("evidence", id)); }
   if (kind === "verifications") { for (const ref of record.checkedClaims) refs.push({ kind: "claims", id: ref.claimId, revision: ref.revision }); for (const ref of record.checkedEvidence) refs.push({ kind: "evidence", id: ref.evidenceId, revision: ref.revision }); for (const id of record.requestIds) refs.push({ kind: "requests", id, revision: null }); for (const id of record.calculationIds) refs.push({ kind: "calculations", id, revision: null }); for (const c of record.corrections) refs.push(latestRef("claims", c.claimId)); for (const id of record.independentEvidenceIds) refs.push(latestRef("evidence", id)); }
   if (kind === "requests") for (const id of record.resultSourceIds) refs.push(latestRef("sources", id));
-  return refs.map((ref) => deepFreeze(ref));
+  return stableSortByCodeUnitKeyInternal(refs, snapshotRecordOrderKey).map((ref) => deepFreeze(ref));
 }
 function validateSymmetricConflicts(records: CanonicalEvidenceSet, latest: Map<string, number>): void {
   const latestClaims = new Map(records.claims.filter((r) => latest.get(latestKey("claims", r.claimId)) === r.revision).map((r) => [r.claimId, r]));
@@ -594,6 +595,7 @@ function validateSymmetricConflicts(records: CanonicalEvidenceSet, latest: Map<s
 function keyForRecord(kind: SnapshotRecordKind, record: any): SnapshotRecordKey { const id = stableId(kind, record); return Object.freeze({ kind, id, revision: ["sources", "claims", "evidence", "verifications"].includes(kind) ? record.revision : null }); }
 function stableId(kind: SnapshotRecordKind, record: any): string { return kind === "sources" ? record.sourceId : kind === "claims" ? record.claimId : kind === "evidence" ? record.evidenceId : kind === "verifications" ? record.verificationId : kind === "requests" ? record.requestId : record.calculationId; }
 function recordKey(key: SnapshotRecordKey): string { return `${key.kind}\0${key.id}\0${key.revision ?? 0}`; }
+function snapshotRecordOrderKey(key: SnapshotRecordKey): string { return `${key.kind}\0${key.id}\0${encodeNonNegativeSafeIntegerInternal(key.revision === -1 ? 0 : key.revision ?? 0)}`; }
 function latestKey(kind: string, id: string): string { return `${kind}\0${id}`; }
 const REVISION_KINDS = ["sources", "claims", "evidence", "verifications"] as const;
 const SNAPSHOT_KINDS = [...REVISION_KINDS, "requests", "calculations"] as const;
@@ -664,7 +666,4 @@ function sumCounts(values: number[], code: any): number { let total = 0; for (co
 function checkedAdd(left: number, right: number, code: any): number { const result = left + right; if (!Number.isSafeInteger(result)) fail(code); return result; }
 function isPlain(value: unknown): value is Record<string, any> { return value !== null && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype; }
 function deepFreeze<T>(value: T): T { if (value && typeof value === "object" && !Object.isFrozen(value)) { for (const child of Object.values(value as any)) deepFreeze(child); Object.freeze(value); } return value; }
-function sortByCodeUnitKey<T>(values: readonly T[], key: (value: T) => string): T[] {
-  return [...values].sort((left, right) => { const leftKey = key(left); const rightKey = key(right); return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0; });
-}
 function fail(code: any): never { throw new EvidenceAdmissionError(code); }

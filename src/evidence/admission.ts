@@ -15,6 +15,7 @@ import {
 } from "../domain/research-records.js";
 import { parse } from "../domain/schema.js";
 import { assertBoundedStructure, StructuralLimitError } from "../storage/bounded-structure.js";
+import { encodeNonNegativeSafeIntegerInternal, stableSortByCodeUnitKeyInternal } from "../scholarly/code-unit-order-internal.js";
 import type { SourceUrlPolicyContext } from "../scholarly/identifiers.js";
 import type { RequestProvenanceIndex } from "../scholarly/source-identity.js";
 import { getLineageRelationComponentKeyInternal, LineageError } from "./lineage.js";
@@ -262,8 +263,8 @@ export function evaluateEvidenceRule(
   if (independentRequired) blockers.push("claim.independent-verification-required");
   if (effectiveIndependentCount < effectiveMinimum && !independentRequired) blockers.push("claim.insufficient-lineages");
 
-  const supportingEvidenceRefs = Object.freeze(qualifying.map(({ evidence }) => ({ evidenceId: evidence.evidenceId, revision: evidence.revision })).sort(refCompare));
-  const contradictingEvidenceRefs = Object.freeze(contradictions.map(({ evidenceId, revision }) => ({ evidenceId, revision })).sort(refCompare));
+  const supportingEvidenceRefs = Object.freeze(stableSortByCodeUnitKeyInternal(qualifying.map(({ evidence }) => ({ evidenceId: evidence.evidenceId, revision: evidence.revision })), evidenceRefOrderKey));
+  const contradictingEvidenceRefs = Object.freeze(stableSortByCodeUnitKeyInternal(contradictions.map(({ evidenceId, revision }) => ({ evidenceId, revision })), evidenceRefOrderKey));
   return deepFreeze({
     claimRef: { claimId: String(target.claimId), revision: Number(target.revision) }, passes: blockers.length === 0,
     supportingEvidenceRefs, contradictingEvidenceRefs, retrievedComponentCount, derivedComponentCount, resolvedLineageCount,
@@ -401,10 +402,8 @@ function buildConflictClosure(
     }
   }
   return {
-    evidence: [...contradictions.values()].sort((left, right) => refCompare(
-      { evidenceId: String(left.evidenceId), revision: Number(left.revision) }, { evidenceId: String(right.evidenceId), revision: Number(right.revision) },
-    )),
-    claims: [...conflictingClaims.values()].sort((left, right) => left.claimId < right.claimId ? -1 : left.claimId > right.claimId ? 1 : left.revision - right.revision),
+    evidence: stableSortByCodeUnitKeyInternal([...contradictions.values()], evidenceRefOrderKey),
+    claims: stableSortByCodeUnitKeyInternal([...conflictingClaims.values()], claimRefOrderKey),
   };
 }
 function selectApplicableVerifications(records: readonly VerificationRecord[], target: ClaimRecord): VerificationRecord[] {
@@ -412,7 +411,7 @@ function selectApplicableVerifications(records: readonly VerificationRecord[], t
   for (const record of records) if (record.checkedClaims.some((ref) => ref.claimId === target.claimId && ref.revision === target.revision)) {
     const prior = selected.get(record.verificationId); if (!prior || prior.revision < record.revision) selected.set(record.verificationId, record);
   }
-  return [...selected.values()].sort((a, b) => a.verificationId < b.verificationId ? -1 : a.verificationId > b.verificationId ? 1 : a.revision - b.revision);
+  return stableSortByCodeUnitKeyInternal([...selected.values()], verificationRefOrderKey);
 }
 function independentCredit(
   verifications: VerificationRecord[], target: ClaimRecord, indexes: ReturnType<typeof getValidatedSnapshotIndexes>,
@@ -439,8 +438,8 @@ function independentCredit(
       if (qualified.key && !baseKeys.has(qualified.key)) candidates.push({ verificationId: verification.verificationId, revision: verification.revision, key: qualified.key });
     }
   }
-  candidates.sort((a, b) => a.verificationId < b.verificationId ? -1 : a.verificationId > b.verificationId ? 1 : a.revision - b.revision || (a.key < b.key ? -1 : 1));
-  return candidates.length > 0 ? 1 : 0;
+  const orderedCandidates = stableSortByCodeUnitKeyInternal(candidates, (candidate) => `${verificationRefOrderKey(candidate)}\0${candidate.key}`);
+  return orderedCandidates.length > 0 ? 1 : 0;
 }
 function conflictsResolved(
   verifications: VerificationRecord[], target: ClaimRecord, supporting: QualifiedEvidence[], contradictions: EvidenceRecord[],
@@ -534,9 +533,11 @@ function validateEvaluationOptions(options?: Readonly<{ maxEvidencePerClaim?: nu
 function uniqueEvidenceRefs(refs: readonly any[]): Array<{ evidenceId: string; revision: number }> {
   const unique = new Map<string, { evidenceId: string; revision: number }>();
   for (const ref of refs) { const value = { evidenceId: String(ref.evidenceId), revision: Number(ref.revision) }; unique.set(`${value.evidenceId}\0${value.revision}`, value); }
-  return [...unique.values()].sort(refCompare);
+  return stableSortByCodeUnitKeyInternal([...unique.values()], evidenceRefOrderKey);
 }
-function refCompare(left: { evidenceId: string; revision: number }, right: { evidenceId: string; revision: number }): number { return left.evidenceId < right.evidenceId ? -1 : left.evidenceId > right.evidenceId ? 1 : left.revision - right.revision; }
+function evidenceRefOrderKey(value: Readonly<{ evidenceId: string; revision: number }>): string { return `${value.evidenceId}\0${encodeNonNegativeSafeIntegerInternal(value.revision)}`; }
+function claimRefOrderKey(value: Readonly<{ claimId: string; revision: number }>): string { return `${value.claimId}\0${encodeNonNegativeSafeIntegerInternal(value.revision)}`; }
+function verificationRefOrderKey(value: Readonly<{ verificationId: string; revision: number }>): string { return `${value.verificationId}\0${encodeNonNegativeSafeIntegerInternal(value.revision)}`; }
 function checkedAdd(left: number, right: number): number { const result = left + right; if (!Number.isSafeInteger(result)) fail("evidence.input-too-large"); return result; }
 function asciiTrim(value: string): string { return value.replace(/^[\t\n\v\f\r ]+|[\t\n\v\f\r ]+$/gu, ""); }
 function isPlain(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype; }

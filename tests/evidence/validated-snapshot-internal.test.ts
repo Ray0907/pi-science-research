@@ -8,6 +8,7 @@ import type { ClaimRecord, EvidenceRecord, SourceRecord } from "../../src/domain
 import {
   EvidenceAdmissionError,
   buildBoundedValidatedEvidenceSnapshot,
+  evaluateEvidenceRule,
   type CanonicalEvidenceSet,
   type EvidenceAdmissionErrorCode,
   type EvidenceSnapshotDiagnostics,
@@ -50,8 +51,15 @@ function code(action: () => unknown): string | undefined {
   try { action(); } catch (error) { expect(error).toBeInstanceOf(EvidenceAdmissionError); return (error as EvidenceAdmissionError).code; }
   return undefined;
 }
+function withoutComparisonSort<T>(action: () => T): T {
+  const original = Array.prototype.sort;
+  Array.prototype.sort = function (this: unknown[], compareFn?: (left: unknown, right: unknown) => number): unknown[] { if (compareFn !== undefined) throw new Error("comparison sort invoked"); return original.call(this); } as typeof Array.prototype.sort;
+  try { return action(); } finally { Array.prototype.sort = original; }
+}
 
 describe("validated evidence snapshot internals", () => {
+  test("builds reversed and shuffled 10k canonical inputs byte-identically with linear diagnostics", () => { const sources = Array.from({ length: 10_000 }, (_, index) => { const suffix = String(index).padStart(8, "0"); return source({ sourceId: `src-snapshot.${suffix}`, identifiers: { doi: `10.1234/radix.${suffix}`, pmid: null, pmcid: null }, canonicalUrl: `https://doi.org/10.1234/radix.${suffix}`, title: `Radix ${suffix}` }); }); const shuffled = sources.map((_value, index) => sources[(index * 7919) % sources.length]!); const empty = { claims: [], evidence: [], verifications: [], requests: [], calculations: [] } as const; const firstVisits = diagnostics(); const secondVisits = diagnostics(); const first = withoutComparisonSort(() => buildBoundedValidatedEvidenceSnapshot({ sources: [...sources].reverse(), ...empty }, undefined, firstVisits)); const second = withoutComparisonSort(() => buildBoundedValidatedEvidenceSnapshot({ sources: shuffled, ...empty }, undefined, secondVisits)); expect(first.snapshotSha256).toBe(second.snapshotSha256); expect(canonicalJson(first.records)).toBe(canonicalJson(second.records)); expect(firstVisits).toEqual(secondVisits); expect(firstVisits).toMatchObject({ canonicalRecordVisits: 10_000, revisionIndexInsertions: 10_000, sourceIdentityVisits: 10_000, lineageVisits: 10_000, referenceVisits: 0 }); });
+  test("builds and evaluates canonical records without comparison sort", () => { const visits = diagnostics(); const snapshot = withoutComparisonSort(() => buildBoundedValidatedEvidenceSnapshot(records(), undefined, visits)); const result = withoutComparisonSort(() => evaluateEvidenceRule(snapshot, { claimId: claim().claimId, revision: 1 })); expect(result.supportingEvidenceRefs).toEqual([{ evidenceId: evidence().evidenceId, revision: 1 }]); expect(visits).toMatchObject({ canonicalRecordVisits: 3, revisionIndexInsertions: 3 }); });
   test("builds one immutable bounded validated evidence snapshot in linear visits", () => {
     const visits = diagnostics(); const snapshot = buildBoundedValidatedEvidenceSnapshot(records(), undefined, visits);
     expect(visits.canonicalRecordVisits).toBe(3);

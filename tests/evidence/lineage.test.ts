@@ -76,8 +76,14 @@ function code(action: () => unknown): LineageErrorCode | undefined {
 function decision(graph: ReturnType<typeof buildLineageGraph>, left: SourceRecord, right: SourceRecord, leftRevision = left.revision, rightRevision = right.revision) {
   return compareSourceIndependence(graph, ref(left, leftRevision), ref(right, rightRevision));
 }
+function withoutComparisonSort<T>(action: () => T): T {
+  const original = Array.prototype.sort;
+  Array.prototype.sort = function (this: unknown[], compareFn?: (left: unknown, right: unknown) => number): unknown[] { if (compareFn !== undefined) throw new Error("comparison sort invoked"); return original.call(this); } as typeof Array.prototype.sort;
+  try { return action(); } finally { Array.prototype.sort = original; }
+}
 
 describe("source lineage", () => {
+  test("builds shuffled and reversed 10k revisions and lineage edges without comparison sort", () => { const revisionBase = source("src-radix.revisions"); const revisions = Array.from({ length: 10_000 }, (_, index) => ({ ...revisionBase, revision: index + 1 })); const limits = { maxRevisions: 10_000, maxStableSources: 10_000, maxGraphNodes: 20_000, maxEdges: 10_000, maxSourceRecordCanonicalBytes: 1_048_576, maxAggregateCanonicalBytes: 67_108_864 }; const revisionGraph = withoutComparisonSort(() => buildLineageGraph([...revisions].reverse(), limits)); expect(revisionGraph.revisionCount).toBe(10_000); expect(revisionGraph.sourceRefs.at(-1)).toEqual({ sourceId: revisionBase.sourceId, revision: 10_000 }); const sources = Array.from({ length: 10_000 }, (_, index) => source(`src-radix.${String(index).padStart(8, "0")}`)); const targetIds = sources.slice(1).map(({ sourceId }) => sourceId); sources[0] = withLineage(sources[0]!, { relatedSourceIds: [...targetIds].reverse(), relationTypes: targetIds.map(() => "reports") }); const shuffled = sources.map((_value, index) => sources[(index * 7919) % sources.length]!); const first = withoutComparisonSort(() => buildLineageGraph(shuffled, limits)); const secondSources = [...sources]; secondSources[0] = withLineage(secondSources[0]!, { relatedSourceIds: targetIds, relationTypes: targetIds.map(() => "reports") }); const second = withoutComparisonSort(() => buildLineageGraph([...secondSources].reverse(), limits)); expect(first.edgeCount).toBe(9_999); expect(first.revisionCount).toBe(10_000); expect(canonicalJson(first)).toBe(canonicalJson(second)); expect(first.nodeCount).toBe(second.nodeCount); expect(getLineageRelationComponentKeyInternal(first, ref(sources[0]!))).toBe(getLineageRelationComponentKeyInternal(second, ref(secondSources[0]!))); });
   test("classifies shared studies cohorts datasets and weak dependency components as dependent", () => {
     const studyA = withLineage(source("src-study.a0000001"), { studyId: "study-shared" });
     const studyB = withLineage(source("src-study.b0000001"), { studyId: "study-shared" });
