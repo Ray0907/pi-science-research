@@ -1,7 +1,8 @@
 import {describe,expect,test,vi} from "vitest";
 
 import {normalizeAcquisitionOptions,type AcademicNcbiProviderOptions} from "../../src/acquisition/contracts.js";
-import {createContentDecodeCapabilitiesInternal,createSecureJsonTransport,createSecureTransportCapabilitiesInternal} from "../../src/acquisition/content-decoding-internal.js";
+import {createContentDecodeCapabilitiesInternal} from "../../src/acquisition/content-decoding-internal.js";
+import {createSecureJsonTransport,createSecureTransportCapabilitiesInternal} from "../../src/acquisition/secure-json-transport-internal.js";
 import {createNodeRuntimeCapabilitiesInternal,createPinnedHopRuntimeInternal} from "../../src/acquisition/node-pinned-hop-internal.js";
 import {createNodeRequestDeadlineSchedulerCapabilitiesInternal,createRequestDeadlineInternal,createRequestDeadlineSchedulerCapabilitiesInternal} from "../../src/acquisition/request-deadline-internal.js";
 import type {SecureTransportRequest} from "../../src/acquisition/transport.js";

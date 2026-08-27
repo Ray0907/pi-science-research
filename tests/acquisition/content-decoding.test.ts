@@ -3,7 +3,8 @@ import path from "node:path";
 import {describe,expect,test,vi} from "vitest";
 
 import {normalizeAcquisitionOptions,type AcademicNcbiProviderOptions,type AcademicTransportOptions} from "../../src/acquisition/contracts.js";
-import {createContentDecodeCapabilitiesInternal,createNodeContentDecodeCapabilitiesInternal,createSecureJsonTransport,createSecureTransportCapabilitiesInternal,openSecureTransportRequestInternal,type ContentDecodeOperationsDescriptorInternal} from "../../src/acquisition/content-decoding-internal.js";
+import {createContentDecodeCapabilitiesInternal,createNodeContentDecodeCapabilitiesInternal,type ContentDecodeOperationsDescriptorInternal} from "../../src/acquisition/content-decoding-internal.js";
+import {createSecureJsonTransport,createSecureTransportCapabilitiesInternal,openSecureTransportRequestInternal} from "../../src/acquisition/secure-json-transport-internal.js";
 import {getProviderJsonSettlementInternal,scanAndParseProviderJsonInternal,snapshotProviderJsonInternal} from "../../src/acquisition/json-wire-scanner-internal.js";
 import {createNodeRuntimeCapabilitiesInternal,createPinnedHopRuntimeInternal} from "../../src/acquisition/node-pinned-hop-internal.js";
 import {assertRequestDeadlineOwnedByInternal,createNodeRequestDeadlineSchedulerCapabilitiesInternal} from "../../src/acquisition/request-deadline-internal.js";
