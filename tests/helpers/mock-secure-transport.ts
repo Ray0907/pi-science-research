@@ -13,6 +13,7 @@ export interface MockSecureTransportControl {
   resolvers:Array<{resolver:NodeResolverInternal;cancelCount:number;destroyCount:number}>;
   resolve4:(hostname:string)=>Promise<readonly string[]>;
   resolve6:(hostname:string)=>Promise<readonly string[]>;
+  onRequest?:(callbacks:NodeRequestCallbacksInternal)=>void;
 }
 
 /** Fake-only capability source; contains no network or process operations. */
@@ -26,6 +27,6 @@ export function createMockSecureTransportCapabilities():MockSecureTransportContr
     bundledRootCertificates:Object.freeze(["TEST ROOT A","TEST ROOT B"]),checkServerIdentity:()=>undefined,
     clock:{monotonicNow:()=>control.now,timestampNow:()=>control.timestampNow(),setTimer:(callback)=>{const id=++timerId;timers.set(id,callback);return id;},clearTimer:(handle)=>{timers.delete(handle as number);}},
   };
-  function makeRequest(options:NodeRequestOptionsInternal,callbacks:NodeRequestCallbacksInternal):NodeRequestHandleInternal { const counts={end:0,abort:0,destroy:0};const handle={end:()=>{counts.end+=1;},abort:()=>{counts.abort+=1;},destroy:()=>{counts.destroy+=1;}};requests.push({options,callbacks,handle,counts});return handle; }
+  function makeRequest(options:NodeRequestOptionsInternal,callbacks:NodeRequestCallbacksInternal):NodeRequestHandleInternal { const counts={end:0,abort:0,destroy:0};const handle={end:()=>{counts.end+=1;},abort:()=>{counts.abort+=1;},destroy:()=>{counts.destroy+=1;}};requests.push({options,callbacks,handle,counts});control.onRequest?.(callbacks);return handle; }
   control.ops=ops;return control;
 }

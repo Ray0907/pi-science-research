@@ -53,7 +53,7 @@ type TimerState={readonly scheduler:object;readonly raw:unknown;active:boolean};
 type DeadlineState={
   readonly scheduler:RequestDeadlineSchedulerCapabilitiesInternal;
   readonly controller:AbortController;
-  readonly deadlineAt:number;
+  deadlineAt:number;
   readonly callerSignal:AbortSignal|null;
   readonly callerListener:(()=>void)|null;
   timer:RequestDeadlineTimerHandleInternal|null;
@@ -184,13 +184,10 @@ export function createRequestDeadlineInternal(
   if(typeof totalRequestDeadlineMs!=="number"||!Number.isSafeInteger(totalRequestDeadlineMs)||totalRequestDeadlineMs<1||totalRequestDeadlineMs>300_000)fail("request-deadline.invalid-options");
   schedulerState(scheduler);
   const caller=callerSignal===undefined?null:genuineSignal(callerSignal);
-  const start=scheduler.monotonicNow();
-  const deadlineAt=start+totalRequestDeadlineMs;
-  if(!Number.isFinite(deadlineAt)||deadlineAt>Number.MAX_SAFE_INTEGER)fail("request-deadline.invalid-capability");
   const controller=new AbortController();
   let output!:RequestDeadlineInternal;
   const callerListener=caller===null?null:()=>{const state=deadlineStates.get(output);if(state)latch(state,"cancelled");};
-  const state:DeadlineState={scheduler,controller,deadlineAt,callerSignal:caller?.signal??null,callerListener,timer:null,terminal:null,dispatching:false,open:true,owner:null};
+  const state:DeadlineState={scheduler,controller,deadlineAt:0,callerSignal:caller?.signal??null,callerListener,timer:null,terminal:null,dispatching:false,open:true,owner:null};
   output=Object.freeze({
     capabilityKind:"request-deadline" as const,
     signal:controller.signal,
@@ -208,19 +205,32 @@ export function createRequestDeadlineInternal(
       const current=stateForDeadline(this,true);
       if(!current.open)return;
       current.open=false;
-      if(current.timer){current.scheduler.clearTimeout(current.timer);current.timer=null;}
-      if(current.callerSignal&&current.callerListener){
-        try{REMOVE_EVENT.call(current.callerSignal,"abort",current.callerListener);}catch{/* quarantine */}
+      const timer=current.timer;current.timer=null;
+      let cleanupError:unknown;
+      try{if(timer)current.scheduler.clearTimeout(timer);}catch(error){cleanupError=error;}
+      finally{
+        if(current.callerSignal&&current.callerListener){try{REMOVE_EVENT.call(current.callerSignal,"abort",current.callerListener);}catch{/* quarantine */}}
+        Object.freeze(current.controller.signal);
       }
-      Object.freeze(current.controller.signal);
+      if(cleanupError!==undefined)throw cleanupError;
     },
   });
   deadlineStates.set(output,state);
-  state.timer=scheduler.setTimeout(()=>latch(state,"expired"),totalRequestDeadlineMs);
   if(caller&&callerListener){
-    try{ADD_EVENT.call(caller.signal,"abort",callerListener,{once:true});}catch{return fail("request-deadline.invalid-capability");}
-    if(caller.aborted)latch(state,"cancelled");
+    try{ADD_EVENT.call(caller.signal,"abort",callerListener,{once:true});}catch{state.open=false;Object.freeze(controller.signal);return fail("request-deadline.invalid-capability");}
+    if(ABORTED_GETTER.call(caller.signal) as boolean)latch(state,"cancelled");
   }
+  let start:number;
+  try{start=scheduler.monotonicNow();}catch(error){output.close();throw error;}
+  state.deadlineAt=start+totalRequestDeadlineMs;
+  if(!Number.isFinite(state.deadlineAt)||state.deadlineAt>Number.MAX_SAFE_INTEGER){output.close();fail("request-deadline.invalid-capability");}
+  if(caller&&(ABORTED_GETTER.call(caller.signal) as boolean))latch(state,"cancelled");
+  if(state.terminal!==null){if(caller&&callerListener)try{REMOVE_EVENT.call(caller.signal,"abort",callerListener);}catch{/* quarantine */}return output;}
+  let timer:RequestDeadlineTimerHandleInternal;
+  try{timer=scheduler.setTimeout(()=>latch(state,"expired"),totalRequestDeadlineMs);}catch(error){output.close();throw error;}
+  state.timer=timer;
+  if(caller&&(ABORTED_GETTER.call(caller.signal) as boolean))latch(state,"cancelled");
+  if(state.terminal!==null){state.timer=null;try{scheduler.clearTimeout(timer);}finally{if(caller&&callerListener)try{REMOVE_EVENT.call(caller.signal,"abort",callerListener);}catch{/* quarantine */}}}
   return output;
 }
 export function assertRequestDeadlineInternal(value:unknown):asserts value is RequestDeadlineInternal{stateForDeadline(value);}

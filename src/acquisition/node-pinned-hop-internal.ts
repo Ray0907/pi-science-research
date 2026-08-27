@@ -35,10 +35,10 @@ type RuntimeState={readonly ops:NodeOperationsInternal;open:boolean;readonly use
 type DnsOperation={readonly resolver:NodeResolverInternal;gate:boolean;cleaned:boolean;cancelled:boolean;reject:(error:Error)=>void};
 type DnsState={readonly runtime:NodeRuntimeCapabilitiesInternal;readonly active:Set<DnsOperation>;open:boolean};
 type PinState={readonly runtime:PinnedHopRuntimeInternal;readonly deadline:RequestDeadlineInternal;state:"resolved"|"consumed"|"stale"};
-type HopState={gate:boolean;settled:boolean;request:NodeRequestHandleInternal|null;agent:NodeRequestOwnedAgentInternal|null;timer:unknown;deadline:RequestDeadlineInternal;deadlineListener:()=>void;resolve:(value:NodePinnedHopSettlementInternal)=>void;startedAt:string;startEpochMs:number;startMonotonic:number;lastSafeMonotonic:number;peer:ConnectedPeer|null;callbacks:NodePinnedHopCallbacksInternal;ops:NodeOperationsInternal;};
+type HopState={gate:boolean;settled:boolean;request:NodeRequestHandleInternal|null;agent:NodeRequestOwnedAgentInternal|null;timer:unknown;deadline:RequestDeadlineInternal;deadlineListener:()=>void;resolve:(value:NodePinnedHopSettlementInternal)=>void;startedAt:string;startEpochMs:number;startMonotonic:number;lastSafeMonotonic:number;connectDeadlineAt:number;peer:ConnectedPeer|null;callbacks:NodePinnedHopCallbacksInternal;ops:NodeOperationsInternal;};
 type PinnedRuntimeState={readonly node:NodeRuntimeCapabilitiesInternal;readonly ops:NodeOperationsInternal;readonly options:NetworkPolicyOptions|undefined;readonly dns:AcquisitionDnsResolver;open:boolean;readonly pins:Set<PinnedProviderTargetInternal>;readonly handles:Set<NodePinnedHopHandleInternal>;readonly owners:Set<string>};
 const usedResolversGlobal=new WeakSet<object>();const usedAgentsGlobal=new WeakSet<object>();const usedRequestsGlobal=new WeakSet<object>();const runtimeStates=new WeakMap<object,RuntimeState>();const realAgents=new WeakMap<object,http.Agent|https.Agent>();const dnsStates=new WeakMap<object,DnsState>();const pinStates=new WeakMap<object,PinState>();const pinnedRuntimeStates=new WeakMap<object,PinnedRuntimeState>();const hopStates=new WeakMap<object,HopState>();
-const ADD_EVENT=EventTarget.prototype.addEventListener;const REMOVE_EVENT=EventTarget.prototype.removeEventListener;const ABORTED_GETTER=Object.getOwnPropertyDescriptor(AbortSignal.prototype,"aborted")!.get!;
+const ADD_EVENT=EventTarget.prototype.addEventListener;const REMOVE_EVENT=EventTarget.prototype.removeEventListener;const PROMISE_THEN=Promise.prototype.then;const ABORTED_GETTER=Object.getOwnPropertyDescriptor(AbortSignal.prototype,"aborted")!.get!;
 function transportFail(code:SecureTransportErrorCode):never{throw new SecureTransportError(code);}function pinnedFail(code:PinnedHopRuntimeErrorCodeInternal):never{throw new PinnedHopRuntimeErrorInternal(code);}
 function descriptors(value:unknown,keys:readonly string[],kind:"transport"|"pinned"):PropertyDescriptorMap{const fail=()=>kind==="transport"?transportFail("transport.invalid-capability"):pinnedFail("pinned-runtime.invalid-input");if(value===null||typeof value!=="object"||utilTypes.isProxy(value))return fail();const prototype=Object.getPrototypeOf(value);if(prototype!==Object.prototype&&prototype!==null)return fail();let result:PropertyDescriptorMap;try{result=Object.getOwnPropertyDescriptors(value);}catch{return fail();}const own=Reflect.ownKeys(result);if(own.some((key)=>typeof key!=="string"||!keys.includes(key))||own.length!==keys.length)return fail();for(const key of keys){const item=result[key];if(!item||!("value" in item)||!item.enumerable)return fail();}return result;}
 function exactFunctions(value:unknown,keys:readonly string[]):PropertyDescriptorMap{const result=descriptors(value,keys,"transport");for(const key of keys)if(typeof result[key]!.value!=="function")transportFail("transport.invalid-capability");return result;}
@@ -227,6 +227,7 @@ export function createNodeRuntimeCapabilitiesInternal(ops:NodeOperationsInternal
 export function getNodeRuntimeClockInternal(runtime:NodeRuntimeCapabilitiesInternal):NodeClockInternal{return runtimeState(runtime).ops.clock;}
 function safeErrorCode(value:unknown):string|undefined{if(value===null||typeof value!=="object"||utilTypes.isProxy(value))return undefined;const descriptor=Object.getOwnPropertyDescriptor(value,"code");return descriptor&&"value" in descriptor&&typeof descriptor.value==="string"?descriptor.value:undefined;}
 function resolverStrings(value:unknown):readonly string[]|"overflow"|"invalid"{if(value===null||typeof value!=="object"||utilTypes.isProxy(value)||!Array.isArray(value)||Object.getPrototypeOf(value)!==Array.prototype)return"invalid";const lengthDescriptor=Object.getOwnPropertyDescriptor(value,"length");if(!lengthDescriptor||!("value" in lengthDescriptor)||typeof lengthDescriptor.value!=="number"||!Number.isSafeInteger(lengthDescriptor.value)||lengthDescriptor.value<0)return"invalid";const length=lengthDescriptor.value;if(length>64)return"overflow";const all=Object.getOwnPropertyDescriptors(value as object) as PropertyDescriptorMap;if(Reflect.ownKeys(all).length!==length+1)return"invalid";const output:string[]=[];for(let index=0;index<length;index+=1){const item=all[String(index)];if(!item||!("value" in item)||!item.enumerable||typeof item.value!=="string")return"invalid";output.push(item.value);}return output;}
+function observeResolverPromise(value:unknown):Promise<PromiseSettledResult<readonly string[]>>{try{return PROMISE_THEN.call(value,(addresses:readonly string[])=>({status:"fulfilled" as const,value:addresses}),(reason:unknown)=>({status:"rejected" as const,reason})) as Promise<PromiseSettledResult<readonly string[]>>;}catch{return transportFail("transport.invalid-capability");}}
 function dnsAbortError():Error{return Object.assign(new Error("DNS operation cancelled"),{code:"ABORT_ERR"});}
 function destroyDnsOperation(state:DnsState,operation:DnsOperation,cancel:boolean,rejectRace:boolean):void{
   if(!operation.gate&&!rejectRace)return;
@@ -261,10 +262,11 @@ export function createNodeDnsResolver(runtime:NodeRuntimeCapabilitiesInternal=cr
         ADD_EVENT.call(signal,"abort",onAbort,{once:true});
         if(ABORTED_GETTER.call(signal))onAbort();
         if(!operation.gate)return await aborted;
-        const first=resolver.resolve4(hostname);
+        const first=observeResolverPromise(resolver.resolve4(hostname));
         if(!operation.gate)return await aborted;
-        const second=resolver.resolve6(hostname);
-        const work=Promise.allSettled([first,second]).then((settled)=>{
+        const second=observeResolverPromise(resolver.resolve6(hostname));
+        if(!operation.gate)return await aborted;
+        const work=Promise.all([first,second]).then((settled)=>{
           if(!operation.gate)throw dnsAbortError();
           const answers:Array<{address:string;family:4|6}>=[];
           const errors:unknown[]=[];
@@ -386,16 +388,22 @@ function openHop(ownerId:`hop-owner-v1-${string}`,target:PinnedProviderTargetInt
   const state:HopState={
     gate:true,settled:false,request:null,agent,timer:null,deadline,
     deadlineListener:()=>{if(state.gate)settleHop(handle,state,cancelledSettlement(state));},
-    resolve:resolveCompletion,startedAt,startEpochMs,startMonotonic,lastSafeMonotonic:startMonotonic,
+    resolve:resolveCompletion,startedAt,startEpochMs,startMonotonic,lastSafeMonotonic:startMonotonic,connectDeadlineAt:startMonotonic+Math.min(request.connectTimeoutMs,remaining),
     peer:null,callbacks:upper,ops:node.ops,
   };
   const fail=(failureCode:NodePinnedHopFailureCodeInternal)=>{
     const clock=settlementTimestamp(state);
     settleHop(handle,state,{outcome:"failed",failureCode:clock.valid?failureCode:"hop.protocol-failed",peer:state.peer,startedAt:state.startedAt,settledAt:clock.timestamp});
   };
+  const callbackAllowed=(requireConnect:boolean):boolean=>{
+    if(!state.gate)return false;
+    try{assertRequestDeadlineInternal(deadline);deadline.throwIfExpired();}catch(error){if(state.gate){if(error instanceof RequestDeadlineErrorInternal&&(error.code==="request-deadline.cancelled"||error.code==="request-deadline.expired"))settleHop(handle,state,cancelledSettlement(state));else fail("hop.protocol-failed");}return false;}
+    if(requireConnect){let now:number;try{now=node.ops.clock.monotonicNow();state.lastSafeMonotonic=now;}catch{fail("hop.protocol-failed");return false;}if(now>=state.connectDeadlineAt){fail("hop.connect-timeout");return false;}}
+    return state.gate;
+  };
   const guarded:NodeRequestCallbacksInternal={
     onSecureConnected:(tlsFacts)=>{
-      if(!state.gate)return;
+      if(!callbackAllowed(true))return;
       const peer=normalizePeer(tlsFacts.address,tlsFacts.family);
       if(!tlsFacts.hostnameVerified||!tlsFacts.authorized||tlsFacts.authorizationError!==null){fail("hop.tls-failed");return;}
       if(!peer){fail("hop.peer-unavailable");return;}
@@ -403,20 +411,22 @@ function openHop(ownerId:`hop-owner-v1-${string}`,target:PinnedProviderTargetInt
       if(!expectedPeer||peer.address!==expectedPeer.address||peer.family!==expectedPeer.family){fail("hop.peer-mismatch");return;}
       state.peer=Object.freeze({address:target.address,family:target.family});
       if(state.timer!==null){try{node.ops.clock.clearTimer(state.timer);}catch{fail("hop.protocol-failed");return;}state.timer=null;}
+      if(!callbackAllowed(true))return;
       try{upper.onSecureConnected(tlsFacts);}catch{fail("hop.protocol-failed");}
     },
-    onProtocolFailure:(code)=>{if(!state.gate)return;try{upper.onProtocolFailure(code);}catch{/* quarantine */}fail("hop.protocol-failed");},
-    onResponse:(status,version,headers)=>{if(!state.gate)return;if(state.peer===null){fail("hop.tls-failed");return;}try{upper.onResponse(status,version,headers);}catch{fail("hop.protocol-failed");}},
-    onData:(chunk)=>{if(!state.gate||state.peer===null)return"abort";try{return upper.onData(chunk);}catch{fail("hop.protocol-failed");return"abort";}},
+    onProtocolFailure:(code)=>{if(!callbackAllowed(state.peer===null))return;try{upper.onProtocolFailure(code);}catch{/* quarantine */}fail("hop.protocol-failed");},
+    onResponse:(status,version,headers)=>{if(!callbackAllowed(state.peer===null))return;if(state.peer===null){fail("hop.tls-failed");return;}try{upper.onResponse(status,version,headers);}catch{fail("hop.protocol-failed");}},
+    onData:(chunk)=>{if(!callbackAllowed(state.peer===null)||state.peer===null)return"abort";try{return upper.onData(chunk);}catch{fail("hop.protocol-failed");return"abort";}},
     onEnd:()=>{
-      if(!state.gate)return;
+      if(!callbackAllowed(state.peer===null))return;
       if(state.peer===null){fail("hop.tls-failed");return;}
       try{upper.onEnd();}catch{fail("hop.protocol-failed");return;}
+      if(!callbackAllowed(false))return;
       const clock=settlementTimestamp(state);
       if(!clock.valid){settleHop(handle,state,{outcome:"failed",failureCode:"hop.protocol-failed",peer:state.peer,startedAt:state.startedAt,settledAt:clock.timestamp});return;}
       settleHop(handle,state,{outcome:"ended",failureCode:null,peer:state.peer,startedAt:state.startedAt,settledAt:clock.timestamp});
     },
-    onError:(kind)=>{if(!state.gate)return;try{upper.onError(kind);}catch{/* quarantine */}fail(kind==="tls"?"hop.tls-failed":"hop.connect-failed");},
+    onError:(kind)=>{if(!callbackAllowed(state.peer===null))return;try{upper.onError(kind);}catch{/* quarantine */}fail(kind==="tls"?"hop.tls-failed":"hop.connect-failed");},
   };
   const options:NodeRequestOptionsInternal=Object.freeze({
     url:target.url,pinnedAddress:target.address,family:target.family,hostHeader:target.hostHeader,servername:target.hostname,
@@ -427,15 +437,18 @@ function openHop(ownerId:`hop-owner-v1-${string}`,target:PinnedProviderTargetInt
       try{return node.ops.checkServerIdentity(hostname,certificate);}catch{return new Error("certificate validation failed");}
     },
   });
-  let rawRequest:NodeRequestHandleInternal;
-  try{rawRequest=node.ops.httpsRequest(options,guarded);}catch{try{agent.destroy();}catch{/* quarantine */}return transportFail("transport.invalid-capability");}
-  try{state.request=validateRequestHandle(rawRequest,node);}catch(error){try{agent.destroy();}catch{/* quarantine */}throw error;}
   handle=Object.freeze({
     ownerId,completion,
     abort(){const current=hopStates.get(handle);if(!current||!current.gate)return;settleHop(handle,current,cancelledSettlement(current));},
     async close(){handle.abort();await completion;},
     forceClose(){const current=hopStates.get(handle);if(!current||!current.gate)return;current.gate=false;settleHop(handle,current,cancelledSettlement(current));},
   });
+  let rawRequest:NodeRequestHandleInternal;
+  try{rawRequest=node.ops.httpsRequest(options,guarded);}catch{if(state.settled)return handle;try{agent.destroy();}catch{/* quarantine */}return transportFail("transport.invalid-capability");}
+  let validatedRequest:NodeRequestHandleInternal;
+  try{validatedRequest=validateRequestHandle(rawRequest,node);}catch(error){if(state.settled)return handle;try{agent.destroy();}catch{/* quarantine */}throw error;}
+  state.request=validatedRequest;
+  if(state.settled){state.request=null;try{validatedRequest.destroy();}catch{/* quarantine */}return handle;}
   hopStates.set(handle,state);
   ADD_EVENT.call(deadline.signal,"abort",state.deadlineListener,{once:true});
   if(ABORTED_GETTER.call(deadline.signal))state.deadlineListener();

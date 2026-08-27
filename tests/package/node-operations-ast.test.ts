@@ -118,6 +118,7 @@ function auditAdapter(source:string):string[]{
     if(ts.isIdentifier(node)){const tracked=trackedBindings.get(node.text);if(tracked)auditTrackedNodeUse(node,tracked);}
     if(ts.isImportDeclaration(node)&&ts.isStringLiteral(node.moduleSpecifier)){
       const specifier=node.moduleSpecifier.text;
+      if(isNetworkCapableSpecifier(specifier)&&!specifier.startsWith("node:"))errors.push(`forbidden import ${specifier}`);
       if(specifier.startsWith("node:")){
         imports.add(specifier);importCounts.set(specifier,(importCounts.get(specifier)??0)+1);
         if(!allowedNodeImports.has(specifier))errors.push(`forbidden import ${specifier}`);
@@ -219,6 +220,25 @@ function auditAdapter(source:string):string[]{
   return errors;
 }
 
+function isNetworkCapableSpecifier(specifier:string):boolean{const normalized=specifier.startsWith("node:")?specifier.slice(5):specifier;return["http","https","http2","net","tls","dgram","dns","undici"].some((base)=>normalized===base||normalized.startsWith(`${base}/`));}
+function auditNonAdapterSource(source:string):string[]{
+  const file=ts.createSourceFile("non-adapter.ts",source,ts.ScriptTarget.Latest,true,ts.ScriptKind.TS);const errors:string[]=[];
+  const visit=(node:ts.Node):void=>{
+    if((ts.isImportDeclaration(node)||ts.isExportDeclaration(node))&&node.moduleSpecifier&&ts.isStringLiteral(node.moduleSpecifier)&&isNetworkCapableSpecifier(node.moduleSpecifier.text))errors.push("network import");
+    if(ts.isImportEqualsDeclaration(node)&&ts.isExternalModuleReference(node.moduleReference)){const expression=node.moduleReference.expression;if(!expression||!ts.isStringLiteral(expression)||isNetworkCapableSpecifier(expression.text))errors.push("network import equals");}
+    if(ts.isCallExpression(node)){
+      if(node.expression.kind===ts.SyntaxKind.ImportKeyword){const argument=node.arguments[0];if(!argument||!ts.isStringLiteral(argument)||isNetworkCapableSpecifier(argument.text))errors.push("network dynamic import");}
+      if(ts.isIdentifier(node.expression)&&node.expression.text==="fetch")errors.push("global fetch");
+      if(ts.isPropertyAccessExpression(node.expression)&&((ts.isIdentifier(node.expression.expression)&&node.expression.expression.text==="globalThis"&&node.expression.name.text==="fetch")||node.expression.name.text==="require"))errors.push("network global call");
+      if(ts.isElementAccessExpression(node.expression)){const argument=node.expression.argumentExpression;if(!argument||!ts.isStringLiteral(argument)||["fetch","require"].includes(argument.text))errors.push("network computed call");}
+    }
+    if(ts.isIdentifier(node)&&["require","fetch","eval","Function"].includes(node.text))errors.push("network global binding");
+    if(ts.isPropertyAccessExpression(node)&&ts.isIdentifier(node.expression)&&node.expression.text==="globalThis"&&node.name.text==="fetch")errors.push("global fetch");
+    if(ts.isElementAccessExpression(node)&&ts.isIdentifier(node.expression)&&node.expression.text==="globalThis"){const argument=node.argumentExpression;if(!argument||!ts.isStringLiteral(argument)||argument.text==="fetch")errors.push("global computed access");}
+    ts.forEachChild(node,visit);
+  };visit(file);return errors;
+}
+
 const defaultFactoryRequiredArguments=new Map<string,readonly number[]>([
   ["createNodeRuntimeCapabilitiesInternal",[0]],
   ["createNodeDnsResolver",[0]],
@@ -275,7 +295,7 @@ describe("Node operations adapter audit",()=>{
   test("audits sole real Node adapter imports methods production features and approved request options by TypeScript AST",()=>{
     const source=fs.readFileSync(adapterPath,"utf8");expect(auditAdapter(source)).toEqual([]);
     const acquisitionFiles=fs.readdirSync(path.join(root,"src/acquisition")).filter((name)=>name.endsWith(".ts")&&name!==path.basename(adapterPath));
-    for(const file of acquisitionFiles){const parsed=ts.createSourceFile(file,fs.readFileSync(path.join(root,"src/acquisition",file),"utf8"),ts.ScriptTarget.Latest,true);const imports:string[]=[];const visit=(node:ts.Node):void=>{if(ts.isImportDeclaration(node)&&ts.isStringLiteral(node.moduleSpecifier)&&networkNodeImports.has(node.moduleSpecifier.text))imports.push(node.moduleSpecifier.text);if(ts.isCallExpression(node)&&node.expression.kind===ts.SyntaxKind.ImportKeyword)imports.push("dynamic");ts.forEachChild(node,visit);};visit(parsed);expect(imports,file).toEqual([]);}
+    for(const file of acquisitionFiles)expect(auditNonAdapterSource(fs.readFileSync(path.join(root,"src/acquisition",file),"utf8")),file).toEqual([]);
     expect(acquisitionUnitIsolationErrors()).toEqual([]);
   });
 
@@ -283,6 +303,9 @@ describe("Node operations adapter audit",()=>{
     const base=fs.readFileSync(adapterPath,"utf8");
     const cases:Array<readonly[string,string]>=[
       [`${base}\nimport net from "node:net";`,"forbidden import node:net"],
+      [`${base}\nimport http2 from "node:http2";`,"forbidden import node:http2"],
+      [`${base}\nimport bareHttps from "https";`,"forbidden import https"],
+      [`${base}\nimport hiddenSubpath from "node:https/subpath";`,"forbidden import node:https/subpath"],
       [`${base}\nimport hiddenHttp from "node:http";void hiddenHttp.request;`,"import binding node:http"],
       [`${base}\nfunction adaptNodeRequest(){void https.request("https://example.invalid");}`,"adapter declaration context"],
       [`${base}\nvoid https.request("https://example.invalid");`,"node member context"],
@@ -318,6 +341,11 @@ describe("Node operations adapter audit",()=>{
     ];
     for(const [source,error] of cases)expect(auditAdapter(source),error).toContain(error);
   });
+
+  test("rejects all network-capable imports outside the sole adapter",()=>{const cases=[
+    'import net from "node:net";','import http2 from "node:http2";','import https from "https";','import dns from "dns";','import promises from "dns/promises";','import hidden from "node:https/subpath";',
+    'const spec="node:net";void import(spec);','void import("http2");','const load=require;load("https");','module.require("dns");','void globalThis.fetch("https://example.invalid");','import undici from "undici";',
+  ];for(const source of cases)expect(auditNonAdapterSource(source),source).not.toEqual([]);expect(auditNonAdapterSource('import {types} from "node:util";void types;')).toEqual([]);});
 
   test("rejects aliases captures nested calls and implicit defaults for imported unit-test factories",()=>{
     const modulePath='../../src/acquisition/node-pinned-hop-internal.js';
