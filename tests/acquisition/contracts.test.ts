@@ -375,6 +375,28 @@ describe("immutable acquisition contracts", () => {
     expect(createAcquisitionTrace(blockedTraceInput).traceKey).toBe(blockedTrace.traceKey);
   });
 
+  test("authenticates many identical owner leases without scanning registrations", () => {
+    const preimage = partitionPreimage({ normalizedInput: { kind: "query", query: "constant-lookup", limit: 1 }, requestedUrl: "https://api.crossref.org/works?query=constant-lookup" });
+    const snapshot = partitionSnapshot(preimage);
+    const owners = Array.from({ length: 48 }, (_, index) => createProviderPartitionPlanOwnerInternal({ planId: `plan-v1-${index.toString(16).padStart(64, "0")}`, options: PARTITION_LIMITS }));
+    for (const owner of owners) registerProviderRequestPartitionInternal(owner, snapshot);
+    const key = createProviderPartitionKey(preimage);
+    const raw = settlement({ ...key, requestedUrl: preimage.requestedUrl, finalUrl: preimage.requestedUrl, redirectWitnesses: [] });
+    const deref = vi.spyOn(WeakRef.prototype, "deref");
+    deref.mockClear();
+    const projected = acquisitionTraceSettlementInternalExported(raw, PROJECTION_LIMITS);
+    expect(deref).not.toHaveBeenCalled();
+    deref.mockRestore();
+    const projectedTrace = createAcquisitionTrace({ provider: "crossref", operation: "search", endpointClass: "works-search", ...key, accessLevel: "metadata-only", settlement: projected, warnings: [] });
+    const validated = validateAcademicAcquisitionResult(result({ candidates: [], candidateGroups: [], traces: [projectedTrace] }));
+    for (const owner of owners.slice(0, -1)) closeProviderPartitionPlanOwnerInternal(owner);
+    expect(acquisitionTraceSettlementInternalExported(raw, PROJECTION_LIMITS).outcome).toBe("success");
+    closeProviderPartitionPlanOwnerInternal(owners.at(-1)!);
+    expect(errorCode(() => acquisitionTraceSettlementInternalExported(raw, PROJECTION_LIMITS))).toBe("acquisition-contract.invalid-capability");
+    expect(createAcquisitionTrace({ provider: "crossref", operation: "search", endpointClass: "works-search", ...key, accessLevel: "metadata-only", settlement: projected, warnings: [] }).traceKey).toBe(projectedTrace.traceKey);
+    expect(validateAcademicAcquisitionResult(validated).traces[0]?.traceKey).toBe(projectedTrace.traceKey);
+  });
+
   test("keeps timestamp out of trace key while every deterministic settlement fact changes it", () => {
     const key = createProviderPartitionKey(partitionPreimage()); registeredPartition();
     const makeTrace = (transportOverrides: Partial<TransportSettlement>, accessLevel: "metadata-only" | "abstract-only" = "metadata-only") => createAcquisitionTrace({ provider: "crossref", operation: "search", endpointClass: "works-search", ...key, accessLevel, settlement: acquisitionTraceSettlementInternalExported(settlement(transportOverrides), PROJECTION_LIMITS), warnings: [] });
@@ -540,6 +562,47 @@ describe("immutable acquisition contracts", () => {
     const authors = (size: number) => Array.from({ length: 1_024 }, () => ({ family: null, given: null, literal: "x".repeat(size), orcid: null }));
     expect(createAcademicCandidate({ ...input, authors: authors(6_000) }).authors).toHaveLength(1_024);
     expect(errorCode(() => createAcademicCandidate({ ...input, authors: authors(9_000) }))).toBe("acquisition-contract.result-too-large");
+  });
+
+  test("requires successful sufficiently accessible traces for every candidate and document access level", () => {
+    const accessLevels = ["metadata-only", "abstract-only", "partial-text", "full-text"] as const;
+    for (const [traceRank, traceAccess] of accessLevels.entries()) {
+      const candidateTrace = trace({ accessLevel: traceAccess });
+      for (const [candidateRank, candidateAccess] of accessLevels.entries()) {
+        const value = candidate({ partitionKeySha256: candidateTrace.partitionKeySha256, traceKey: candidateTrace.traceKey, accessLevel: candidateAccess });
+        const input = result({ candidates: [value], candidateGroups: [group(value)], traces: [candidateTrace] });
+        if (traceRank >= candidateRank) expect(validateAcademicAcquisitionResult(input).candidates[0]?.accessLevel).toBe(candidateAccess);
+        else expect(errorCode(() => validateAcademicAcquisitionResult(input))).toBe("acquisition-contract.invalid-key");
+      }
+    }
+
+    const nullAccessTrace = trace({ accessLevel: null });
+    const nullCandidate = candidate({ partitionKeySha256: nullAccessTrace.partitionKeySha256, traceKey: nullAccessTrace.traceKey });
+    expect(errorCode(() => validateAcademicAcquisitionResult(result({ candidates: [nullCandidate], candidateGroups: [group(nullCandidate)], traces: [nullAccessTrace] })))).toBe("acquisition-contract.invalid-key");
+    expect(errorCode(() => validateAcademicAcquisitionResult(result({ candidates: [candidate()], candidateGroups: [group(candidate())], traces: [] })))).toBe("acquisition-contract.invalid-key");
+
+    registeredPartition();
+    const failureSettlement = acquisitionTraceSettlementInternalExported(settlement({ outcome: "failure", failureCode: "transport.http-terminal", payloadUtf8: null }), PROJECTION_LIMITS);
+    const failureKey = createProviderPartitionKey(partitionPreimage());
+    const failureTrace = createAcquisitionTrace({ provider: "crossref", operation: "search", endpointClass: "works-search", ...failureKey, accessLevel: null, settlement: failureSettlement, warnings: [] });
+    const failureCandidate = candidate({ partitionKeySha256: failureTrace.partitionKeySha256, traceKey: failureTrace.traceKey });
+    expect(errorCode(() => validateAcademicAcquisitionResult(result({ candidates: [failureCandidate], candidateGroups: [group(failureCandidate)], traces: [failureTrace] })))).toBe("acquisition-contract.invalid-key");
+
+    const pmcPartition = { provider: "pmc" as const, operation: "fetch" as const, endpointClass: "pmc-bioc", target: "ncbi" as const, normalizedInput: { kind: "pmcid" as const, pmcid: "PMC123" }, url: "https://www.ncbi.nlm.nih.gov/research/bionlp/RESTful/pmcoa.cgi/BioC_json/PMC123/unicode" };
+    for (const [traceRank, traceAccess] of accessLevels.entries()) {
+      const pmcTrace = providerTrace({ ...pmcPartition, accessLevel: traceAccess });
+      for (const [documentRank, documentAccess] of accessLevels.entries()) {
+        const pmcCandidate = candidate({ provider: "pmc", endpointClass: "pmc-bioc", providerRecordId: "PMC123", identifiers: { doi: null, pmid: null, pmcid: "PMC123" }, canonicalUrl: "https://pmc.ncbi.nlm.nih.gov/articles/PMC123/", partitionKeySha256: pmcTrace.partitionKeySha256, traceKey: pmcTrace.traceKey, accessLevel: documentAccess });
+        const pmcDocument = createAcademicDocument({ pmcid: "PMC123", candidateKey: pmcCandidate.candidateKey, partitionKeySha256: pmcTrace.partitionKeySha256, responsePayloadSha256: HASH_A, provider: "pmc", traceKey: pmcTrace.traceKey, accessLevel: documentAccess, sections: [] });
+        const input = result({ candidates: [pmcCandidate], candidateGroups: [group(pmcCandidate, { identityKind: "pmcid", identityValueSha256: sha256Hex(canonicalJson("PMC123")) })], documents: [pmcDocument], traces: [pmcTrace] });
+        if (traceRank >= documentRank) expect(validateAcademicAcquisitionResult(input).documents[0]?.accessLevel).toBe(documentAccess);
+        else expect(errorCode(() => validateAcademicAcquisitionResult(input))).toBe("acquisition-contract.invalid-key");
+      }
+    }
+    const nullPmcTrace = providerTrace({ ...pmcPartition, accessLevel: null });
+    const nullPmcCandidate = candidate({ provider: "pmc", endpointClass: "pmc-bioc", providerRecordId: "PMC123", identifiers: { doi: null, pmid: null, pmcid: "PMC123" }, canonicalUrl: "https://pmc.ncbi.nlm.nih.gov/articles/PMC123/", partitionKeySha256: nullPmcTrace.partitionKeySha256, traceKey: nullPmcTrace.traceKey, accessLevel: "metadata-only" });
+    const nullPmcDocument = createAcademicDocument({ pmcid: "PMC123", candidateKey: nullPmcCandidate.candidateKey, partitionKeySha256: nullPmcTrace.partitionKeySha256, responsePayloadSha256: HASH_A, provider: "pmc", traceKey: nullPmcTrace.traceKey, accessLevel: "metadata-only", sections: [] });
+    expect(errorCode(() => validateAcademicAcquisitionResult(result({ candidates: [nullPmcCandidate], candidateGroups: [group(nullPmcCandidate, { identityKind: "pmcid", identityValueSha256: sha256Hex(canonicalJson("PMC123")) })], documents: [nullPmcDocument], traces: [nullPmcTrace] })))).toBe("acquisition-contract.invalid-key");
   });
 
   test("constructors require PMCID candidate partition and payload hashes plus every claimed field", () => {
