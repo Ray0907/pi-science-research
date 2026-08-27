@@ -326,7 +326,6 @@ function validatedHeaders(value:unknown):readonly Readonly<{name:string;value:st
   const output:Array<Readonly<{name:string;value:string}>>=[];
   const seenNames=new Set<string>();
   const seenObjects=new WeakSet<object>();
-  let aggregateCanonicalBytes=0;
   for(let index=0;index<length;index+=1){
     const item=all[String(index)];
     if(!item||!("value" in item)||!item.enumerable||item.value===null||typeof item.value!=="object"||seenObjects.has(item.value))pinnedFail("pinned-runtime.invalid-input");
@@ -338,8 +337,6 @@ function validatedHeaders(value:unknown):readonly Readonly<{name:string;value:st
     if(!isNodeHeaderValue(headerValue))pinnedFail("pinned-runtime.invalid-input");
     const valueBytes=canonicalStringBytes(headerValue);
     if(!Number.isSafeInteger(valueBytes)||valueBytes>16_384)pinnedFail("pinned-runtime.invalid-input");
-    aggregateCanonicalBytes+=Buffer.byteLength(name,"utf8")+valueBytes;
-    if(!Number.isSafeInteger(aggregateCanonicalBytes)||aggregateCanonicalBytes>16*16_384)pinnedFail("pinned-runtime.invalid-input");
     seenNames.add(name);
     output.push(Object.freeze({name,value:headerValue}));
   }
@@ -348,6 +345,7 @@ function validatedHeaders(value:unknown):readonly Readonly<{name:string;value:st
 function requestInput(value:unknown):PinnedHopOpenRequestInternal{const d=descriptors(value,["ownerId","url","headers","maxHeaderSize","connectTimeoutMs"],"pinned");if(typeof d.ownerId!.value!=="string"||!/^hop-owner-v1-[A-Za-z0-9._-]+$/u.test(d.ownerId!.value)||typeof d.url!.value!=="string"||typeof d.maxHeaderSize!.value!=="number"||!Number.isSafeInteger(d.maxHeaderSize!.value)||d.maxHeaderSize!.value<1||d.maxHeaderSize!.value>262_144||typeof d.connectTimeoutMs!.value!=="number"||!Number.isSafeInteger(d.connectTimeoutMs!.value)||d.connectTimeoutMs!.value<1||d.connectTimeoutMs!.value>30_000)pinnedFail("pinned-runtime.invalid-input");const headers=validatedHeaders(d.headers!.value);return Object.freeze({ownerId:d.ownerId!.value as `hop-owner-v1-${string}`,url:d.url!.value,headers:Object.freeze(headers),maxHeaderSize:d.maxHeaderSize!.value,connectTimeoutMs:d.connectTimeoutMs!.value});}
 function normalizePeer(address:string|undefined,family:string|number|undefined):ConnectedPeer|null{if(address===undefined||address.includes("%"))return null;const normalized=family===4||family==="IPv4"?4:family===6||family==="IPv6"?6:null;if(normalized===null)return null;let canonical:string;try{const parsed=new URL(normalized===6?`https://[${address}]/`:`https://${address}/`);canonical=normalized===6?parsed.hostname.slice(1,-1):parsed.hostname;}catch{return null;}return{address:canonical,family:normalized};}
 function pinnedRuntimeState(value:unknown):PinnedRuntimeState{if(value===null||typeof value!=="object"||utilTypes.isProxy(value))pinnedFail("pinned-runtime.invalid-capability");const state=pinnedRuntimeStates.get(value);if(!state||!Object.isFrozen(value)||(value as PinnedHopRuntimeInternal).capabilityKind!=="pinned-hop-runtime")pinnedFail("pinned-runtime.invalid-capability");return state;}
+export function assertPinnedHopRuntimeInternal(value:unknown):asserts value is PinnedHopRuntimeInternal{pinnedRuntimeState(value);}
 function settlementTimestamp(state:HopState):{timestamp:string;valid:boolean}{
   let valid=true;
   let monotonic=state.lastSafeMonotonic;

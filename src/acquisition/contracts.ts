@@ -334,6 +334,7 @@ const providerKeys = Object.keys(providerHard);
 
 type OptionState = { transport:object;providers:object;hash:string;scalars:Record<string,number> };
 const normalizedOptionsRegistry = new WeakMap<object,OptionState>();
+const normalizedTransportRegistry = new WeakMap<object,object>();
 type OwnerState = { planId:string;options:ProviderPartitionRegistryOptionsInternal;open:boolean;keys:Set<string>;partitions:Set<object>;count:number };
 interface MinimalPartitionBinding { readonly partitionKey:`partition-v1-${string}`;readonly partitionKeySha256:string;readonly provider:AcquisitionProvider;readonly operation:AcquisitionOperation;readonly endpointClass:string;readonly target:"crossref"|"openalex"|"ncbi";readonly requestedUrlSha256:string; }
 type MinimalBindingEntry = { readonly binding:MinimalPartitionBinding;liveRegistrations:number };
@@ -397,7 +398,10 @@ export function normalizeAcquisitionOptions(raw:unknown):NormalizedAcquisitionOp
   const body={schemaVersion:1,transport:normalizedTransport,providers:normalizedProviders,...top};const optionsSha256=sha256Hex(canonicalJson(body));
   const output=deepFreeze({capabilityKind:"normalized-acquisition-options" as const,transport:normalizedTransport,providers:normalizedProviders,...top,optionsSha256}) as NormalizedAcquisitionOptionsInternal;
   const scalars:Record<string,number>={};for(const key of topKeys)scalars[key]=output[key as keyof NormalizedAcquisitionOptionsInternal] as number;
-  normalizedOptionsRegistry.set(output,{transport:output.transport,providers:output.providers,hash:optionsSha256,scalars});return output;
+  normalizedOptionsRegistry.set(output,{transport:output.transport,providers:output.providers,hash:optionsSha256,scalars});normalizedTransportRegistry.set(output.transport,output);return output;
+}
+export function assertNormalizedAcademicTransportOptionsInternal(value:unknown):asserts value is Readonly<Required<AcademicTransportOptions>> {
+  if(value===null||typeof value!=="object"||utilTypes.isProxy(value))fail("acquisition-contract.invalid-capability");const owner=normalizedTransportRegistry.get(value);const state=owner?normalizedOptionsRegistry.get(owner):undefined;if(!owner||!state||state.transport!==value||!Object.isFrozen(value))fail("acquisition-contract.invalid-capability");
 }
 export function assertNormalizedAcquisitionOptionsInternal(value:unknown):asserts value is NormalizedAcquisitionOptionsInternal {
   if(value===null||typeof value!=="object"||utilTypes.isProxy(value))fail("acquisition-contract.invalid-capability");const state=normalizedOptionsRegistry.get(value);if(!state||!Object.isFrozen(value)||!Object.isFrozen(state.transport)||!Object.isFrozen(state.providers))fail("acquisition-contract.invalid-capability");

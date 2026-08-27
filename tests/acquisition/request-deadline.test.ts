@@ -4,6 +4,7 @@ import {
   RequestDeadlineErrorInternal,
   assertRequestDeadlineInternal,
   assertRequestDeadlineOwnedByInternal,
+  assertRequestDeadlineSchedulerCapabilitiesInternal,
   claimRequestDeadlineInternal,
   createRequestDeadlineInternal,
   createRequestDeadlineSchedulerCapabilitiesInternal,
@@ -33,5 +34,6 @@ describe("request deadline lifecycle",()=>{
     claimRequestDeadlineInternal(b,"transport-request-v1-owner-a");expect(errorCode(()=>claimRequestDeadlineInternal(b,"transport-request-v1-owner-a"))).toBe("request-deadline.replayed");expect(errorCode(()=>assertRequestDeadlineOwnedByInternal(b,"transport-request-v1-owner-b"))).toBe("request-deadline.replayed");
     expect(errorCode(()=>assertRequestDeadlineInternal({ ...b }))).toBe("request-deadline.invalid-capability");b.close();expect(errorCode(()=>assertRequestDeadlineInternal(b))).toBe("request-deadline.closed");
     const getter=Object.defineProperty({},"monotonicNow",{enumerable:true,get(){throw new Error("SECRET");}});expect(errorCode(()=>createRequestDeadlineSchedulerCapabilitiesInternal(getter as never))).toBe("request-deadline.invalid-capability");
+    let methodCalls=0;const branded=createRequestDeadlineSchedulerCapabilitiesInternal({monotonicNow:()=>{methodCalls+=1;return 1;},setTimeout:()=>{methodCalls+=1;return 1;},clearTimeout:()=>{methodCalls+=1;}});assertRequestDeadlineSchedulerCapabilitiesInternal(branded);expect(methodCalls).toBe(0);expect(errorCode(()=>assertRequestDeadlineSchedulerCapabilitiesInternal(Object.freeze({...branded})))).toBe("request-deadline.invalid-capability");let traps=0;const proxy=new Proxy(branded,{get(){traps+=1;throw new Error("SECRET");}});expect(errorCode(()=>assertRequestDeadlineSchedulerCapabilitiesInternal(proxy))).toBe("request-deadline.invalid-capability");expect(traps).toBe(0);expect(methodCalls).toBe(0);
   });
 });

@@ -13,6 +13,7 @@ import { sha256Hex } from "../../src/crypto/hash.js";
 import {
   AcquisitionContractError,
   acquisitionTraceSettlementInternal as acquisitionTraceSettlementInternalExported,
+  assertNormalizedAcademicTransportOptionsInternal,
   assertNormalizedAcquisitionOptionsInternal,
   assertProviderRequestPartitionInternal,
   assertProviderRequestPartitionOwnedByInternal,
@@ -296,16 +297,19 @@ describe("immutable acquisition contracts", () => {
 
   test("deep-freezes one branded normalized view and rejects forged clone changed hash nested identity and cross-module values", () => {
     const value = normalizeAcquisitionOptions(undefined); expect(Object.isFrozen(value)).toBe(true); expect(Object.isFrozen(value.transport)).toBe(true);
-    assertNormalizedAcquisitionOptionsInternal(value);
+    assertNormalizedAcquisitionOptionsInternal(value);assertNormalizedAcademicTransportOptionsInternal(value.transport);
     expect(errorCode(() => assertNormalizedAcquisitionOptionsInternal({ ...value }))).toBe("acquisition-contract.invalid-capability");
     expect(errorCode(() => assertNormalizedAcquisitionOptionsInternal({ ...value, transport: { ...value.transport } }))).toBe("acquisition-contract.invalid-capability");
+    expect(errorCode(() => assertNormalizedAcademicTransportOptionsInternal({ ...value.transport }))).toBe("acquisition-contract.invalid-capability");
+    const lookalike=Object.freeze({ ...value.transport });expect(errorCode(() => assertNormalizedAcademicTransportOptionsInternal(lookalike))).toBe("acquisition-contract.invalid-capability");const forgedNormalized=Object.freeze({...value,transport:lookalike});expect(errorCode(()=>assertNormalizedAcademicTransportOptionsInternal(forgedNormalized.transport))).toBe("acquisition-contract.invalid-capability");
+    let traps=0;const proxy=new Proxy(value.transport,{get(){traps+=1;throw new Error("SECRET");}});expect(errorCode(() => assertNormalizedAcademicTransportOptionsInternal(proxy))).toBe("acquisition-contract.invalid-capability");expect(traps).toBe(0);
   });
 
   test("keeps normalized transport planner fields and options hash stable after raw option mutation with O1 repeated assertions", () => {
     const raw = { maxQueries: 3, transport: { maxDnsAddresses: 4 } }; const value = normalizeAcquisitionOptions(raw);
     raw.maxQueries = 2; raw.transport.maxDnsAddresses = 5;
     expect(value.maxQueries).toBe(3); expect(value.transport.maxDnsAddresses).toBe(4);
-    const hash = value.optionsSha256; for (let index = 0; index < 10_000; index += 1) assertNormalizedAcquisitionOptionsInternal(value); expect(value.optionsSha256).toBe(hash);
+    const hash = value.optionsSha256; for (let index = 0; index < 10_000; index += 1) {assertNormalizedAcquisitionOptionsInternal(value);assertNormalizedAcademicTransportOptionsInternal(value.transport);} expect(value.optionsSha256).toBe(hash);
   });
 
   test("hashes exact collision-free partition candidate trace document and group preimages", () => {

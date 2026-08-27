@@ -94,6 +94,7 @@ function schedulerState(value:unknown):SchedulerState{
   if(!state||!Object.isFrozen(value)||(value as RequestDeadlineSchedulerCapabilitiesInternal).capabilityKind!=="request-deadline-scheduler-capabilities")fail("request-deadline.invalid-capability");
   return state;
 }
+export function assertRequestDeadlineSchedulerCapabilitiesInternal(value:unknown):asserts value is RequestDeadlineSchedulerCapabilitiesInternal{schedulerState(value);}
 function genuineSignal(value:unknown):{signal:AbortSignal;aborted:boolean}{
   if(value===null||typeof value!=="object"||utilTypes.isProxy(value))fail("request-deadline.invalid-capability");
   let aborted:boolean;
