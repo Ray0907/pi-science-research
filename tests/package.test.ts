@@ -60,7 +60,11 @@ describe("Pi package manifest", () => {
         "pi-science-research/src/index.ts",
         "pi-science-research/src/scholarly/identifiers.js",
         "pi-science-research/src/acquisition/providers/provider-adapter-friend-internal.ts",
-        "pi-science-research/src/acquisition/providers/provider-adapter-friend-internal.js"
+        "pi-science-research/src/acquisition/providers/provider-adapter-friend-internal.js",
+        "pi-science-research/src/acquisition/planner-scheduler-friend-internal.ts",
+        "pi-science-research/src/acquisition/planner-scheduler-friend-internal.js",
+        "pi-science-research/src/acquisition/transport-settlement-friend-internal.ts",
+        "pi-science-research/src/acquisition/transport-settlement-friend-internal.js"
       ]) {
         for (const action of [() => import.meta.resolve(specifier), () => import(specifier)]) {
           try { await action(); throw new Error("unexpected subpath access: " + specifier); }
@@ -109,6 +113,7 @@ describe("Pi package manifest", () => {
       "src/acquisition/planner-internal.ts",
       "src/acquisition/planner-scheduler-friend-internal.ts",
       "src/acquisition/scheduler-internal.ts",
+      "src/acquisition/transport-settlement-friend-internal.ts",
       "src/scholarly/source-identity.ts",
       "src/evidence/lineage.ts",
       "src/evidence/admission.ts",
