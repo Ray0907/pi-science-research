@@ -46,6 +46,7 @@ export interface EvidenceQueryDiagnostics {
   candidateVisits: number;
   closureVisits: number;
   normalizedQueryCanonicalizations: number;
+  selectedWrapperCanonicalizations: number;
 }
 export interface EvidenceIndexOptions {
   readonly maxLedgerEvents?: number; readonly maxTaskRevisions?: number; readonly maxStableTasks?: number; readonly maxAttempts?: number;
@@ -84,6 +85,9 @@ const QUALITIES = ["primary-peer-reviewed", "primary-unreviewed", "official", "s
 const ACCESS = ["metadata-only", "abstract-only", "partial-text", "full-text"] as const;
 const STATUSES = ["unverified", "verified", "rejected", "disputed"] as const;
 const KINDS: readonly SnapshotRecordKind[] = ["sources", "claims", "evidence", "verifications", "requests", "calculations"];
+const SELECTION_CANONICAL_KINDS: readonly SnapshotRecordKind[] = ["calculations", "claims", "evidence", "requests", "sources", "verifications"];
+const EMPTY_SELECTION_CANONICAL = '{"calculations":[],"claims":[],"evidence":[],"requests":[],"sources":[],"verifications":[]}';
+const SELECTION_WRAPPER_OVERHEAD_BYTES = Buffer.byteLength(EMPTY_SELECTION_CANONICAL, "utf8");
 const RANK: Readonly<Record<PrimaryKind, number>> = { sources: 0, claims: 1, evidence: 2, verifications: 3 };
 
 export function buildEvidenceIndex(input: EvidenceIndexInput, options?: EvidenceIndexOptions): EvidenceIndex {
@@ -388,7 +392,7 @@ function preflightPrimaryPage(values: readonly Primary[], options: NormalizedOpt
 function createClosure(indexes: ValidatedSnapshotIndexes, options: NormalizedOptions, byteMaximum: number, diagnostics?: EvidenceQueryDiagnostics) {
   const selected = new Map<string, { key: SnapshotRecordKey; record: AnyRecord; canonical: string }>();
   const counts: Record<SnapshotRecordKind, number> = { sources: 0, claims: 0, evidence: 0, verifications: 0, requests: 0, calculations: 0 };
-  let bytes = Buffer.byteLength(selectionCanonical([]), "utf8"); let edges = 0;
+  let bytes = SELECTION_WRAPPER_OVERHEAD_BYTES; let edges = 0;
   if (bytes > byteMaximum) fail("query.closure-too-large");
   const rollback = (added: string[], oldBytes: number, oldEdges: number): void => { for (const encoded of added) { const item = selected.get(encoded)!; counts[item.key.kind] -= 1; selected.delete(encoded); } bytes = oldBytes; edges = oldEdges; };
   const tryAdd = (seed: SnapshotRecordKey): boolean => {
@@ -400,22 +404,26 @@ function createClosure(indexes: ValidatedSnapshotIndexes, options: NormalizedOpt
         const record = indexes.getExactRecord(key); const canonical = indexes.getCanonicalRecordString(key); if (!record || canonical === undefined) fail("query.unresolved-ref");
         const refs = indexes.getOutgoingReferences(key); const nextEdges = add(edges, refs.length, "query.closure-too-large");
         const nextKind = add(counts[key.kind], 1, "query.closure-too-large"); const nextTotal = add(selected.size, 1, "query.closure-too-large");
-        const recordBytes = Buffer.byteLength(canonical, "utf8"); const nextBytes = add(bytes, recordBytes + (counts[key.kind] === 0 ? 0 : 1), "query.closure-too-large");
+        const recordBytes = Buffer.byteLength(canonical, "utf8");
+        const recordContribution = add(recordBytes, counts[key.kind] === 0 ? 0 : 1, "query.closure-too-large");
+        const nextBytes = add(bytes, recordContribution, "query.closure-too-large");
         if (nextEdges > options.maxClosureEdges || nextKind > options.maxSelectedPerKind[key.kind] || nextTotal > options.maxTotalSelectedRecords || nextBytes > byteMaximum) fail("query.closure-too-large");
         edges = nextEdges; counts[key.kind] = nextKind; bytes = nextBytes; selected.set(encoded, { key, record, canonical }); added.push(encoded);
         for (const ref of refs) if (!selected.has(encodedKey(ref))) queue.push(ref);
       }
-      const wrapper = selectionCanonical([...selected.values()]); if (Buffer.byteLength(wrapper, "utf8") !== bytes) fail("query.invalid-input");
       return true;
     } catch (error) { rollback(added, oldBytes, oldEdges); if (error instanceof EvidenceQueryError && error.code === "query.closure-too-large") return false; throw error; }
   };
   const selection = (truncated: boolean, nextCursor: string | null): EvidenceSelection => {
-    const ordered = orderSelected([...selected.values()]); const canonical = selectionCanonical(ordered);
+    const ordered = orderSelected([...selected.values()]);
+    const canonical = selectionCanonical(ordered, diagnostics);
+    if (Buffer.byteLength(canonical, "utf8") !== bytes) fail("query.invalid-input");
+    const bundleSha256 = sha256Hex(canonical);
     const clone = <T>(value: { canonical: string }): T => deepFreeze(JSON.parse(value.canonical)) as T;
     return deepFreeze({
       sources: ordered.sources.map(clone<SourceRecord>), claims: ordered.claims.map(clone<ClaimRecord>), evidence: ordered.evidence.map(clone<EvidenceRecord>),
       verifications: ordered.verifications.map(clone<VerificationRecord>), requests: ordered.requests.map(clone<RequestRecord>), calculations: ordered.calculations.map(clone<CalculationRecord>),
-      selectedRecordBundleSha256: sha256Hex(canonical), truncated, nextCursor,
+      selectedRecordBundleSha256: bundleSha256, truncated, nextCursor,
     });
   };
   return Object.freeze({ tryAdd, selection });
@@ -426,9 +434,9 @@ function orderSelected(values: Array<{ key: SnapshotRecordKey; record: AnyRecord
   for (const kind of KINDS) output[kind].sort((a, b) => a.key.id < b.key.id ? -1 : a.key.id > b.key.id ? 1 : (a.key.revision ?? 0) - (b.key.revision ?? 0));
   return output;
 }
-function selectionCanonical(values: Array<{ key: SnapshotRecordKey; record: AnyRecord; canonical: string }> | Record<SnapshotRecordKind, Array<{ key: SnapshotRecordKey; record: AnyRecord; canonical: string }>>): string {
-  const ordered = Array.isArray(values) ? orderSelected(values) : values;
-  return `{${["calculations", "claims", "evidence", "requests", "sources", "verifications"].map((kind) => `${canonicalJson(kind)}:[${ordered[kind as SnapshotRecordKind].map(({ canonical }) => canonical).join(",")}]`).join(",")}}`;
+function selectionCanonical(ordered: Record<SnapshotRecordKind, Array<{ key: SnapshotRecordKey; record: AnyRecord; canonical: string }>>, diagnostics?: EvidenceQueryDiagnostics): string {
+  bumpQuery(diagnostics, "selectedWrapperCanonicalizations");
+  return `{${SELECTION_CANONICAL_KINDS.map((kind) => `${canonicalJson(kind)}:[${ordered[kind].map(({ canonical }) => canonical).join(",")}]`).join(",")}}`;
 }
 
 function encodeCursor(snapshotHash: string, queryHash: string, position: readonly [number, string, number], maximum: number): string {
@@ -467,7 +475,7 @@ function dataValue(input: object, key: string, code: EvidenceQueryErrorCode): un
 function optionalDataValue(input: object, key: string, code: EvidenceQueryErrorCode): { present: boolean; value?: unknown } { const descriptor = Object.getOwnPropertyDescriptor(input, key); if (!descriptor) return { present: false }; if (!descriptor.enumerable || !("value" in descriptor)) fail(code); return { present: true, value: descriptor.value }; }
 function pairSort(a: readonly [string, unknown], b: readonly [string, unknown]): number { return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0; }
 function validateQueryDiagnostics(value: unknown): asserts value is EvidenceQueryDiagnostics {
-  const keys = ["indexVisits", "candidateVisits", "closureVisits", "normalizedQueryCanonicalizations"];
+  const keys = ["indexVisits", "candidateVisits", "closureVisits", "normalizedQueryCanonicalizations", "selectedWrapperCanonicalizations"];
   if (utilTypes.isProxy(value) || !isPlain(value)) fail("query.invalid-options"); const ownKeys = Reflect.ownKeys(value);
   if (ownKeys.length !== keys.length || ownKeys.some((key) => typeof key !== "string" || !keys.includes(key))) fail("query.invalid-options");
   for (const key of keys) { const descriptor = Object.getOwnPropertyDescriptor(value, key); if (!descriptor || !("value" in descriptor) || !descriptor.writable) fail("query.invalid-options"); const current = descriptor.value; if (!Number.isSafeInteger(current) || current < 0) fail("query.invalid-options"); }
