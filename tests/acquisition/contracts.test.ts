@@ -689,6 +689,52 @@ describe("immutable acquisition contracts", () => {
     expect(errorCode(() => registerProviderRequestPartitionInternal(owner, { ...nestedPartition, normalizedInput: { ...nestedPartition.normalizedInput, [oversizedUnknown]: true } }))).toBe("acquisition-contract.invalid-input");
   });
 
+  test("preflights nested array lengths before proxy enumeration or descriptor-map allocation", () => {
+    const dense = Array.from({ length: 17 }, (_, index) => String(index + 1));
+    let lengthReads = 0; let ownKeysReads = 0; let otherDescriptorReads = 0; let prototypeReads = 0;
+    const hostile = new Proxy(dense, {
+      getOwnPropertyDescriptor(target, key) { if (key === "length") { lengthReads += 1; return Reflect.getOwnPropertyDescriptor(target, key); } otherDescriptorReads += 1; throw new Error("unexpected descriptor enumeration"); },
+      ownKeys() { ownKeysReads += 1; throw new Error("unexpected ownKeys enumeration"); },
+      getPrototypeOf() { prototypeReads += 1; throw new Error("unexpected prototype access"); },
+    });
+    const preimage = partitionPreimage({ provider: "pubmed", endpointClass: "pubmed-search", target: "ncbi", normalizedInput: { kind: "pmid-list", pmids: dense }, requestedUrl: "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?id=1" });
+    const owner = createProviderPartitionPlanOwnerInternal({ planId: `plan-v1-${"f".repeat(64)}`, options: { ...PARTITION_LIMITS, maxStructureNodes: 16 } });
+    const snapshot = partitionSnapshot(preimage);
+    expect(errorCode(() => registerProviderRequestPartitionInternal(owner, { ...snapshot, normalizedInput: { kind: "pmid-list", pmids: hostile } }))).toBe("acquisition-contract.input-too-large");
+    expect({ lengthReads, ownKeysReads, otherDescriptorReads, prototypeReads }).toEqual({ lengthReads: 1, ownKeysReads: 0, otherDescriptorReads: 0, prototypeReads: 0 });
+    let throwingOwnKeys = 0;
+    const throwingLength = new Proxy(dense, { getOwnPropertyDescriptor() { throw new Error("SECRET length trap"); }, ownKeys() { throwingOwnKeys += 1; throw new Error("unexpected ownKeys enumeration"); } });
+    expect(errorCode(() => registerProviderRequestPartitionInternal(owner, { ...snapshot, normalizedInput: { kind: "pmid-list", pmids: throwingLength } }))).toBe("acquisition-contract.invalid-input");
+    expect(throwingOwnKeys).toBe(0);
+  });
+
+  test("bounds nested snapshot arrays from their length descriptor before a second descriptor map", () => {
+    const pmids = ["1"];
+    const input = partitionPreimage({ provider: "pubmed", endpointClass: "pubmed-search", target: "ncbi", normalizedInput: { kind: "pmid-list", pmids }, requestedUrl: "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?id=1" });
+    const originalLength = Object.getOwnPropertyDescriptor;
+    const originalDescriptors = Object.getOwnPropertyDescriptors;
+    let lengthReads = 0; let descriptorMaps = 0;
+    const lengthSpy = vi.spyOn(Object, "getOwnPropertyDescriptor").mockImplementation((value, key) => {
+      if (value === pmids && key === "length") { lengthReads += 1; const descriptor = originalLength(value, key)!; return lengthReads === 2 ? { ...descriptor, value: 100_001 } : descriptor; }
+      return originalLength(value, key);
+    });
+    const descriptorsSpy = vi.spyOn(Object, "getOwnPropertyDescriptors").mockImplementation((value) => { if (value === pmids) descriptorMaps += 1; return originalDescriptors(value); });
+    let code: string | undefined;
+    try { code = errorCode(() => createProviderPartitionKey(input as Parameters<typeof createProviderPartitionKey>[0])); }
+    finally { lengthSpy.mockRestore(); descriptorsSpy.mockRestore(); }
+    expect(code).toBe("acquisition-contract.input-too-large");
+    expect({ lengthReads, descriptorMaps }).toEqual({ lengthReads: 2, descriptorMaps: 1 });
+  });
+
+  test("applies explicit array caps to proxy arrays before enumeration", () => {
+    registeredPartition();
+    const redirects = Array.from({ length: 6 }, () => ({ ordinal: 1, status: 302 as const, fromUrl: URL, fromOrigin: "https://api.crossref.org", toUrl: URL, toOrigin: "https://api.crossref.org" }));
+    let lengthReads = 0; let ownKeysReads = 0;
+    const hostile = new Proxy(redirects, { getOwnPropertyDescriptor(target, key) { if (key === "length") { lengthReads += 1; return Reflect.getOwnPropertyDescriptor(target, key); } throw new Error("unexpected descriptor enumeration"); }, ownKeys() { ownKeysReads += 1; throw new Error("unexpected ownKeys enumeration"); } });
+    expect(errorCode(() => acquisitionTraceSettlementInternalExported(settlement({ redirectWitnesses: hostile }), PROJECTION_LIMITS))).toBe("acquisition-contract.result-too-large");
+    expect({ lengthReads, ownKeysReads }).toEqual({ lengthReads: 1, ownKeysReads: 0 });
+  });
+
   test("rejects overlong strings and keys before canonical expansion", () => {
     const owner = createProviderPartitionPlanOwnerInternal({ planId: `plan-v1-${"e".repeat(64)}`, options: { ...PARTITION_LIMITS, maxStringCanonicalBytes: 128 } });
     const endpointClass = "x".repeat(129);
