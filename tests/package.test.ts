@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -48,6 +49,34 @@ describe("Pi package manifest", () => {
 
     expect(manifest.keywords).toContain("pi-package");
     expect(manifest.pi).toEqual({ extensions: ["./extensions/research/index.ts"] });
+    expect((manifest as {exports?:unknown}).exports).toEqual({".":"./src/index.ts"});
+  });
+
+  it("resolves only the package root through Node self-reference semantics", async () => {
+    const script = `
+      const root = import.meta.resolve("pi-science-research");
+      if (!root.endsWith("/src/index.ts")) throw new Error("unexpected root: " + root);
+      for (const specifier of [
+        "pi-science-research/src/index.ts",
+        "pi-science-research/src/scholarly/identifiers.js",
+        "pi-science-research/src/acquisition/providers/provider-adapter-friend-internal.ts",
+        "pi-science-research/src/acquisition/providers/provider-adapter-friend-internal.js"
+      ]) {
+        for (const action of [() => import.meta.resolve(specifier), () => import(specifier)]) {
+          try { await action(); throw new Error("unexpected subpath access: " + specifier); }
+          catch (error) { if (error?.code !== "ERR_PACKAGE_PATH_NOT_EXPORTED") throw error; }
+        }
+      }
+      process.stdout.write("root-only");
+    `;
+    const scriptPath = join(fileURLToPath(projectRoot), `.package-self-reference-${process.pid}.mjs`);
+    await writeFile(scriptPath, script);
+    try {
+      const { stdout } = await execFileAsync(process.execPath, [scriptPath], { cwd: projectRoot });
+      expect(stdout).toBe("root-only");
+    } finally {
+      await rm(scriptPath, { force: true });
+    }
   });
 
   it("publishes only runtime sources and license files", async () => {

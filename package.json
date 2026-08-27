@@ -11,6 +11,9 @@
   "engines": {
     "node": ">=22.19.0"
   },
+  "exports": {
+    ".": "./src/index.ts"
+  },
   "files": [
     "extensions",
     "src",
