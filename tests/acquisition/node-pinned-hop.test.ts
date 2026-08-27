@@ -1,3 +1,4 @@
+import {EventEmitter} from "node:events";
 import { describe, expect, test, vi } from "vitest";
 
 import { canonicalJson } from "../../src/crypto/canonical-json.js";
@@ -5,8 +6,8 @@ import { sha256Hex } from "../../src/crypto/hash.js";
 import { NetworkPolicyError } from "../../src/acquisition/network-policy.js";
 import {
   PinnedHopRuntimeErrorInternal, SecureTransportError,
-  assertPinnedHopRuntimeInternal, createNodeDnsResolver, createNodeRuntimeCapabilitiesInternal, createPinnedHopRuntimeInternal,
-  type NodePinnedHopCallbacksInternal, type NodeOperationsInternal, type NodePinnedHopHandleInternal,
+  adaptNodeRequestInternal, assertPinnedHopRuntimeInternal, createNodeDnsResolver, createNodeRuntimeCapabilitiesInternal, createPinnedHopRuntimeInternal,
+  type NodePinnedHopCallbacksInternal, type NodeOperationsInternal, type NodePinnedHopHandleInternal, type NodeRequestCallbacksInternal, type NodeRequestOptionsInternal,
 } from "../../src/acquisition/node-pinned-hop-internal.js";
 import {
   RequestDeadlineErrorInternal, claimRequestDeadlineInternal, createNodeRequestDeadlineSchedulerCapabilitiesInternal,
@@ -100,6 +101,9 @@ describe("authenticated pinned Node hops",()=>{
     const syncSlow=setup();const slowTarget=await targetOf(syncSlow);syncSlow.mock.onRequest=()=>{syncSlow.mock.now+=11;};const slowHandle=syncSlow.runtime.openPinnedHop(slowTarget,{ownerId:"hop-owner-v1-sync-slow",url:slowTarget.url,headers:[],maxHeaderSize:100,connectTimeoutMs:10},callbacks(),syncSlow.deadline);const slowEndCount=syncSlow.mock.requests[0]!.counts.end;const slowTimerCount=syncSlow.mock.timerMilliseconds.size;slowHandle.forceClose();expect(slowEndCount).toBe(0);expect(slowTimerCount).toBe(1);await expect(slowHandle.completion).resolves.toMatchObject({outcome:"failed",failureCode:"hop.connect-timeout"});
     const asyncValue=setup();const asyncTarget=await targetOf(asyncValue);const asyncHandle=asyncValue.runtime.openPinnedHop(asyncTarget,{ownerId:"hop-owner-v1-async-normal",url:asyncTarget.url,headers:[],maxHeaderSize:100,connectTimeoutMs:10},callbacks(),asyncValue.deadline);expect([...asyncValue.mock.timerMilliseconds.values()]).toEqual([1_000,10]);asyncHandle.forceClose();
   });
+
+  test("quarantines IncomingMessage aborted and error sequences through one socket settlement",()=>{class FakeRequest extends EventEmitter{destroyCount=0;endCount=0;end(){this.endCount+=1;}destroy(){this.destroyCount+=1;}}class FakeResponse extends EventEmitter{statusCode=200;httpVersion="1.1";rawHeaders:string[]=[];}const options={url:"https://api.crossref.org/works",pinnedAddress:"8.8.8.8",family:4,hostHeader:"api.crossref.org",servername:"api.crossref.org",headers:[],agent:Object.freeze({protocol:"https:" as const,keepAlive:false as const,maxSockets:1 as const,maxFreeSockets:0 as const,destroy:()=>undefined}),ca:Object.freeze([]),rejectUnauthorized:true as const,maxHeaderSize:1024,insecureHTTPParser:false as const,joinDuplicateHeaders:false as const,checkServerIdentity:()=>undefined} satisfies NodeRequestOptionsInternal;for(const sequence of [["aborted","error","request-error"],["error","aborted","request-error"],["end","error","aborted","request-error"]] as const){const request=new FakeRequest();const response=new FakeResponse();let publish!:((value:never)=>void);const callbacks:NodeRequestCallbacksInternal={onSecureConnected:vi.fn(),onProtocolFailure:vi.fn(),onResponse:vi.fn(),onData:vi.fn((_chunk:Uint8Array)=>"continue" as const),onEnd:vi.fn(),onError:vi.fn()};const handle=adaptNodeRequestInternal("https:",options,callbacks,(_url,_options,onResponse)=>{publish=onResponse;return request as never;});publish(response as never);expect(response.listenerCount("aborted")).toBe(1);expect(response.listenerCount("error")).toBe(1);for(const event of sequence){expect(()=>event==="request-error"?request.emit("error",new Error("SECRET")):event==="error"?response.emit(event,new Error("SECRET")):response.emit(event)).not.toThrow();}expect(callbacks.onResponse).toHaveBeenCalledTimes(1);expect(response.listenerCount("aborted")).toBe(0);expect(response.listenerCount("data")).toBe(0);expect(response.listenerCount("end")).toBe(0);expect(response.listenerCount("error")).toBe(1);if(sequence[0]==="end"){expect(callbacks.onEnd).toHaveBeenCalledTimes(1);expect(callbacks.onError).not.toHaveBeenCalled();expect(request.destroyCount).toBe(0);}else{expect(callbacks.onError).toHaveBeenCalledTimes(1);expect(callbacks.onError).toHaveBeenCalledWith("socket");expect(callbacks.onEnd).not.toHaveBeenCalled();expect(request.destroyCount).toBe(1);}handle.destroy();expect(request.destroyCount).toBe(1);}}
+  );
 
   test("maps malformed injected Node operations to invalid-capability without invoking defaults",()=>{const mock=createMockSecureTransportCapabilities();expect(()=>createNodeRuntimeCapabilitiesInternal({...mock.ops,httpsRequest:undefined} as never)).toThrow(expect.objectContaining({code:"transport.invalid-capability"}));});
 

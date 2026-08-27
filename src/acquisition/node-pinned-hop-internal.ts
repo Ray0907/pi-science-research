@@ -83,13 +83,14 @@ function isTlsErrorCode(code:string):boolean{
     "UNABLE_TO_GET_ISSUER_CERT","UNABLE_TO_GET_ISSUER_CERT_LOCALLY","EPROTO",
   ].includes(code);
 }
-function adaptNodeRequest(protocol:"http:"|"https:",options:NodeRequestOptionsInternal,callbacks:NodeRequestCallbacksInternal):NodeRequestHandleInternal{
+type NodeRequestOperationInternal=(url:string,options:unknown,onResponse:(response:http.IncomingMessage)=>void)=>http.ClientRequest;
+function adaptNodeRequest(protocol:"http:"|"https:",options:NodeRequestOptionsInternal,callbacks:NodeRequestCallbacksInternal,requestOperation?:NodeRequestOperationInternal):NodeRequestHandleInternal{
   let lookupUsed=false;
   let phase:"connect"|"tls"|"secure"="connect";
   let callbackGate=true;
   let destroyed=false;
-  let request!:http.ClientRequest;
-  const destroyOnce=()=>{if(destroyed)return;destroyed=true;request.destroy();};
+  let request:http.ClientRequest|undefined;
+  const destroyOnce=()=>{if(destroyed)return;destroyed=true;if(request)request.destroy();};
   const rawHeaders:string[]=[];for(const {name,value} of options.headers)rawHeaders.push(name,value);rawHeaders.push("host",options.hostHeader);Object.freeze(rawHeaders);
   const pinnedLookupAll=Object.freeze([Object.freeze({address:options.pinnedAddress,family:options.family})]);
   const requestOptions={
@@ -111,16 +112,19 @@ function adaptNodeRequest(protocol:"http:"|"https:",options:NodeRequestOptionsIn
   };
   const onResponse=(response:http.IncomingMessage)=>{
     if(!callbackGate)return;
+    let flowAttached=false;
+    const responseData=(chunk:Buffer)=>{if(!callbackGate)return;if(callbacks.onData(new Uint8Array(chunk))==="abort")responseSocketFailure();};
+    const responseEnd=()=>{if(!callbackGate)return;callbackGate=false;cleanupFlow();callbacks.onEnd();};
+    const cleanupFlow=()=>{response.removeListener("aborted",responseSocketFailure);if(flowAttached){flowAttached=false;response.removeListener("data",responseData);response.removeListener("end",responseEnd);}};
+    const responseSocketFailure=()=>{if(!callbackGate)return;callbackGate=false;cleanupFlow();callbacks.onError("socket");destroyOnce();};
+    response.on("aborted",responseSocketFailure);
+    response.on("error",responseSocketFailure);
     if(protocol==="http:")phase="secure";
     callbacks.onResponse(response.statusCode??0,response.httpVersion,response.rawHeaders);
-    if(destroyed){callbackGate=false;return;}
-    response.on("data",(chunk:Buffer)=>{
-      if(!callbackGate)return;
-      if(callbacks.onData(new Uint8Array(chunk))==="abort"){callbackGate=false;callbacks.onError("socket");destroyOnce();}
-    });
-    response.on("end",()=>{if(!callbackGate)return;callbackGate=false;callbacks.onEnd();});
+    if(destroyed){callbackGate=false;cleanupFlow();return;}
+    flowAttached=true;response.on("data",responseData);response.on("end",responseEnd);
   };
-  request=protocol==="https:"?https.request(options.url,requestOptions as never,onResponse):http.request(options.url,requestOptions as never,onResponse);
+  const created=requestOperation?requestOperation(options.url,requestOptions,onResponse):protocol==="https:"?https.request(options.url,requestOptions as never,onResponse):http.request(options.url,requestOptions as never,onResponse);request=created;if(destroyed)request.destroy();
   request.on("socket",(socket)=>{
     if(protocol!=="https:")return;
     socket.once("connect",()=>{if(callbackGate&&phase==="connect")phase="tls";});
@@ -148,8 +152,9 @@ function adaptNodeRequest(protocol:"http:"|"https:",options:NodeRequestOptionsIn
     if(parserFailure!==null){callbacks.onProtocolFailure(parserFailure);return;}
     callbacks.onError(phase==="secure"?"socket":protocol==="https:"&&(phase==="tls"||isTlsErrorCode(code))?"tls":"connect");
   });
-  return{end:()=>request.end(),abort:destroyOnce,destroy:destroyOnce};
+  return{end:()=>request!.end(),abort:destroyOnce,destroy:destroyOnce};
 }
+export function adaptNodeRequestInternal(protocol:"http:"|"https:",options:NodeRequestOptionsInternal,callbacks:NodeRequestCallbacksInternal,requestOperation:NodeRequestOperationInternal):NodeRequestHandleInternal{return adaptNodeRequest(protocol,options,callbacks,requestOperation);}
 const unavailableBundledRoots=Object.freeze([] as string[]);
 function readProductionBundledRoots():readonly string[]{try{return tls.rootCertificates;}catch{return unavailableBundledRoots;}}
 const productionBundledRoots=readProductionBundledRoots();

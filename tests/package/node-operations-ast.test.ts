@@ -339,6 +339,7 @@ function auditTestNetworkSource(source:string):string[]{
 }
 
 const defaultFactoryRequiredArguments=new Map<string,readonly number[]>([
+  ["adaptNodeRequestInternal",[3]],
   ["createNodeRuntimeCapabilitiesInternal",[0]],
   ["createNodeDnsResolver",[0]],
   ["createNodeRequestDeadlineSchedulerCapabilitiesInternal",[0]],
