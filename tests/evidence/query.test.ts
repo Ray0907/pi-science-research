@@ -251,6 +251,7 @@ describe("bounded evidence queries", () => {
       [() => index().query(query({ evidenceRefs: [{ evidenceId: "bad", revision: 1 }] as never })), "query.reference-invalid"],
       [() => buildEvidenceIndexFromRecords(records({ sources: [source(), { ...source(), sourceId: "src-query.00000002" }] }), undefined), "query.identity-invalid"],
       [() => buildEvidenceIndexFromRecords(records({ sources: [source(undefined, { lineage: { ...source().lineage, cohortIds: ["duplicate", "duplicate"] } })] }), undefined), "query.identity-invalid"],
+      [() => buildEvidenceIndexFromRecords(records({ sources: [source(undefined, { identifiers: { doi: "not-a-doi", pmid: null, pmcid: null } })] }), undefined), "query.identity-invalid"],
       [() => buildEvidenceIndexFromRecords(records({ claims: [claim(), { ...claim() }] }), undefined), "query.invalid-evidence-set"],
       [() => buildEvidenceIndexFromRecords(records({ sources: [a, b], evidence: [evidence(undefined, { sourceRef: { sourceId: a.sourceId, revision: 1 } })] }), undefined), "query.lineage-invalid"],
     ]; for (const [action, expected] of cases) expect(errorCode(action)).toBe(expected);

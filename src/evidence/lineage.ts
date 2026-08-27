@@ -291,7 +291,7 @@ function buildPreparedGraph(
   const nodeCount = checkedAdd(prepared.length, revisionsBySource.size, "lineage.too-many-sources");
   if (nodeCount > options.maxGraphNodes) fail("lineage.too-many-sources");
 
-  const sourceIds = radixSortByUtf8Key([...revisionsBySource.keys()], (value) => value);
+  const sourceIds = sortByCodeUnitKey([...revisionsBySource.keys()], (value) => value);
   const ordered: PreparedSource[] = [];
   const latestBySource = new Map<string, PreparedSource>();
   for (const sourceId of sourceIds) {
@@ -528,24 +528,8 @@ function checkedAdd(left: number, right: number, code: LineageErrorCode): number
 function isPlain(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
 }
-function radixSortByUtf8Key<T>(values: readonly T[], key: (value: T) => string): T[] {
-  const encoded = values.map((value) => ({ value, bytes: Buffer.from(key(value), "utf8") }));
-  type Item = (typeof encoded)[number];
-  type Frame = { readonly items: Item[]; readonly offset: number } | { readonly emit: Item[] };
-  const stack: Frame[] = [{ items: encoded, offset: 0 }];
-  const output: Item[] = [];
-  while (stack.length > 0) {
-    const frame = stack.pop()!;
-    if ("emit" in frame) { output.push(...frame.emit); continue; }
-    if (frame.items.length < 2) { output.push(...frame.items); continue; }
-    const buckets: Item[][] = Array.from({ length: 257 }, () => []);
-    for (const item of frame.items)
-      buckets[frame.offset >= item.bytes.length ? 0 : item.bytes[frame.offset]! + 1]!.push(item);
-    for (let index = buckets.length - 1; index >= 1; index -= 1)
-      if (buckets[index]!.length > 0) stack.push({ items: buckets[index]!, offset: frame.offset + 1 });
-    if (buckets[0]!.length > 0) stack.push({ emit: buckets[0]! });
-  }
-  return output.map(({ value }) => value);
+function sortByCodeUnitKey<T>(values: readonly T[], key: (value: T) => string): T[] {
+  return [...values].sort((left, right) => { const leftKey = key(left); const rightKey = key(right); return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0; });
 }
 function fail(code: LineageErrorCode): never { throw new LineageError(code); }
 

@@ -22,7 +22,6 @@ import {
 export type SourceIdentityErrorCode =
   | "source.invalid-options"
   | "source.invalid-input"
-  | "source.semantic-invalid"
   | "source.too-many-records"
   | "source.too-many-provenance-steps"
   | "source.record-too-large"
@@ -106,6 +105,7 @@ const indexState = new WeakMap<object, ProvenanceState>();
 const validatedSourceRecordsState = new WeakMap<readonly SourceRecord[], ProvenanceState>();
 const snapshotSourceProvenanceState = new WeakMap<object, Readonly<{ index: RequestProvenanceIndex; provenance: SourceProvenance }>>();
 const evidenceSnapshotDuplicateRequestErrors = new WeakSet<object>();
+const evidenceSnapshotSemanticErrors = new WeakSet<object>();
 /** @internal Read-only package lookup; never exported from the package root. */
 export interface ValidatedSourceRecordsInternal {
   readonly sources: readonly SourceRecord[];
@@ -282,7 +282,7 @@ function buildRequestProvenanceIndexInternal(
   for (const { record } of validatedSources) validateSourceSemantics(record);
   const sourceChains = revisionChains(validatedSources, true);
   const orderedSources = [...sourceChains.values()].flat();
-  const orderedRequests = radixSortByUtf8Key(validatedRequests, ({ record }) => record.requestId);
+  const orderedRequests = sortByCodeUnitKey(validatedRequests, ({ record }) => record.requestId);
   const indexedRequests = orderedRequests.map((request) => indexRequestUrls(request, normalized, diagnostics));
 
   const requestsById = new Map<string, IndexedRequest>();
@@ -365,9 +365,12 @@ export function getValidatedSourceRecordsInternal(
   });
 }
 
-/** Package-internal closed translation guard for Task 4 duplicate requests. */
+/** Package-internal closed translation guards for Task 4 snapshot construction. */
 export function isEvidenceSnapshotDuplicateRequestError(error: unknown): boolean {
   return typeof error === "object" && error !== null && evidenceSnapshotDuplicateRequestErrors.has(error);
+}
+export function isEvidenceSnapshotSourceSemanticError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && evidenceSnapshotSemanticErrors.has(error);
 }
 
 /** Package-internal cached lookup for exact Task 2-issued source objects. */
@@ -407,7 +410,7 @@ export function validateSourceCanonicalUrlProvenanceOnce(
 function selectProvenance(state: ProvenanceState, sourceHash: string): SourceUrlProvenance {
   const provenance = state.sourceByHash.get(sourceHash);
   if (!provenance || provenance.witnesses.length === 0) fail(provenance?.failure ?? "source.provenance-index-mismatch");
-  return provenance.witnesses[0]!.value;
+  return deepFreeze(JSON.parse(canonicalJson(provenance.witnesses[0]!.value)) as SourceUrlProvenance);
 }
 
 export function mergeSourceRecords(
@@ -655,7 +658,7 @@ function mergeValidated(existing: readonly ValidatedSource[], incoming: readonly
       incoming: true,
     });
   }
-  const orderedNodes = radixSortByUtf8Key(nodes, ({ id }) => id);
+  const orderedNodes = sortByCodeUnitKey(nodes, ({ id }) => id);
   nodes.splice(0, nodes.length, ...orderedNodes);
   const union = new UnionFind(nodes.length);
   const strong = new Map<string, number>();
@@ -708,7 +711,7 @@ function mergeValidated(existing: readonly ValidatedSource[], incoming: readonly
       ? existingById.get(retainedId)!.at(-1)!
       : componentNodes.find(({ id }) => id === retainedId)!.current;
     const base = baseValidated.record;
-    const candidates = radixSortByUtf8Key(componentNodes.map(({ current }) => current),
+    const candidates = sortByCodeUnitKey(componentNodes.map(({ current }) => current),
       ({ record, json }) => `${record.sourceId}\0${json}`).map(({ record }) => record);
     const retainedEffectiveIdentifiers = componentNodes.find(({ id }) => id === retainedId)!.authoritativeIdentifiers;
     const merged = mergeGroup(
@@ -727,10 +730,10 @@ function mergeValidated(existing: readonly ValidatedSource[], incoming: readonly
       output.push(created); changed.push(ref(created));
     }
   }
-  const orderedOutput = radixSortByUtf8Key(output, ({ sourceId, revision }) => `${sourceId}\0${revisionKey(revision)}`);
-  const orderedConflicts = radixSortByUtf8Key(conflicts, (value) => `${value.code}\0${value.field}\0${canonicalJson(value)}`);
-  const orderedChanged = radixSortByUtf8Key(changed, ({ sourceId, revision }) => `${sourceId}\0${revisionKey(revision)}`);
-  const canonicalAliases = Object.fromEntries(radixSortByUtf8Key(Object.entries(aliases), ([sourceId]) => sourceId));
+  const orderedOutput = [...output].sort(compareSourceRefs);
+  const orderedConflicts = sortByCodeUnitKey(conflicts, (value) => `${value.code}\0${value.field}\0${canonicalJson(value)}`);
+  const orderedChanged = [...changed].sort(compareSourceRefs);
+  const canonicalAliases = Object.fromEntries(sortByCodeUnitKey(Object.entries(aliases), ([sourceId]) => sourceId));
   return deepFreeze({ sources: orderedOutput, aliases: canonicalAliases, conflicts: orderedConflicts, changedSourceRefs: orderedChanged });
 }
 
@@ -752,12 +755,12 @@ function revisionChains(records: readonly ValidatedSource[], existing: boolean):
     revisions.set(record.record.revision, record);
     indexed.set(record.record.sourceId, revisions);
   }
-  const orderedIds = radixSortByUtf8Key([...indexed.keys()], (value) => value);
+  const orderedIds = sortByCodeUnitKey([...indexed.keys()], (value) => value);
   const groups = new Map<string, ValidatedSource[]>();
   for (const sourceId of orderedIds) {
     const revisions = indexed.get(sourceId)!;
     if (!existing) {
-      groups.set(sourceId, [...revisions.values()]);
+      groups.set(sourceId, [...revisions.values()].sort((left, right) => left.record.revision - right.record.revision));
       continue;
     }
     const list: ValidatedSource[] = [];
@@ -831,10 +834,10 @@ function mergeGroup(
       conflicts.push(conflict("source.metadata-conflict", "peerReviewStatus", [merged, candidate], [merged.peerReviewStatus, candidate.peerReviewStatus]));
   }
   merged.authors = sortedCanonicalValues(authors);
-  merged.retrievalRequestIds = radixSortByUtf8Key([...retrievalRequestIds], (value) => value);
+  merged.retrievalRequestIds = sortByCodeUnitKey([...retrievalRequestIds], (value) => value);
   merged.metadataProvenance = sortedCanonicalValues(metadataProvenance);
-  merged.lineage.cohortIds = radixSortByUtf8Key([...cohortIds], (value) => value);
-  merged.lineage.datasetIds = radixSortByUtf8Key([...datasetIds], (value) => value);
+  merged.lineage.cohortIds = sortByCodeUnitKey([...cohortIds], (value) => value);
+  merged.lineage.datasetIds = sortByCodeUnitKey([...datasetIds], (value) => value);
   const sortedRelations = sortedCanonicalValues(relations);
   merged.lineage.relatedSourceIds = sortedRelations.map(({ id }) => id);
   merged.lineage.relationTypes = sortedRelations.map(({ type }) => type);
@@ -844,8 +847,8 @@ function mergeGroup(
 function conflict(code: SourceMergeConflict["code"], field: string, records: readonly SourceRecord[], values: readonly unknown[]): SourceMergeConflict {
   return deepFreeze({
     code, field,
-    sourceIds: radixSortByUtf8Key([...new Set(records.map(({ sourceId }) => sourceId))], (value) => value),
-    canonicalValueHashes: radixSortByUtf8Key([...new Set(values.map((value) => sha256Hex(canonicalJson(value))))], (value) => value),
+    sourceIds: sortByCodeUnitKey([...new Set(records.map(({ sourceId }) => sourceId))], (value) => value),
+    canonicalValueHashes: sortByCodeUnitKey([...new Set(values.map((value) => sha256Hex(canonicalJson(value))))], (value) => value),
   });
 }
 function hasProvenance(record: SourceRecord, field: string): boolean {
@@ -968,7 +971,7 @@ function validatePolicyOptions(policy: Record<string, unknown>): {
     catch (error) { if (error instanceof SourceIdentityError) throw error; return fail("source.invalid-options"); }
     seen.add(host); hosts.push(host);
   }
-  const orderedHosts = radixSortByUtf8Key(hosts, (host) => host);
+  const orderedHosts = sortByCodeUnitKey(hosts, (host) => host);
   return {
     allowHttp: true, approvedHttpHosts: Object.freeze(orderedHosts), accessPolicySha256: policy.accessPolicySha256,
     maxApprovedHttpHosts: maxHosts as number,
@@ -1070,29 +1073,13 @@ function addCanonical<T>(target: Map<string, T>, values: readonly T[]): void {
   }
 }
 function sortedCanonicalValues<T>(values: ReadonlyMap<string, T>): T[] {
-  return radixSortByUtf8Key([...values.keys()], (encoded) => encoded).map((encoded) => JSON.parse(encoded) as T);
+  return sortByCodeUnitKey([...values.keys()], (encoded) => encoded).map((encoded) => JSON.parse(encoded) as T);
 }
 function radixSortWitnesses(values: readonly Witness[]): Witness[] {
-  return radixSortByUtf8Key(values, ({ key }) => key);
+  return sortByCodeUnitKey(values, ({ key }) => key);
 }
-function radixSortByUtf8Key<T>(values: readonly T[], key: (value: T) => string): T[] {
-  const encoded = values.map((value) => ({ value, bytes: Buffer.from(key(value), "utf8") }));
-  type Item = (typeof encoded)[number];
-  type Frame = { readonly items: Item[]; readonly offset: number } | { readonly emit: Item[] };
-  const stack: Frame[] = [{ items: encoded, offset: 0 }];
-  const output: Item[] = [];
-  while (stack.length > 0) {
-    const frame = stack.pop()!;
-    if ("emit" in frame) { output.push(...frame.emit); continue; }
-    if (frame.items.length < 2) { output.push(...frame.items); continue; }
-    const buckets: Item[][] = Array.from({ length: 257 }, () => []);
-    for (const item of frame.items)
-      buckets[frame.offset >= item.bytes.length ? 0 : item.bytes[frame.offset]! + 1]!.push(item);
-    for (let index = buckets.length - 1; index >= 1; index -= 1)
-      if (buckets[index]!.length > 0) stack.push({ items: buckets[index]!, offset: frame.offset + 1 });
-    if (buckets[0]!.length > 0) stack.push({ emit: buckets[0]! });
-  }
-  return output.map(({ value }) => value);
+function sortByCodeUnitKey<T>(values: readonly T[], key: (value: T) => string): T[] {
+  return [...values].sort((left, right) => { const leftKey = key(left); const rightKey = key(right); return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0; });
 }
 function checkedAdd(left: number, right: number): number {
   const value = left + right;
@@ -1100,7 +1087,7 @@ function checkedAdd(left: number, right: number): number {
   return value;
 }
 function ref(record: SourceRecord): { sourceId: string; revision: number } { return Object.freeze({ sourceId: record.sourceId, revision: record.revision }); }
-function revisionKey(revision: number): string { return revision.toString(10).padStart(16, "0"); }
+function compareSourceRefs(left: Readonly<{ sourceId: string; revision: number }>, right: Readonly<{ sourceId: string; revision: number }>): number { return left.sourceId < right.sourceId ? -1 : left.sourceId > right.sourceId ? 1 : left.revision - right.revision; }
 function isPlain(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
 }
@@ -1115,7 +1102,7 @@ function translateIdentifierErrorForEvidenceSnapshot(error: ScholarlyIdentifierE
   if (error.code === "identifier.invalid-options" || error.code === "url.http-context-invalid") fail("source.invalid-options");
   if (error.code === "identifier.record-too-large") fail("source.record-too-large");
   if (error.code.startsWith("url.")) fail("source.url-policy-invalid");
-  return fail("source.semantic-invalid");
+  const translated = new SourceIdentityError("source.invalid-input"); evidenceSnapshotSemanticErrors.add(translated); throw translated;
 }
 function translateIdentifierError(error: ScholarlyIdentifierError): never {
   if (error.code === "identifier.invalid-options" || error.code === "url.http-context-invalid") fail("source.invalid-options");

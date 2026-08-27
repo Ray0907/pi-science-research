@@ -9,9 +9,10 @@ import {
   EvidenceAdmissionError,
   buildBoundedValidatedEvidenceSnapshot,
   type CanonicalEvidenceSet,
+  type EvidenceAdmissionErrorCode,
   type EvidenceSnapshotDiagnostics,
 } from "../../src/evidence/admission.js";
-import { getValidatedSnapshotIndexes } from "../../src/evidence/validated-snapshot-internal.js";
+import { EvidenceSnapshotBuildFailureInternal, buildBoundedValidatedEvidenceSnapshotInternal, getValidatedSnapshotIndexes } from "../../src/evidence/validated-snapshot-internal.js";
 
 const AT = "2026-08-25T12:00:00.000Z";
 const HASH = "a".repeat(64);
@@ -78,11 +79,13 @@ describe("validated evidence snapshot internals", () => {
       "prepareProspectiveEvidenceCanonicalInternal", "validatePreparedEvidenceSemanticsInternal",
       "getLineageDependencyComponentKey", "getLineageRelationComponentKeyInternal",
       "getLineageDependencyComponentCountInternal", "buildLineageGraphFromValidatedSourcesForEvidenceSnapshotInternal",
-      "buildRequestProvenanceIndexForEvidenceSnapshotInternal", "isEvidenceSnapshotDuplicateRequestError",
+      "buildRequestProvenanceIndexForEvidenceSnapshotInternal", "isEvidenceSnapshotDuplicateRequestError", "isEvidenceSnapshotSourceSemanticError",
       "validateSourceCanonicalUrlProvenanceFromSnapshotInternal", "validateSourceIdentityOptionsForEvidenceSnapshotInternal",
-      "validatePreparedSourceIdentityFieldsInternal",
+      "validatePreparedSourceIdentityFieldsInternal", "EvidenceSnapshotBuildFailureInternal",
     ]) expect(name in rootExports).toBe(false);
   });
+  test("keeps the public admission error union exact and excludes internal stage classifiers", () => { const approved = ["evidence.invalid-options", "evidence.invalid-input", "evidence.snapshot-invalid", "evidence.too-many-records", "evidence.too-many-references", "evidence.record-too-large", "evidence.input-too-large", "evidence.duplicate-revision", "evidence.revision-gap", "evidence.unresolved-ref", "evidence.duplicate-request", "evidence.stale-latest-ref", "evidence.duplicate-source-identity", "evidence.ambiguous-source-identity", "evidence.source-url-policy-invalid", "evidence.source-url-unattributed", "evidence.source-url-request-mismatch", "evidence.source-url-metadata-mismatch", "evidence.asymmetric-conflict", "evidence.invalid-prospective-record"] as const satisfies readonly EvidenceAdmissionErrorCode[]; const exhaustive: [Exclude<EvidenceAdmissionErrorCode, (typeof approved)[number]>] extends [never] ? true : false = true; expect(exhaustive).toBe(true); expect("EvidenceSnapshotBuildFailureInternal" in rootExports).toBe(false); });
+  test("retains closed internal source and lineage stage codes before public translation", () => { const semantic = source({ identifiers: { doi: "not-a-doi", pmid: null, pmcid: null } }); let semanticFailure: unknown; try { buildBoundedValidatedEvidenceSnapshotInternal(records({ sources: [semantic] })); } catch (error) { semanticFailure = error; } expect(semanticFailure).toBeInstanceOf(EvidenceSnapshotBuildFailureInternal); expect(semanticFailure).toMatchObject({ code: "snapshot.source-identity-invalid", upstreamClass: "SourceIdentityError", upstreamCode: "source.invalid-input" }); expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: [semantic] })))).toBe("evidence.invalid-input"); const malformed = source({ lineage: { ...source().lineage, cohortIds: ["duplicate", "duplicate"] } }); let identity: unknown; try { buildBoundedValidatedEvidenceSnapshotInternal(records({ sources: [malformed] })); } catch (error) { identity = error; } expect(identity).toBeInstanceOf(EvidenceSnapshotBuildFailureInternal); expect(identity).toMatchObject({ code: "snapshot.source-identity-invalid", upstreamClass: "SourceIdentityError", upstreamCode: "source.invalid-lineage" }); const a = source({ sourceId: "src-stage.cyclea01", identifiers: { doi: "10.1234/stage-a", pmid: null, pmcid: null }, canonicalUrl: "https://doi.org/10.1234/stage-a", lineage: { ...source().lineage, relatedSourceIds: ["src-stage.cycleb01"], relationTypes: ["version-of"] } }); const b = source({ sourceId: "src-stage.cycleb01", identifiers: { doi: "10.1234/stage-b", pmid: null, pmcid: null }, canonicalUrl: "https://doi.org/10.1234/stage-b", lineage: { ...source().lineage, relatedSourceIds: [a.sourceId], relationTypes: ["version-of"] } }); let lineage: unknown; try { buildBoundedValidatedEvidenceSnapshotInternal(records({ sources: [a, b] })); } catch (error) { lineage = error; } expect(lineage).toBeInstanceOf(EvidenceSnapshotBuildFailureInternal); expect(lineage).toMatchObject({ code: "snapshot.lineage-invalid", upstreamClass: "LineageError" }); expect((lineage as Error).message).not.toMatch(/stage-a|stage-b|cyclea|cycleb/u); });
   test("deep-freezes outgoing exact keys across mutation and repeated traversal", () => {
     const snapshot = buildBoundedValidatedEvidenceSnapshot(records());
     const indexes = getValidatedSnapshotIndexes(snapshot);
@@ -190,10 +193,10 @@ describe("validated evidence snapshot internals", () => {
     };
     expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ requests: [request, { ...request }] })))).toBe("evidence.duplicate-request");
     const semantic = source({ lineage: { ...source().lineage, cohortIds: ["duplicate", "duplicate"] } });
-    expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: [semantic] })))).toBe("evidence.source-semantic-invalid");
+    expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: [semantic] })))).toBe("evidence.invalid-input");
     const a = source({ sourceId: "src-internal.cyclea", identifiers: { doi: "10.1234/cycle-a", pmid: null, pmcid: null }, canonicalUrl: "https://doi.org/10.1234/cycle-a", lineage: { ...source().lineage, studyId: "study-a", relatedSourceIds: ["src-internal.cycleb"], relationTypes: ["version-of"] } });
     const b = source({ sourceId: "src-internal.cycleb", identifiers: { doi: "10.1234/cycle-b", pmid: null, pmcid: null }, canonicalUrl: "https://doi.org/10.1234/cycle-b", lineage: { ...source().lineage, studyId: "study-b", relatedSourceIds: [a.sourceId], relationTypes: ["version-of"] } });
-    expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: [a, b] })))).toBe("evidence.lineage-invalid");
+    expect(code(() => buildBoundedValidatedEvidenceSnapshot(records({ sources: [a, b] })))).toBe("evidence.invalid-input");
   });
   test("audits complete strong identity and URL components deterministically", () => {
     const first = source();

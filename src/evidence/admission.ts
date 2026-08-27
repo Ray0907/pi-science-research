@@ -19,7 +19,7 @@ import type { SourceUrlPolicyContext } from "../scholarly/identifiers.js";
 import type { RequestProvenanceIndex } from "../scholarly/source-identity.js";
 import { getLineageRelationComponentKeyInternal, LineageError } from "./lineage.js";
 import {
-  buildBoundedValidatedEvidenceSnapshotInternal,
+  buildBoundedValidatedEvidenceSnapshotInternal, EvidenceSnapshotBuildFailureInternal,
   getValidatedSnapshotIndexes,
   type SnapshotRecordKey,
 } from "./validated-snapshot-internal.js";
@@ -43,8 +43,6 @@ export type EvidenceAdmissionErrorCode =
   | "evidence.source-url-unattributed"
   | "evidence.source-url-request-mismatch"
   | "evidence.source-url-metadata-mismatch"
-  | "evidence.source-semantic-invalid"
-  | "evidence.lineage-invalid"
   | "evidence.asymmetric-conflict"
   | "evidence.invalid-prospective-record";
 export class EvidenceAdmissionError extends Error {
@@ -117,7 +115,8 @@ export interface EvidenceGateDecision {
 export function buildBoundedValidatedEvidenceSnapshot(
   records: CanonicalEvidenceSet, options?: EvidenceSnapshotOptions, diagnostics?: EvidenceSnapshotDiagnostics,
 ): BoundedValidatedEvidenceSnapshot {
-  return buildBoundedValidatedEvidenceSnapshotInternal(records, options, diagnostics);
+  try { return buildBoundedValidatedEvidenceSnapshotInternal(records, options, diagnostics); }
+  catch (error) { if (error instanceof EvidenceSnapshotBuildFailureInternal) fail("evidence.invalid-input"); throw error; }
 }
 export function validateCanonicalEvidenceSet(records: CanonicalEvidenceSet, options?: EvidenceSnapshotOptions): CanonicalEvidenceSet {
   return buildBoundedValidatedEvidenceSnapshot(records, options).records;

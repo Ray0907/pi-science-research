@@ -182,6 +182,7 @@ describe("citation mappings", () => {
       [() => assignCitationMappings(snapshot(), [sourceRef()], [binding(), binding({ sourceRef: { ...sourceRef(), revision: 2 } })]), "citation.ambiguous-source-revision"],
       [() => assignCitationMappingsFromRecords(records({ claims: [claim(), { ...claim() }] }), [], []), "citation.invalid-evidence-set"],
       [() => assignCitationMappingsFromRecords(records({ sources: [source(undefined, { lineage: { ...source().lineage, cohortIds: ["duplicate", "duplicate"] } })] }), [], []), "citation.noncanonical-source"],
+      [() => assignCitationMappingsFromRecords(records({ sources: [source(undefined, { identifiers: { doi: "not-a-doi", pmid: null, pmcid: null } })] }), [], []), "citation.noncanonical-source"],
       [() => assignCitationMappingsFromRecords(records({ sources: [lineageA, lineageB], evidence: [evidence(undefined, { sourceRef: sourceRef(lineageA) })] }), [], []), "citation.invalid-evidence-set"],
     ]; for (const [action, code] of cases) expect(errorCode(action)).toBe(code);
   });

@@ -16,16 +16,18 @@ import {
 import { parse } from "../domain/schema.js";
 import {
   buildLineageGraphFromValidatedSourcesForEvidenceSnapshotInternal,
-  getLineageDependencyComponentCountInternal, LineageError, type LineageGraph,
+  getLineageDependencyComponentCountInternal, LineageError, type LineageErrorCode, type LineageGraph,
 } from "./lineage.js";
 import {
   SourceIdentityError,
   buildRequestProvenanceIndexForEvidenceSnapshotInternal,
   isEvidenceSnapshotDuplicateRequestError,
+  isEvidenceSnapshotSourceSemanticError,
   validateSourceCanonicalUrlProvenanceFromSnapshotInternal,
   validateSourceIdentityOptionsForEvidenceSnapshotInternal,
   validatedProvenanceRecordsForSnapshot,
   type RequestProvenanceDiagnostics,
+  type SourceIdentityErrorCode,
   type RequestProvenanceIndex,
 } from "../scholarly/source-identity.js";
 import { assertBoundedStructure, StructuralLimitError } from "../storage/bounded-structure.js";
@@ -43,6 +45,15 @@ import {
 
 export type SnapshotRecordKind = "sources" | "claims" | "evidence" | "verifications" | "requests" | "calculations";
 export interface SnapshotRecordKey { readonly kind: SnapshotRecordKind; readonly id: string; readonly revision: number | null }
+export type EvidenceSnapshotBuildFailureCodeInternal = "snapshot.source-identity-invalid" | "snapshot.lineage-invalid";
+/** Package-internal stage classifier for raw wrappers; intentionally absent from the package root. */
+export class EvidenceSnapshotBuildFailureInternal extends Error {
+  readonly code: EvidenceSnapshotBuildFailureCodeInternal;
+  readonly upstreamClass: "SourceIdentityError" | "LineageError";
+  readonly upstreamCode: SourceIdentityErrorCode | LineageErrorCode;
+  constructor(code: EvidenceSnapshotBuildFailureCodeInternal, upstreamClass: "SourceIdentityError" | "LineageError", upstreamCode: SourceIdentityErrorCode | LineageErrorCode) { super(`Evidence snapshot construction rejected (${code})`); this.name = "EvidenceSnapshotBuildFailureInternal"; this.code = code; this.upstreamClass = upstreamClass; this.upstreamCode = upstreamCode; }
+}
+
 export interface ValidatedSnapshotIndexes {
   readonly snapshotSha256: string;
   readonly optionsSha256: string;
@@ -332,11 +343,7 @@ function makePublicIndexes(
 }
 
 function orderPrepared<T>(kind: SnapshotRecordKind, values: readonly Prepared<T>[]): Prepared<T>[] {
-  return radixSortByUtf8Key(values, ({ record }) => {
-    const id = stableId(kind, record);
-    const revision = (record as { revision?: number }).revision;
-    return `${id}\0${revision === undefined ? "" : String(revision).padStart(16, "0")}`;
-  });
+  return [...values].sort((left, right) => { const leftId = stableId(kind, left.record); const rightId = stableId(kind, right.record); if (leftId !== rightId) return leftId < rightId ? -1 : 1; return ((left.record as { revision?: number }).revision ?? 0) - ((right.record as { revision?: number }).revision ?? 0); });
 }
 function prepareEvidenceKind(
   inputs: readonly unknown[], expected: "claim" | "evidence" | "verification", maxBytes: number,
@@ -474,7 +481,7 @@ function preflightReferences(prepared: Record<SnapshotRecordKind, readonly Prepa
   return count;
 }
 function preflightLineageComponents(sources: readonly SourceRecord[], maximum: number): void {
-  const ids = radixSortByUtf8Key([...new Set(sources.map(({ sourceId }) => sourceId))], (value) => value);
+  const ids = sortByCodeUnitKey([...new Set(sources.map(({ sourceId }) => sourceId))], (value) => value);
   const indexById = new Map(ids.map((id, index) => [id, index] as const));
   const parent = ids.map((_, index) => index);
   const find = (value: number): number => { let root = value; while (parent[root] !== root) root = parent[root]!; while (parent[value] !== value) { const next = parent[value]!; parent[value] = root; value = next; } return root; };
@@ -518,7 +525,7 @@ function assembleCanonicalSet(prepared: Record<SnapshotRecordKind, readonly Prep
   return `{${KIND_ORDER.map((kind) => `${canonicalJson(kind)}:[${prepared[kind].map(({ json }) => json).join(",")}]`).join(",")}}`;
 }
 function auditSourceIdentities(sources: readonly SourceRecord[], diagnostics?: EvidenceSnapshotDiagnostics): void {
-  const sourceIds = radixSortByUtf8Key([...new Set(sources.map(({ sourceId }) => sourceId))], (value) => value);
+  const sourceIds = sortByCodeUnitKey([...new Set(sources.map(({ sourceId }) => sourceId))], (value) => value);
   const indexById = new Map(sourceIds.map((id, index) => [id, index] as const));
   const parent = sourceIds.map((_, index) => index);
   const find = (value: number): number => { let root = value; while (parent[root] !== root) root = parent[root]!; while (parent[value] !== value) { const next = parent[value]!; parent[value] = root; value = next; } return root; };
@@ -629,14 +636,13 @@ function validateDiagnostics(value?: EvidenceSnapshotDiagnostics): void {
 function bump(value: EvidenceSnapshotDiagnostics | undefined, key: keyof EvidenceSnapshotDiagnostics, amount = 1) { if (value) value[key] = checkedAdd(value[key], amount, "evidence.input-too-large"); }
 function translateSourceError(error: unknown): never {
   if (error instanceof SourceIdentityError) {
+    if (isEvidenceSnapshotSourceSemanticError(error) || error.code === "source.invalid-provenance" || error.code === "source.invalid-lineage") throw new EvidenceSnapshotBuildFailureInternal("snapshot.source-identity-invalid", "SourceIdentityError", error.code);
     const map: Partial<Record<string, any>> = {
       "source.record-too-large": "evidence.record-too-large", "source.input-too-large": "evidence.input-too-large",
       "source.too-many-records": "evidence.input-too-large", "source.too-many-provenance-steps": "evidence.too-many-references",
       "source.duplicate-revision": "evidence.duplicate-revision", "source.revision-gap": "evidence.revision-gap",
       "source.url-policy-invalid": "evidence.source-url-policy-invalid", "source.url-unattributed": "evidence.source-url-unattributed",
       "source.url-request-mismatch": "evidence.source-url-request-mismatch", "source.url-metadata-mismatch": "evidence.source-url-metadata-mismatch",
-      "source.semantic-invalid": "evidence.source-semantic-invalid", "source.invalid-provenance": "evidence.source-semantic-invalid",
-      "source.invalid-lineage": "evidence.source-semantic-invalid",
     };
     fail(map[error.code] ?? (error.code === "source.invalid-options" ? "evidence.invalid-options" : "evidence.invalid-input"));
   }
@@ -650,7 +656,7 @@ function translateLineageError(error: unknown): never {
     if (error.code === "lineage.revision-gap") fail("evidence.revision-gap");
     if (error.code === "lineage.unresolved-ref") fail("evidence.unresolved-ref");
     if (error.code === "lineage.invalid-options") fail("evidence.invalid-options");
-    fail("evidence.lineage-invalid");
+    throw new EvidenceSnapshotBuildFailureInternal("snapshot.lineage-invalid", "LineageError", error.code);
   }
   return fail("evidence.invalid-input");
 }
@@ -658,18 +664,7 @@ function sumCounts(values: number[], code: any): number { let total = 0; for (co
 function checkedAdd(left: number, right: number, code: any): number { const result = left + right; if (!Number.isSafeInteger(result)) fail(code); return result; }
 function isPlain(value: unknown): value is Record<string, any> { return value !== null && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype; }
 function deepFreeze<T>(value: T): T { if (value && typeof value === "object" && !Object.isFrozen(value)) { for (const child of Object.values(value as any)) deepFreeze(child); Object.freeze(value); } return value; }
-function radixSortByUtf8Key<T>(values: readonly T[], key: (value: T) => string): T[] {
-  const encoded = values.map((value) => ({ value, bytes: Buffer.from(key(value), "utf8") }));
-  type Item = (typeof encoded)[number]; type Frame = { items: Item[]; offset: number } | { emit: Item[] };
-  const stack: Frame[] = [{ items: encoded, offset: 0 }]; const output: Item[] = [];
-  while (stack.length > 0) {
-    const frame = stack.pop()!; if ("emit" in frame) { output.push(...frame.emit); continue; }
-    if (frame.items.length < 2) { output.push(...frame.items); continue; }
-    const buckets: Item[][] = Array.from({ length: 257 }, () => []);
-    for (const item of frame.items) buckets[frame.offset >= item.bytes.length ? 0 : item.bytes[frame.offset]! + 1]!.push(item);
-    for (let index = 256; index >= 1; index -= 1) if (buckets[index]!.length) stack.push({ items: buckets[index]!, offset: frame.offset + 1 });
-    if (buckets[0]!.length) stack.push({ emit: buckets[0]! });
-  }
-  return output.map(({ value }) => value);
+function sortByCodeUnitKey<T>(values: readonly T[], key: (value: T) => string): T[] {
+  return [...values].sort((left, right) => { const leftKey = key(left); const rightKey = key(right); return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0; });
 }
 function fail(code: any): never { throw new EvidenceAdmissionError(code); }

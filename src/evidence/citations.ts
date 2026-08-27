@@ -7,13 +7,13 @@ import {
   CitationMapRecordSchema, type CitationMapRecord, type ClaimRecord, type EvidenceRecord, type SourceRecord,
 } from "../domain/research-records.js";
 import {
-  EvidenceAdmissionError, buildBoundedValidatedEvidenceSnapshot, type BoundedValidatedEvidenceSnapshot,
+  EvidenceAdmissionError, type BoundedValidatedEvidenceSnapshot,
   type CanonicalEvidenceSet, type EvidenceSnapshotDiagnostics, type EvidenceSnapshotOptions,
 } from "./admission.js";
 import {
   SourceIdentityError, validateSourceCanonicalUrlProvenanceFromSnapshotInternal,
 } from "../scholarly/source-identity.js";
-import { getValidatedSnapshotIndexes, type ValidatedSnapshotIndexes } from "./validated-snapshot-internal.js";
+import { EvidenceSnapshotBuildFailureInternal, buildBoundedValidatedEvidenceSnapshotInternal, getValidatedSnapshotIndexes, type ValidatedSnapshotIndexes } from "./validated-snapshot-internal.js";
 
 export type CitationErrorCode =
   | "citation.invalid-options"
@@ -94,8 +94,8 @@ export function assignCitationMappingsFromRecords(
 ): Readonly<{ citations: readonly CitationMapRecord[]; bibliography: readonly BibliographyMetadataProjection[] }> {
   normalizeOptions(citationOptions);
   let snapshot: BoundedValidatedEvidenceSnapshot;
-  try { snapshot = buildBoundedValidatedEvidenceSnapshot(records, snapshotOptions, diagnostics); }
-  catch (error) { return mapAdmission(error); }
+  try { snapshot = buildBoundedValidatedEvidenceSnapshotInternal(records, snapshotOptions, diagnostics); }
+  catch (error) { return mapSnapshotBuildFailure(error); }
   return assignCitationMappings(snapshot, orderedSourceRefs, bindings, citationOptions);
 }
 
@@ -223,7 +223,7 @@ function validateCitedSource(source: SourceRecord, indexes: ValidatedSnapshotInd
   try { validateSourceCanonicalUrlProvenanceFromSnapshotInternal(source, indexes.requestProvenanceIndex); }
   catch (error) {
     if (error instanceof SourceIdentityError) {
-      if (error.code === "source.url-policy-invalid" || error.code === "source.invalid-input" || error.code === "source.semantic-invalid") fail("citation.noncanonical-source");
+      if (error.code === "source.url-policy-invalid" || error.code === "source.invalid-input") fail("citation.noncanonical-source");
       if (error.code === "source.url-unattributed") fail("citation.source-url-unattributed");
       if (error.code === "source.url-request-mismatch") fail("citation.source-url-request-mismatch");
       if (error.code === "source.url-metadata-mismatch") fail("citation.source-url-metadata-mismatch");
@@ -240,18 +240,19 @@ function projectSource(source: SourceRecord, citationNumber: number, ref: Source
   });
 }
 
-function mapAdmission(error: unknown): never {
+function mapSnapshotBuildFailure(error: unknown): never {
+  if (error instanceof EvidenceSnapshotBuildFailureInternal) return fail(error.code === "snapshot.source-identity-invalid" ? "citation.noncanonical-source" : "citation.invalid-evidence-set");
   if (!(error instanceof EvidenceAdmissionError)) return fail("citation.invalid-evidence-set");
   switch (error.code) {
     case "evidence.invalid-options": return fail("citation.invalid-options");
     case "evidence.too-many-records": case "evidence.too-many-references": case "evidence.record-too-large": case "evidence.input-too-large": return fail("citation.evidence-set-too-large");
     case "evidence.unresolved-ref": return fail("citation.unresolved-ref");
-    case "evidence.source-url-policy-invalid": case "evidence.source-semantic-invalid": return fail("citation.noncanonical-source");
+    case "evidence.source-url-policy-invalid": return fail("citation.noncanonical-source");
     case "evidence.source-url-unattributed": return fail("citation.source-url-unattributed");
     case "evidence.source-url-request-mismatch": return fail("citation.source-url-request-mismatch");
     case "evidence.source-url-metadata-mismatch": return fail("citation.source-url-metadata-mismatch");
     case "evidence.invalid-input": case "evidence.snapshot-invalid": case "evidence.duplicate-revision": case "evidence.revision-gap": case "evidence.duplicate-request":
-    case "evidence.stale-latest-ref": case "evidence.duplicate-source-identity": case "evidence.ambiguous-source-identity": case "evidence.lineage-invalid":
+    case "evidence.stale-latest-ref": case "evidence.duplicate-source-identity": case "evidence.ambiguous-source-identity":
     case "evidence.asymmetric-conflict": case "evidence.invalid-prospective-record": return fail("citation.invalid-evidence-set");
   }
 }

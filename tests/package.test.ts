@@ -37,7 +37,7 @@ describe("Pi package manifest", () => {
 
   it("does not export validated snapshot internal accessors from the package root", async () => {
     const api = await import("../src/index.js");
-    for (const name of ["getValidatedSnapshotIndexes", "buildBoundedValidatedEvidenceSnapshotInternal", "validatedProvenanceRecordsForSnapshot", "buildLineageGraphFromValidatedSources", "getLineageDependencyComponentKey", "getLineageRelationComponentKeyInternal", "prepareProspectiveSourceCanonicalInternal", "validatePreparedSourceSemanticsInternal", "EvidenceSnapshotDiagnostics", "EvidenceQueryDiagnostics", "buildEvidenceIndexWithDiagnosticsInternal"]) expect(api).not.toHaveProperty(name);
+    for (const name of ["getValidatedSnapshotIndexes", "buildBoundedValidatedEvidenceSnapshotInternal", "validatedProvenanceRecordsForSnapshot", "buildLineageGraphFromValidatedSources", "getLineageDependencyComponentKey", "getLineageRelationComponentKeyInternal", "prepareProspectiveSourceCanonicalInternal", "validatePreparedSourceSemanticsInternal", "EvidenceSnapshotDiagnostics", "EvidenceQueryDiagnostics", "buildEvidenceIndexWithDiagnosticsInternal", "EvidenceSnapshotBuildFailureInternal", "isEvidenceSnapshotSourceSemanticError"]) expect(api).not.toHaveProperty(name);
   });
 
   it("advertises only the extension resource that exists", async () => {

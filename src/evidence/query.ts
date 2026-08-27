@@ -10,10 +10,10 @@ import type { TaskRecord } from "../domain/records.js";
 import type { CalculationRecord, ClaimRecord, EvidenceRecord, ResearchRecord, SourceRecord, VerificationRecord } from "../domain/research-records.js";
 import { assertBoundedStructure, StructuralLimitError } from "../storage/bounded-structure.js";
 import {
-  EvidenceAdmissionError, buildBoundedValidatedEvidenceSnapshot,
+  EvidenceAdmissionError,
   type BoundedValidatedEvidenceSnapshot, type CanonicalEvidenceSet, type EvidenceSnapshotDiagnostics, type EvidenceSnapshotOptions,
 } from "./admission.js";
-import { getValidatedSnapshotIndexes, type SnapshotRecordKey, type SnapshotRecordKind, type ValidatedSnapshotIndexes } from "./validated-snapshot-internal.js";
+import { EvidenceSnapshotBuildFailureInternal, buildBoundedValidatedEvidenceSnapshotInternal, getValidatedSnapshotIndexes, type SnapshotRecordKey, type SnapshotRecordKind, type ValidatedSnapshotIndexes } from "./validated-snapshot-internal.js";
 
 export type EvidenceQueryErrorCode =
   | "query.invalid-options" | "query.invalid-input" | "query.invalid-evidence-set" | "query.identity-invalid"
@@ -141,8 +141,8 @@ export function buildEvidenceIndexFromRecords(
 ): EvidenceIndex {
   normalizeOptions(indexOptions);
   let snapshot: BoundedValidatedEvidenceSnapshot;
-  try { snapshot = buildBoundedValidatedEvidenceSnapshot(records, snapshotOptions, diagnostics); }
-  catch (error) { return mapAdmission(error); }
+  try { snapshot = buildBoundedValidatedEvidenceSnapshotInternal(records, snapshotOptions, diagnostics); }
+  catch (error) { return mapSnapshotBuildFailure(error); }
   return buildEvidenceIndex({ snapshot, ...(ledgerEvents === undefined ? {} : { ledgerEvents }) }, indexOptions);
 }
 
@@ -476,14 +476,14 @@ function bumpQuery(value: EvidenceQueryDiagnostics | undefined, key: keyof Evide
 function add(a: number, b: number, code: EvidenceQueryErrorCode): number { const value = a + b; if (!Number.isSafeInteger(value)) fail(code); return value; }
 function isPlain(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype; }
 function deepFreeze<T>(value: T): T { if (value && typeof value === "object" && !Object.isFrozen(value)) { for (const child of Object.values(value as object)) deepFreeze(child); Object.freeze(value); } return value; }
-function mapAdmission(error: unknown): never {
+function mapSnapshotBuildFailure(error: unknown): never {
+  if (error instanceof EvidenceSnapshotBuildFailureInternal) fail(error.code === "snapshot.source-identity-invalid" ? "query.identity-invalid" : "query.lineage-invalid");
   if (!(error instanceof EvidenceAdmissionError)) fail("query.invalid-evidence-set");
   if (error.code === "evidence.invalid-options") fail("query.invalid-options");
   if (error.code === "evidence.record-too-large") fail("query.record-too-large");
   if (["evidence.input-too-large", "evidence.too-many-records", "evidence.too-many-references"].includes(error.code)) fail("query.input-too-large");
   if (error.code === "evidence.unresolved-ref") fail("query.unresolved-ref");
-  if (["evidence.duplicate-source-identity", "evidence.ambiguous-source-identity", "evidence.source-url-policy-invalid", "evidence.source-url-unattributed", "evidence.source-url-request-mismatch", "evidence.source-url-metadata-mismatch", "evidence.source-semantic-invalid"].includes(error.code)) fail("query.identity-invalid");
-  if (error.code === "evidence.lineage-invalid") fail("query.lineage-invalid");
+  if (["evidence.duplicate-source-identity", "evidence.ambiguous-source-identity", "evidence.source-url-policy-invalid", "evidence.source-url-unattributed", "evidence.source-url-request-mismatch", "evidence.source-url-metadata-mismatch"].includes(error.code)) fail("query.identity-invalid");
   if (error.code === "evidence.snapshot-invalid") fail("query.invalid-input");
   fail("query.invalid-evidence-set");
 }
