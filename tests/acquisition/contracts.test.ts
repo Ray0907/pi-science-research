@@ -561,6 +561,8 @@ describe("immutable acquisition contracts", () => {
     expect(largeMs).toBeLessThan(smallMs * 8 + 500);
   });
 
+  test("validates exact Gregorian candidate publication dates on creation and reconstruction",()=>{for(const published of [{date:null,precision:"unknown"},{date:"0001",precision:"year"},{date:"9999-12",precision:"month"},{date:"2000-02-29",precision:"day"}] as const)expect(()=>candidate({published})).not.toThrow();const invalid=[{date:"2024",precision:"unknown"},{date:null,precision:"day"},{date:"0000",precision:"year"},{date:"10000",precision:"year"},{date:"2024-00",precision:"month"},{date:"2024-13",precision:"month"},{date:"1900-02-29",precision:"day"},{date:"2024-02-30",precision:"day"},{date:"2024-04-31",precision:"day"}] as const;for(const published of invalid)expect(errorCode(()=>candidate({published})),JSON.stringify(published)).toBe("acquisition-contract.invalid-input");const authentic=result(),forged={...authentic.candidates[0]!,published:{date:"1900-02-29",precision:"day"}};expect(errorCode(()=>validateAcademicAcquisitionResult({...authentic,candidates:[forged]} as never))).toBe("acquisition-contract.invalid-input");});
+
   test("enforces aggregate canonical scalar bytes without counting container punctuation", () => {
     const { schemaVersion: _schemaVersion, candidateKey: _candidateKey, provenanceStatus: _provenanceStatus, ...input } = candidate();
     const authors = (size: number) => Array.from({ length: 1_024 }, () => ({ family: null, given: null, literal: "x".repeat(size), orcid: null }));
@@ -809,9 +811,17 @@ describe("immutable acquisition contracts", () => {
     expect(createAcquisitionTrace(traceInput(success, null)).accessLevel).toBeNull();
 
     const failures = [
-      ["network.dns-empty", "availability"], ["transport.http-retryable", "http-retryable"],
+      ["network.dns-empty", "availability"], ["network.dns-nxdomain", "terminal-provider"], ["network.dns-temporary", "availability"], ["transport.connect-failed", "availability"], ["transport.connect-timeout", "availability"], ["transport.http-retryable", "http-retryable"],
       ["transport.http-terminal", "http-terminal"], ["transport.json-root-invalid", "invalid-response"],
-      ["network.dns-unsafe", "security-policy"],
+      ["network.dns-unsafe", "security-policy"], ["transport.tls-failed", "security-policy"],
+      ["transport.peer-unavailable", "security-policy"], ["transport.peer-mismatch", "security-policy"],
+      ["transport.redirect-invalid", "security-policy"], ["transport.too-many-redirects", "security-policy"],
+      ["transport.too-many-headers", "security-policy"], ["transport.headers-too-large", "security-policy"],
+      ["transport.framing-invalid", "security-policy"], ["transport.protocol-invalid", "security-policy"],
+      ["transport.encoded-too-large", "security-policy"], ["transport.too-many-encoding-layers", "security-policy"],
+      ["transport.unsupported-encoding", "security-policy"], ["transport.decompression-failed", "security-policy"],
+      ["transport.decompression-ratio", "security-policy"], ["transport.decoded-too-large", "security-policy"],
+      ["transport.invalid-utf8", "security-policy"],
     ] as const;
     for (const [failureCode, code] of failures) {
       const projected = acquisitionTraceSettlementInternalExported(settlement({ outcome: "failure", failureCode, payloadUtf8: null, finalUrl: null, redirectWitnesses: [], httpStatus: null, encodedBytes: 0, decodedBytes: 0, responsePayloadSha256: null }), PROJECTION_LIMITS);
