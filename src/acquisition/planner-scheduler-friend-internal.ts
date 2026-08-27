@@ -26,8 +26,10 @@ interface ControllerDescriptorInternal extends AcquisitionPlanExecutionControlle
 }
 
 const controllers=new WeakMap<object,ControllerDescriptorInternal>();
+const CONTROLLER_KEYS=["snapshot","concrete","reservations","transition","close","consume"] as const;
 
 function invalid():never{throw new Error("planner-scheduler friend rejected");}
+function controllerDescriptor(value:unknown):ControllerDescriptorInternal{if(value===null||typeof value!=="object"||utilTypes.isProxy(value)||Object.getPrototypeOf(value)!==Object.prototype||!Object.isFrozen(value))invalid();const keys=Reflect.ownKeys(value);if(keys.length>CONTROLLER_KEYS.length||keys.length!==CONTROLLER_KEYS.length||keys.some(key=>typeof key!=="string"||!CONTROLLER_KEYS.includes(key as never)))invalid();const descriptors=Object.getOwnPropertyDescriptors(value);for(const key of CONTROLLER_KEYS)if(!descriptors[key]?.enumerable||!("value" in descriptors[key]!))invalid();return value as ControllerDescriptorInternal;}
 
 /** @internal Planner-only registration seam; AST-confined to planner and this module. */
 export function registerAcquisitionPlanExecutionControllerInternal(
@@ -35,8 +37,8 @@ export function registerAcquisitionPlanExecutionControllerInternal(
   descriptor:ControllerDescriptorInternal,
 ):void{
   if(plan===null||typeof plan!=="object"||utilTypes.isProxy(plan)||!Object.isFrozen(plan)||controllers.has(plan as object))invalid();
-  if(descriptor===null||typeof descriptor!=="object"||utilTypes.isProxy(descriptor)||!Object.isFrozen(descriptor))invalid();
-  controllers.set(plan as object,descriptor);
+  const authenticated=controllerDescriptor(descriptor);
+  controllers.set(plan as object,authenticated);
 }
 
 /** @internal Scheduler-only atomic one-consumer seam. */
