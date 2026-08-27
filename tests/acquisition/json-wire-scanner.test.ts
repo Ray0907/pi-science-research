@@ -1,0 +1,24 @@
+import {describe,expect,test,vi} from "vitest";
+
+import {createRequestDeadlineInternal,createRequestDeadlineSchedulerCapabilitiesInternal} from "../../src/acquisition/request-deadline-internal.js";
+import {ProviderJsonScanError,getProviderJsonSettlementInternal,scanAndParseProviderJsonInternal,snapshotProviderJsonInternal} from "../../src/acquisition/json-wire-scanner-internal.js";
+
+function deadline(){return createRequestDeadlineInternal(10_000,createRequestDeadlineSchedulerCapabilitiesInternal({monotonicNow:()=>1,setTimeout:()=>1,clearTimeout:()=>undefined}));}
+function code(action:()=>unknown):string|undefined{try{action();}catch(error){expect(error).toBeInstanceOf(ProviderJsonScanError);return(error as ProviderJsonScanError).code;}return undefined;}
+
+ describe("duplicate-safe provider JSON wire scanner",()=>{
+  test("scans JSON nonrecursively before parse with exact syntax escape surrogate number grammar",()=>{const valid=["{}","[]",`{"s":"x\\n\\uD834\\uDD1E","n":-1.25e+2,"v":[true,false,null]}`];for(const payload of valid){const value=scanAndParseProviderJsonInternal(payload,undefined,deadline());expect(snapshotProviderJsonInternal(value)).toEqual(JSON.parse(payload));}const invalid:readonly [string,string][]=[[`{"x":01}`,"json.invalid-number"],[`{"x":1.}`,"json.invalid-number"],[`{"x":+1}`,"json.invalid-syntax"],[`{"x":NaN}`,"json.invalid-syntax"],[`{"x":"\\x00"}`,"json.invalid-escape"],[`{"x":"\\uD800"}`,"json.invalid-surrogate"],[`{"x":"\\uDC00"}`,"json.invalid-surrogate"],[`{"x":"a
+b"}`,"json.invalid-syntax"],[`{"x":true}x`,"json.invalid-syntax"],[`{"x":}`,"json.invalid-syntax"]];for(const [payload,expected] of invalid)expect(code(()=>scanAndParseProviderJsonInternal(payload,undefined,deadline())),payload).toBe(expected);});
+
+  test("rejects decoded duplicate keys including alternate escape spellings before JSON parse",()=>{const parse=vi.spyOn(JSON,"parse");expect(code(()=>scanAndParseProviderJsonInternal(`{"a":1,"\\u0061":2}`,undefined,deadline()))).toBe("json.duplicate-key");expect(parse).not.toHaveBeenCalled();parse.mockRestore();});
+
+  test("lexically validates then rejects primitive boolean number string null roots before JSON parse",()=>{for(const payload of ["true","false","null","1","-2.5e3",`"value"`]){const parse=vi.spyOn(JSON,"parse");expect(code(()=>scanAndParseProviderJsonInternal(payload,undefined,deadline())),payload).toBe("transport.json-root-invalid");expect(parse).not.toHaveBeenCalled();parse.mockRestore();}const parse=vi.spyOn(JSON,"parse");expect(code(()=>scanAndParseProviderJsonInternal("tru",undefined,deadline()))).toBe("json.invalid-syntax");expect(parse).not.toHaveBeenCalled();parse.mockRestore();});
+
+  test("deep-freezes every parsed object array node brands exact root and rejects spread structured JSON clones",()=>{const value=scanAndParseProviderJsonInternal(`{"a":[{"b":1}]}`,undefined,deadline());const snapshot=snapshotProviderJsonInternal(value);expect(Object.isFrozen(snapshot)&&Object.isFrozen((snapshot as {a:unknown[]}).a)&&Object.isFrozen((snapshot as {a:{b:number}[]}).a[0])).toBe(true);expect(code(()=>snapshotProviderJsonInternal({...snapshot} as never))).toBe("json.snapshot-mismatch");});
+
+  test("registers parsed-or-error settlement sidecar once and adapters never reparse payload",()=>{const forged=Object.freeze({outcome:"success",payloadUtf8:"{}"});const parse=vi.spyOn(JSON,"parse");expect(code(()=>getProviderJsonSettlementInternal(forged as never))).toBe("json.snapshot-mismatch");expect(parse).not.toHaveBeenCalled();parse.mockRestore();});
+
+  test("bounds JSON depth nodes keys object wire scalar aggregate before allocation",()=>{const cases:readonly [string,object,string][]=[[`{"a":{"b":1}}`,{maxDepth:1},"json.depth-exceeded"],[`[1,2]`,{maxNodes:2},"json.nodes-exceeded"],[`{"a":1,"b":2}`,{maxKeys:1},"json.keys-exceeded"],[`{"a":123}`,{maxObjectWireBytes:5},"json.object-too-large"],[`{"abcdef":1}`,{maxScalarCanonicalBytes:5},"json.scalar-too-large"],[`{"a":"xx","b":"yy"}`,{maxAggregateScalarBytes:8},"json.aggregate-scalars-too-large"]];for(const [payload,options,expected] of cases){const parse=vi.spyOn(JSON,"parse");expect(code(()=>scanAndParseProviderJsonInternal(payload,options,deadline())),payload).toBe(expected);expect(parse).not.toHaveBeenCalled();parse.mockRestore();}});
+
+  test("brands scanner-produced JSON and rejects plain parsed values and digest mismatch",()=>{expect(code(()=>snapshotProviderJsonInternal(JSON.parse("{}") as never))).toBe("json.snapshot-mismatch");const parse=vi.spyOn(JSON,"parse").mockReturnValue({different:true});expect(code(()=>scanAndParseProviderJsonInternal(`{"expected":true}`,undefined,deadline()))).toBe("json.snapshot-mismatch");expect(parse).toHaveBeenCalledTimes(1);parse.mockRestore();});
+ });
