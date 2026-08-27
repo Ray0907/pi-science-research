@@ -1,9 +1,9 @@
 import { describe, expect, test, vi } from "vitest";
 
-const canonicalCounter = vi.hoisted(() => ({ calls: 0 }));
+const canonicalCounter = vi.hoisted(() => ({ calls: 0, stringLengths: [] as number[] }));
 vi.mock("../../src/crypto/canonical-json.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/crypto/canonical-json.js")>();
-  return { ...actual, canonicalJson(value: unknown) { canonicalCounter.calls += 1; return actual.canonicalJson(value); } };
+  return { ...actual, canonicalJson(value: unknown) { canonicalCounter.calls += 1; if (typeof value === "string") canonicalCounter.stringLengths.push(value.length); return actual.canonicalJson(value); } };
 });
 
 import * as contractsModule from "../../src/acquisition/contracts.js";
@@ -626,6 +626,32 @@ describe("immutable acquisition contracts", () => {
     expect(errorCode(() => registerProviderRequestPartitionInternal(owner, { ...nestedPartition, normalizedInput: { ...nestedPartition.normalizedInput, [oversizedUnknown]: true } }))).toBe("acquisition-contract.invalid-input");
   });
 
+  test("rejects overlong strings and keys before canonical expansion", () => {
+    const owner = createProviderPartitionPlanOwnerInternal({ planId: `plan-v1-${"e".repeat(64)}`, options: { ...PARTITION_LIMITS, maxStringCanonicalBytes: 128 } });
+    const endpointClass = "x".repeat(129);
+    const partition = partitionSnapshot({ endpointClass });
+    const { endpointClass: _endpointClass, ...partitionRest } = partition;
+    const endpointFirst = { endpointClass, ...partitionRest };
+    canonicalCounter.calls = 0; canonicalCounter.stringLengths = [];
+    expect(errorCode(() => registerProviderRequestPartitionInternal(owner, endpointFirst))).toBe("acquisition-contract.input-too-large");
+    expect(canonicalCounter.stringLengths).not.toContain(endpointClass.length);
+
+    const overlongKey = "k".repeat(129);
+    canonicalCounter.calls = 0; canonicalCounter.stringLengths = [];
+    expect(errorCode(() => registerProviderRequestPartitionInternal(owner, { ...partition, [overlongKey]: 1 }))).toBe("acquisition-contract.invalid-input");
+    expect(canonicalCounter.calls).toBe(0);
+    const hugeKey = "k".repeat(1_048_577);
+    expect(errorCode(() => normalizeAcquisitionOptions({ [hugeKey]: 1 }))).toBe("acquisition-contract.invalid-options");
+
+    const requestedUrl = `https://api.crossref.org/${"q".repeat(180)}`;
+    const input = partitionPreimage({ normalizedInput: { kind: "query", query: "long-url", limit: 1 }, requestedUrl });
+    registeredPartition(input);
+    const key = createProviderPartitionKey(input);
+    canonicalCounter.calls = 0; canonicalCounter.stringLengths = [];
+    expect(errorCode(() => acquisitionTraceSettlementInternalExported(settlement({ ...key, requestedUrl, finalUrl: requestedUrl, redirectWitnesses: [] }), { maxCanonicalUrlBytes: 32, maxRedirects: 5 }))).toBe("acquisition-contract.result-too-large");
+    expect(canonicalCounter.stringLengths).not.toContain(requestedUrl.length);
+  });
+
   test("returns fresh deeply frozen contracts and internal transport settlements without aliases", () => {
     const input = result(); const output = validateAcademicAcquisitionResult(input); expect(output).not.toBe(input); expect(Object.isFrozen(output)).toBe(true); expect(Object.isFrozen(output.candidates[0]?.identifiers)).toBe(true);
     expect(() => (output.normalizedQueries as string[]).push("mutate")).toThrow(); expect(validateAcademicAcquisitionResult(input)).not.toBe(output);
@@ -644,6 +670,34 @@ describe("immutable acquisition contracts", () => {
     expect(errorCode(() => createAcquisitionTrace({ ...input, provider: "openalex" } as never))).toBe("acquisition-contract.invalid-key");
     expect(errorCode(() => createAcquisitionTrace({ ...input, operation: "fetch" } as never))).toBe("acquisition-contract.invalid-key");
     expect(errorCode(() => createAcquisitionTrace({ ...input, endpointClass: "opaque-endpoint-v1" } as never))).toBe("acquisition-contract.invalid-key");
+  });
+
+  test("permits access only for authentic success settlements", () => {
+    registeredPartition(); const key = createProviderPartitionKey(partitionPreimage());
+    const traceInput = (projected: AcquisitionTrace["settlement"], accessLevel: "metadata-only" | null) => ({ provider: "crossref" as const, operation: "search" as const, endpointClass: "works-search", ...key, accessLevel, settlement: projected, warnings: [] });
+    const success = acquisitionTraceSettlementInternalExported(settlement(), PROJECTION_LIMITS);
+    expect(createAcquisitionTrace(traceInput(success, "metadata-only")).accessLevel).toBe("metadata-only");
+    expect(createAcquisitionTrace(traceInput(success, null)).accessLevel).toBeNull();
+
+    const failures = [
+      ["network.dns-empty", "availability"], ["transport.http-retryable", "http-retryable"],
+      ["transport.http-terminal", "http-terminal"], ["transport.json-root-invalid", "invalid-response"],
+      ["network.dns-unsafe", "security-policy"],
+    ] as const;
+    for (const [failureCode, code] of failures) {
+      const projected = acquisitionTraceSettlementInternalExported(settlement({ outcome: "failure", failureCode, payloadUtf8: null, finalUrl: null, redirectWitnesses: [], httpStatus: null, encodedBytes: 0, decodedBytes: 0, responsePayloadSha256: null }), PROJECTION_LIMITS);
+      expect(projected.code).toBe(code);
+      expect(createAcquisitionTrace(traceInput(projected, null)).accessLevel).toBeNull();
+      expect(errorCode(() => createAcquisitionTrace(traceInput(projected, "metadata-only")))).toBe("acquisition-contract.invalid-input");
+    }
+    for (const failureCode of ["transport.cancelled", "transport.deadline-exceeded"] as const) {
+      const projected = acquisitionTraceSettlementInternalExported(settlement({ outcome: "cancelled", failureCode, payloadUtf8: null, finalUrl: null, redirectWitnesses: [], httpStatus: null, encodedBytes: 0, decodedBytes: 0, responsePayloadSha256: null }), PROJECTION_LIMITS);
+      expect(createAcquisitionTrace(traceInput(projected, null)).accessLevel).toBeNull();
+      expect(errorCode(() => createAcquisitionTrace(traceInput(projected, "metadata-only")))).toBe("acquisition-contract.invalid-input");
+    }
+    const blocked = createBlockedTraceSettlementInternal({ requestedUrl: URL, retrievedAt: AT, limits: PROJECTION_LIMITS });
+    expect(createAcquisitionTrace(traceInput(blocked, null)).accessLevel).toBeNull();
+    expect(errorCode(() => createAcquisitionTrace(traceInput(blocked, "metadata-only")))).toBe("acquisition-contract.invalid-input");
   });
 
   test("uses structural ceilings rather than an unlisted trace-warning cap", () => {
