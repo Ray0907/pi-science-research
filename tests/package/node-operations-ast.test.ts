@@ -19,6 +19,7 @@ const exactImportedMembers=new Map<string,readonly string[]>([
 const moduleBindings=new Set(["Resolver","http","https","tls","nodePerformance","utilTypes"]);
 const directFunctionBindings=new Set(["nodeSetTimeout","nodeClearTimeout"]);
 const forbiddenMemberNames=new Set(["globalAgent","createConnection","createRequire","fetch","require","eval","exec","execFile","spawn","fork","sendBeacon","WebSocket","EventSource","XMLHttpRequest"]);
+const globalObjectIdentifiers=new Set(["globalThis","window","self","global","navigator"]);
 const forbiddenExecutionIdentifiers=new Set(["child_process","exec","execFile","spawn","fork","worker_threads","Worker","vm","eval","Function","WebSocket","EventSource","XMLHttpRequest","navigator","window","self","fetch","require","createRequire"]);
 const forbiddenPackages=["node-fetch","cross-fetch","undici","http-proxy-agent","https-proxy-agent","socks-proxy-agent","ws"] as const;
 function isRelativeSpecifier(specifier:string):boolean{return specifier.startsWith("./")||specifier.startsWith("../");}
@@ -50,7 +51,8 @@ function insideVariableInitializer(node:ts.Node,name:string):boolean{
   for(let current:ts.Node|undefined=node.parent;current;current=current.parent){if(ts.isVariableDeclaration(current)&&ts.isIdentifier(current.name)&&current.name.text===name)return true;if(ts.isSourceFile(current))return false;}
   return false;
 }
-function isPropertyName(node:ts.Identifier):boolean{const parent=node.parent;return(ts.isPropertyAccessExpression(parent)&&parent.name===node)||(ts.isPropertyAssignment(parent)&&parent.name===node)||(ts.isPropertyDeclaration(parent)&&parent.name===node)||(ts.isMethodDeclaration(parent)&&parent.name===node);}
+function isPropertyName(node:ts.Identifier):boolean{const parent=node.parent;return(ts.isPropertyAccessExpression(parent)&&parent.name===node)||(ts.isPropertyAssignment(parent)&&parent.name===node)||(ts.isPropertyDeclaration(parent)&&parent.name===node)||(ts.isPropertySignature(parent)&&parent.name===node)||(ts.isMethodDeclaration(parent)&&parent.name===node)||(ts.isMethodSignature(parent)&&parent.name===node)||(ts.isBindingElement(parent)&&parent.propertyName===node);}
+function isExactTestGlobalUrl(node:ts.Identifier):boolean{const access=node.parent;return node.text==="globalThis"&&ts.isPropertyAccessExpression(access)&&!access.questionDotToken&&access.expression===node&&access.name.text==="URL"&&ts.isNewExpression(access.parent)&&access.parent.expression===access;}
 function isObjectCall(call:ts.CallExpression,name:string):boolean{
   const expression=call.expression;return ts.isPropertyAccessExpression(expression)&&!expression.questionDotToken&&ts.isIdentifier(expression.expression)&&expression.expression.text==="Object"&&expression.name.text===name;
 }
@@ -179,8 +181,8 @@ function auditAdapter(source:string):string[]{
       if(ts.isCallExpression(parent)&&parent.arguments.includes(node)){const callee=parent.expression;allowed=ts.isPropertyAccessExpression(callee)&&ts.isIdentifier(callee.expression)&&callee.expression.text==="Object"&&(callee.name.text==="getOwnPropertyDescriptor"||callee.name.text==="getPrototypeOf");}
       if(!allowed)errors.push("module binding escape");
     }
-    if(ts.isIdentifier(node)&&node.text==="globalThis"&&!((ts.isPropertyAccessExpression(node.parent)||ts.isElementAccessExpression(node.parent))&&node.parent.expression===node)&&!ts.isObjectBindingPattern(node.parent))errors.push("global binding escape");
-    if(ts.isIdentifier(node)&&(forbiddenExecutionIdentifiers.has(node.text)||node.text==="globalAgent"||node.text==="createConnection"||node.text==="process"))errors.push(`forbidden identifier ${node.text}`);
+    if(ts.isIdentifier(node)&&globalObjectIdentifiers.has(node.text)&&!isPropertyName(node))errors.push("forbidden global object");
+    if(ts.isIdentifier(node)&&(forbiddenExecutionIdentifiers.has(node.text)||node.text==="globalAgent"||node.text==="createConnection"||node.text==="process")&&!isPropertyName(node))errors.push(`forbidden identifier ${node.text}`);
     if(ts.isCallExpression(node)){
       if(ts.isPropertyAccessExpression(node.expression)&&ts.isIdentifier(node.expression.expression)&&node.expression.expression.text==="Object"&&node.expression.name.text==="fromEntries")headerMapOverride=true;
       if(node.expression.kind===ts.SyntaxKind.ImportKeyword)errors.push("dynamic import");
@@ -244,6 +246,7 @@ function auditNonAdapterSource(source:string):string[]{
       if(ts.isPropertyAccessExpression(node.expression)&&(forbiddenMemberNames.has(node.expression.name.text)||node.expression.name.text==="createRequire"))errors.push("production member call denied");
       if(ts.isElementAccessExpression(node.expression)){const argument=node.expression.argumentExpression;if(!argument||!ts.isStringLiteral(argument)||forbiddenMemberNames.has(argument.text)||["WebSocket","EventSource","XMLHttpRequest"].includes(argument.text))errors.push("production computed call denied");}
     }
+    if(ts.isIdentifier(node)&&globalObjectIdentifiers.has(node.text)&&!isPropertyName(node))errors.push("production global object denied");
     if(ts.isIdentifier(node)&&(forbiddenExecutionIdentifiers.has(node.text)||node.text==="process"||node.text==="module")&&!isPropertyName(node))errors.push("production execution binding denied");
     if(ts.isPropertyAccessExpression(node)){const root=rootIdentifier(node.expression);if((root==="globalThis"||root==="window"||root==="self")&&["fetch","WebSocket","EventSource","XMLHttpRequest"].includes(node.name.text))errors.push("production global denied");if(root==="navigator"&&node.name.text==="sendBeacon")errors.push("production beacon denied");}
     if(ts.isElementAccessExpression(node)){const root=rootIdentifier(node.expression);if(root==="globalThis"||root==="window"||root==="self"){const argument=node.argumentExpression;if(!argument||!ts.isStringLiteral(argument)||["fetch","WebSocket","EventSource","XMLHttpRequest"].includes(argument.text))errors.push("production computed global denied");}}
@@ -256,6 +259,7 @@ function auditTestNetworkSource(source:string):string[]{
     if((ts.isImportDeclaration(node)||ts.isExportDeclaration(node))&&node.moduleSpecifier&&ts.isStringLiteral(node.moduleSpecifier)&&isNetworkCapableSpecifier(node.moduleSpecifier.text))errors.push("test network import denied");
     if(ts.isImportEqualsDeclaration(node))errors.push("test import equals denied");
     if(ts.isCallExpression(node)&&node.expression.kind===ts.SyntaxKind.ImportKeyword){const argument=node.arguments[0];if(!argument||!ts.isStringLiteral(argument)||isNetworkCapableSpecifier(argument.text))errors.push("test dynamic network import denied");}
+    if(ts.isIdentifier(node)&&globalObjectIdentifiers.has(node.text)&&!isPropertyName(node)&&!isExactTestGlobalUrl(node))errors.push("test global object denied");
     if(ts.isIdentifier(node)&&forbiddenExecutionIdentifiers.has(node.text)&&!isPropertyName(node))errors.push("test network execution denied");
     if(ts.isPropertyAccessExpression(node)){const root=rootIdentifier(node.expression);if((root==="globalThis"||root==="window"||root==="self")&&["fetch","WebSocket","EventSource","XMLHttpRequest"].includes(node.name.text))errors.push("test network global denied");if(node.name.text==="createRequire"||node.name.text==="require")errors.push("test require denied");}
     if(ts.isElementAccessExpression(node)){const root=rootIdentifier(node.expression);if(root==="globalThis"||root==="window"||root==="self")errors.push("test computed global denied");}
@@ -310,8 +314,8 @@ function auditAcquisitionUnitSource(source:string,name="fixture.ts"):string[]{
   visit(file);return errors;
 }
 function acquisitionUnitIsolationErrors():string[]{
-  const errors:string[]=[];const directory=path.join(root,"tests/acquisition");
-  for(const name of fs.readdirSync(directory).filter((file)=>file.endsWith(".ts")))errors.push(...auditAcquisitionUnitSource(fs.readFileSync(path.join(directory,name),"utf8"),name));
+  const errors:string[]=[];
+  for(const relativeDirectory of ["tests/acquisition","tests/helpers"]){const directory=path.join(root,relativeDirectory);for(const name of fs.readdirSync(directory).filter((file)=>file.endsWith(".ts")))errors.push(...auditAcquisitionUnitSource(fs.readFileSync(path.join(directory,name),"utf8"),`${relativeDirectory}/${name}`));}
   return errors;
 }
 
@@ -355,7 +359,12 @@ describe("Node operations adapter audit",()=>{
       [`${base}\nconst HiddenResolver=Resolver;void HiddenResolver;`,"module alias"],
       [`${base}\nconst hiddenTimer=nodeSetTimeout;void hiddenTimer;`,"function binding escape"],
       [`${base}\nconst {globalAgent:renamed}=https;void renamed;`,"destructured alias"],
-      [`${base}\nconst hiddenGlobal=globalThis;void hiddenGlobal;`,"global binding escape"],
+      [`${base}\nconst hiddenGlobal=globalThis;void hiddenGlobal;`,"forbidden global object"],
+      [`${base}\nconst hiddenCrypto=globalThis.crypto;void hiddenCrypto;`,"forbidden global object"],
+      [`${base}\nlet assignedGlobal;assignedGlobal=(globalThis);void assignedGlobal;`,"forbidden global object"],
+      [`${base}\nconst {fetch:renamedFetch}=globalThis;void renamedFetch;`,"forbidden global object"],
+      [`${base}\nReflect.get(globalThis,"fetch");`,"forbidden global object"],
+      [`${base}\nvoid window.location;void self.location;void global.process;void navigator.userAgent;`,"forbidden global object"],
       [`${base}\nglobalThis["fetch"]("https://example.invalid");`,"forbidden computed fetch"],
       [`${base}\nvoid globalThis.fetch;`,"forbidden global fetch"],
       [`${base}\nconst spec="node:https";void import(spec);`,"dynamic import"],
@@ -377,14 +386,15 @@ describe("Node operations adapter audit",()=>{
       [base.replace('Object.getOwnPropertyDescriptor(resolverBase as object,"cancel")','undefined'),"production feature audit"],
     ];
     for(const [source,error] of cases)expect(auditAdapter(source),error).toContain(error);
+    expect(auditAdapter(`${base}\nconst holder={self:1};void holder.self;`)).toEqual([]);
   });
 
   test("rejects default-denied production imports and network execution escapes outside the sole adapter",()=>{const cases=[
     'import fs from "node:fs";','import child from "node:child_process";','import workers from "node:worker_threads";','import vm from "node:vm";','import external from "node-fetch";','import cross from "cross-fetch";','import undiciClient from "undici";','import httpProxy from "http-proxy-agent";','import httpsProxy from "https-proxy-agent";','import socksProxy from "socks-proxy-agent";','import anything from "some-external-package";',
     'import net from "node:net";','import http2 from "node:http2";','import https from "https";','import dns from "dns";','import promises from "dns/promises";','import hidden from "node:https/subpath";',
     'const spec="node:net";void import(spec);','void import("./relative.js");','void import("http2");','const load=require;load("https");','module.require("dns");','module.createRequire(import.meta.url);','void globalThis.fetch("https://example.invalid");','import undici from "undici";',
-    'exec("x");','execFile("x");','spawn("x");','fork("x");','new Worker("x");','vm.runInNewContext("x");','eval("x");','Function("x")();','new WebSocket("x");','new EventSource("x");','new XMLHttpRequest();','navigator.sendBeacon("x");','globalThis["WebSocket"]("x");','globalThis.EventSource.bind(null);','window["fetch"]("x");','self.EventSource.call(null,"x");',
-  ];for(const source of cases)expect(auditNonAdapterSource(source),source).not.toEqual([]);expect(auditNonAdapterSource('import {types as utilTypes} from "node:util";import value from "./local.js";void utilTypes.isProxy(value);')).toEqual([]);expect(auditNonAdapterSource('import {types as utilTypes} from "node:util";const proxyCheck=utilTypes.isProxy;void proxyCheck;')).not.toEqual([]);});
+    'exec("x");','execFile("x");','spawn("x");','fork("x");','new Worker("x");','vm.runInNewContext("x");','eval("x");','Function("x")();','const g=globalThis;void g;','let g;g=(globalThis);','const {fetch:renamed}=globalThis;void renamed;','function leak(){return globalThis;}','Reflect.get(globalThis,"fetch");','void window.location;','void self.location;','void global.process;','void navigator.userAgent;','new WebSocket("x");','new EventSource("x");','new XMLHttpRequest();','navigator.sendBeacon("x");','globalThis["WebSocket"]("x");','globalThis.EventSource.bind(null);','window["fetch"]("x");','self.EventSource.call(null,"x");',
+  ];for(const source of cases)expect(auditNonAdapterSource(source),source).not.toEqual([]);expect(auditNonAdapterSource('const holder={self:1};void holder.self;')).toEqual([]);expect(auditNonAdapterSource('import {types as utilTypes} from "node:util";import value from "./local.js";void utilTypes.isProxy(value);')).toEqual([]);expect(auditNonAdapterSource('import {types as utilTypes} from "node:util";const proxyCheck=utilTypes.isProxy;void proxyCheck;')).not.toEqual([]);});
 
   test("rejects aliases captures nested calls and implicit defaults for imported unit-test factories",()=>{
     const modulePath='../../src/acquisition/node-pinned-hop-internal.js';
@@ -406,6 +416,13 @@ describe("Node operations adapter audit",()=>{
       `import * as internals from "${modulePath}";const make=internals.createNodeRuntimeCapabilitiesInternal;make({});`,
     ];
     for(const source of cases)expect(auditAcquisitionUnitSource(source)).not.toEqual([]);
+    expect(auditAcquisitionUnitSource('const g=globalThis;const h=(g);Reflect.get(g,"fetch");void h["WebSocket"];')).not.toEqual([]);
+    expect(auditAcquisitionUnitSource('const URLCtor=globalThis.URL;void URLCtor;')).not.toEqual([]);
+    expect(auditAcquisitionUnitSource('new (globalThis.URL)("https://example.invalid");')).not.toEqual([]);
+    expect(auditAcquisitionUnitSource('function leak(){return globalThis;}void leak;')).not.toEqual([]);
+    expect(auditAcquisitionUnitSource('let g;g=globalThis;new g.WebSocket("x");')).not.toEqual([]);
+    expect(auditAcquisitionUnitSource('Reflect.get(globalThis,"fetch");')).not.toEqual([]);
+    expect(auditAcquisitionUnitSource('const holder={self:1};void holder.self;new globalThis.URL("https://example.invalid");')).toEqual([]);
     expect(auditAcquisitionUnitSource('import fetcher from "node-fetch";void fetcher;')).not.toEqual([]);
     expect(auditAcquisitionUnitSource('new WebSocket("wss://example.invalid");')).not.toEqual([]);
     expect(auditAcquisitionUnitSource('import {describe} from "vitest";void describe;')).toEqual([]);
