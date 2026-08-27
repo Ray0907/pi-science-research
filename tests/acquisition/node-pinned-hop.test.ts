@@ -1,4 +1,3 @@
-import https from "node:https";
 import { describe, expect, test, vi } from "vitest";
 
 import { canonicalJson } from "../../src/crypto/canonical-json.js";
@@ -6,7 +5,7 @@ import { sha256Hex } from "../../src/crypto/hash.js";
 import { NetworkPolicyError } from "../../src/acquisition/network-policy.js";
 import {
   PinnedHopRuntimeErrorInternal, SecureTransportError,
-  createNodeDnsResolver, createNodeRuntimeCapabilitiesInternal, createPinnedHopRuntimeInternal, realNodeOperations,
+  createNodeDnsResolver, createNodeRuntimeCapabilitiesInternal, createPinnedHopRuntimeInternal,
   type NodePinnedHopCallbacksInternal, type NodeOperationsInternal,
 } from "../../src/acquisition/node-pinned-hop-internal.js";
 import {
@@ -64,13 +63,17 @@ describe("authenticated pinned Node hops",()=>{
       [{name:"x-extra",value:"a"}],
       [{name:"authorization",value:"a\u0000b"}],
       [{name:"authorization",value:"a\u007fb"}],
+      [{name:"authorization",value:"a\u0100b"}],
+      [{name:"authorization",value:"a\u202eb"}],
+      [{name:"authorization",value:"a\ud800b"}],
       [{name:"user-agent",value:"a\r\nb"}],
+      [{name:"accept",value:new String("primitive only")}],
       Object.defineProperty([],"0",{enumerable:true,get(){throw new Error("SECRET");}}),
       [{name:"accept",value:"a".repeat(16_383)}],
       Object.assign(new Array(2),{0:{name:"accept",value:"a"}}),
     ];
     for(const headers of invalidHeaders){const value=setup();const target=await targetOf(value);expect(runtimeCode(()=>value.runtime.openPinnedHop(target,{ownerId:"hop-owner-v1-h",url:target.url,headers:headers as never,maxHeaderSize:100,connectTimeoutMs:100},callbacks(),value.deadline))).toBe("pinned-runtime.invalid-input");expect(value.mock.agents).toHaveLength(0);expect(value.mock.requests).toHaveLength(0);}
-    const value=setup();const target=await targetOf(value);const input=Object.freeze([Object.freeze({name:"user-agent",value:"ua"}),Object.freeze({name:"accept",value:"application/json"}),Object.freeze({name:"authorization",value:"Bearer x"})]);const handle=value.runtime.openPinnedHop(target,{ownerId:"hop-owner-v1-valid",url:target.url,headers:input,maxHeaderSize:100,connectTimeoutMs:100},callbacks(),value.deadline);expect(value.mock.requests[0]!.options.headers).toEqual(input);expect(value.mock.requests[0]!.options.headers).not.toBe(input);expect(Object.isFrozen(value.mock.requests[0]!.options.headers)).toBe(true);expect(value.mock.requests[0]!.options.headers.every(Object.isFrozen)).toBe(true);handle.forceClose();
+    const value=setup();const target=await targetOf(value);const input=Object.freeze([Object.freeze({name:"user-agent",value:"\t ~\u0080\u00ff"}),Object.freeze({name:"accept",value:"a".repeat(16_382)}),Object.freeze({name:"authorization",value:"Bearer x"})]);const handle=value.runtime.openPinnedHop(target,{ownerId:"hop-owner-v1-valid",url:target.url,headers:input,maxHeaderSize:100,connectTimeoutMs:100},callbacks(),value.deadline);expect(value.mock.requests[0]!.options.headers).toEqual(input);expect(value.mock.requests[0]!.options.headers).not.toBe(input);expect(Object.isFrozen(value.mock.requests[0]!.options.headers)).toBe(true);expect(value.mock.requests[0]!.options.headers.every(Object.isFrozen)).toBe(true);handle.forceClose();
   });
 
   test("runtime close synchronously rejects active DNS races and destroys each owned resolver once",async()=>{const value=setup();let late:(value:readonly string[])=>void=()=>undefined;value.mock.resolve4=()=>new Promise((resolve)=>{late=resolve;});value.mock.resolve6=()=>new Promise(()=>undefined);const pending=targetOf(value);const closing=value.runtime.close();expect(value.mock.resolvers[0]).toMatchObject({cancelCount:1,destroyCount:1});await expect(pending).rejects.toMatchObject({code:"network.cancelled"});late(["8.8.8.8"]);await closing;await value.runtime.close();expect(value.mock.resolvers[0]).toMatchObject({cancelCount:1,destroyCount:1});});
@@ -80,7 +83,7 @@ describe("authenticated pinned Node hops",()=>{
     const regressing=setup();const regressingTarget=await targetOf(regressing);const regressingHandle=regressing.runtime.openPinnedHop(regressingTarget,{ownerId:"hop-owner-v1-clock-regress",url:regressingTarget.url,headers:[],maxHeaderSize:100,connectTimeoutMs:100},callbacks(),regressing.deadline);const regressingRequest=regressing.mock.requests[0]!;regressingRequest.callbacks.onSecureConnected({address:regressingTarget.address,family:regressingTarget.family,hostnameVerified:true,authorized:true,authorizationError:null});regressing.mock.now+=10;regressing.mock.timestampNow=()=>"2020-01-01T00:00:00.000Z";regressingRequest.callbacks.onEnd();const regressed=await regressingHandle.completion;expect(regressed).toMatchObject({outcome:"failed",failureCode:"hop.protocol-failed"});expect(Date.parse(regressed.settledAt)).toBe(Date.parse(regressed.startedAt)+10);
   });
 
-  test("maps missing default Node features to unsupported-runtime but malformed custom ops to invalid-capability",()=>{const descriptor=Object.getOwnPropertyDescriptor(https,"request")!;try{Object.defineProperty(https,"request",{...descriptor,value:undefined});expect(()=>createNodeRuntimeCapabilitiesInternal()).toThrow(expect.objectContaining({code:"transport.unsupported-runtime"}));}finally{Object.defineProperty(https,"request",descriptor);}expect(()=>createNodeRuntimeCapabilitiesInternal({...realNodeOperations,httpsRequest:undefined} as never)).toThrow(expect.objectContaining({code:"transport.invalid-capability"}));});
+  test("maps malformed injected Node operations to invalid-capability without invoking defaults",()=>{const mock=createMockSecureTransportCapabilities();expect(()=>createNodeRuntimeCapabilitiesInternal({...mock.ops,httpsRequest:undefined} as never)).toThrow(expect.objectContaining({code:"transport.invalid-capability"}));});
 
   test("cancels and destroys fake-backed Node DNS resolver operations idempotently",async()=>{const mock=createMockSecureTransportCapabilities();mock.resolve4=()=>new Promise(()=>undefined);mock.resolve6=()=>new Promise(()=>undefined);const runtime=createNodeRuntimeCapabilitiesInternal(mock.ops);const resolver=createNodeDnsResolver(runtime);const controller=new AbortController();const pending=(resolver as unknown as {resolveAll:(hostname:string,signal:AbortSignal)=>Promise<unknown>}).resolveAll;expect(pending).toBeUndefined();const deadline=createRequestDeadlineInternal(10,createNodeRequestDeadlineSchedulerCapabilitiesInternal(runtime),controller.signal);const pinned=createPinnedHopRuntimeInternal(undefined,runtime);const target=pinned.resolveProviderTarget("https://api.crossref.org",deadline);controller.abort();await expect(target).rejects.toBeDefined();expect(mock.resolvers[0]?.cancelCount).toBe(1);expect(mock.resolvers[0]?.destroyCount).toBe(1);await pinned.close();await pinned.close();});
 

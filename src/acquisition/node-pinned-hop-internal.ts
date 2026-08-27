@@ -16,7 +16,7 @@ export interface NodeClockInternal { readonly monotonicNow:()=>number;readonly t
 export interface NodeResolverInternal { readonly resolve4:(hostname:string)=>Promise<readonly string[]>;readonly resolve6:(hostname:string)=>Promise<readonly string[]>;readonly cancel:()=>void;readonly destroy:()=>void; }
 export interface NodeRequestOwnedAgentInternal { readonly protocol:"http:"|"https:";readonly keepAlive:false;readonly maxSockets:1;readonly maxFreeSockets:0;readonly destroy:()=>void; }
 export type NodeHopProtocolFailureInternal="header-overflow"|"unexpected-content-length"|"invalid-header-token"|"invalid-chunk"|"invalid-version"|"invalid-status"|"invalid-protocol";
-export interface NodeRequestCallbacksInternal { readonly onSecureConnected:(tls:Readonly<{address:string|undefined;family:string|number|undefined;hostnameVerified:boolean;authorized:boolean;authorizationError:Error|null;}>)=>void;readonly onProtocolFailure:(code:NodeHopProtocolFailureInternal)=>void;readonly onResponse:(statusCode:number,httpVersion:string,rawHeaders:readonly string[])=>void;readonly onData:(chunk:Uint8Array)=>"continue"|"abort";readonly onEnd:()=>void;readonly onError:(kind:"connect"|"tls"|"socket")=>void; }
+export interface NodeRequestCallbacksInternal { readonly onSecureConnected:(tlsFacts:Readonly<{address:string|undefined;family:string|number|undefined;hostnameVerified:boolean;authorized:boolean;authorizationError:Error|null;}>)=>void;readonly onProtocolFailure:(code:NodeHopProtocolFailureInternal)=>void;readonly onResponse:(statusCode:number,httpVersion:string,rawHeaders:readonly string[])=>void;readonly onData:(chunk:Uint8Array)=>"continue"|"abort";readonly onEnd:()=>void;readonly onError:(kind:"connect"|"tls"|"socket")=>void; }
 export interface NodeRequestHandleInternal { readonly end:()=>void;readonly abort:()=>void;readonly destroy:()=>void; }
 export interface NodeRequestOptionsInternal { readonly url:string;readonly pinnedAddress:string;readonly family:4|6;readonly hostHeader:string;readonly servername:string;readonly headers:readonly Readonly<{name:string;value:string}>[];readonly agent:NodeRequestOwnedAgentInternal;readonly ca:readonly string[];readonly rejectUnauthorized:true;readonly maxHeaderSize:number;readonly insecureHTTPParser:false;readonly joinDuplicateHeaders:false;readonly checkServerIdentity:(hostname:string,certificate:object)=>Error|undefined; }
 export interface NodeOperationsInternal { readonly createResolver:()=>NodeResolverInternal;readonly createRequestOwnedAgent:(protocol:"http:"|"https:")=>NodeRequestOwnedAgentInternal;readonly httpRequest:(options:NodeRequestOptionsInternal,callbacks:NodeRequestCallbacksInternal)=>NodeRequestHandleInternal;readonly httpsRequest:(options:NodeRequestOptionsInternal,callbacks:NodeRequestCallbacksInternal)=>NodeRequestHandleInternal;readonly bundledRootCertificates:readonly string[];readonly checkServerIdentity:(hostname:string,certificate:object)=>Error|undefined;readonly clock:NodeClockInternal; }
@@ -84,7 +84,6 @@ function isTlsErrorCode(code:string):boolean{
   ].includes(code);
 }
 function adaptNodeRequest(protocol:"http:"|"https:",options:NodeRequestOptionsInternal,callbacks:NodeRequestCallbacksInternal):NodeRequestHandleInternal{
-  const module=protocol==="https:"?https:http;
   let lookupUsed=false;
   let phase:"connect"|"tls"|"secure"="connect";
   let callbackGate=true;
@@ -107,7 +106,7 @@ function adaptNodeRequest(protocol:"http:"|"https:",options:NodeRequestOptionsIn
     },
     checkServerIdentity:options.checkServerIdentity,
   };
-  request=module.request(options.url,requestOptions as never,(response)=>{
+  const onResponse=(response:http.IncomingMessage)=>{
     if(!callbackGate)return;
     if(protocol==="http:")phase="secure";
     callbacks.onResponse(response.statusCode??0,response.httpVersion,response.rawHeaders);
@@ -117,7 +116,8 @@ function adaptNodeRequest(protocol:"http:"|"https:",options:NodeRequestOptionsIn
       if(callbacks.onData(new Uint8Array(chunk))==="abort"){callbackGate=false;callbacks.onError("socket");destroyOnce();}
     });
     response.on("end",()=>{if(!callbackGate)return;callbackGate=false;callbacks.onEnd();});
-  });
+  };
+  request=protocol==="https:"?https.request(options.url,requestOptions as never,onResponse):http.request(options.url,requestOptions as never,onResponse);
   request.on("socket",(socket)=>{
     if(protocol!=="https:")return;
     socket.once("connect",()=>{if(callbackGate&&phase==="connect")phase="tls";});
@@ -147,19 +147,41 @@ function adaptNodeRequest(protocol:"http:"|"https:",options:NodeRequestOptionsIn
   });
   return{end:()=>request.end(),abort:destroyOnce,destroy:destroyOnce};
 }
+const unavailableBundledRoots=Object.freeze([] as string[]);
+function readProductionBundledRoots():readonly string[]{try{return tls.rootCertificates;}catch{return unavailableBundledRoots;}}
+const productionBundledRoots=readProductionBundledRoots();
 // Sole built-in adapter. Construction is lazy: Resolver/Agent/request/timers are created only by methods.
-export const realNodeOperations:NodeOperationsInternal=Object.freeze<NodeOperationsInternal>({createResolver:()=>{const resolver=new Resolver();return{resolve4:(hostname)=>resolver.resolve4(hostname),resolve6:(hostname)=>resolver.resolve6(hostname),cancel:()=>resolver.cancel(),destroy:()=>undefined};},createRequestOwnedAgent:(protocol)=>{const agent=protocol==="https:"?new https.Agent({keepAlive:false,maxSockets:1,maxFreeSockets:0}):new http.Agent({keepAlive:false,maxSockets:1,maxFreeSockets:0});const wrapper=Object.freeze({protocol,keepAlive:false as const,maxSockets:1 as const,maxFreeSockets:0 as const,destroy:()=>agent.destroy()});realAgents.set(wrapper,agent);return wrapper;},httpRequest:(options,callbacks)=>adaptNodeRequest("http:",options,callbacks),httpsRequest:(options,callbacks)=>adaptNodeRequest("https:",options,callbacks),bundledRootCertificates:tls.rootCertificates,checkServerIdentity:(hostname,certificate)=>tls.checkServerIdentity(hostname,certificate as tls.PeerCertificate),clock:Object.freeze<NodeClockInternal>({monotonicNow:()=>nodePerformance.now(),timestampNow:()=>new Date().toISOString(),setTimer:(callback,milliseconds)=>nodeSetTimeout(callback,milliseconds),clearTimer:(handle)=>nodeClearTimeout(handle as ReturnType<typeof nodeSetTimeout>)})});
+export const realNodeOperations:NodeOperationsInternal=Object.freeze<NodeOperationsInternal>({createResolver:()=>{const resolver=new Resolver();return{resolve4:(hostname)=>resolver.resolve4(hostname),resolve6:(hostname)=>resolver.resolve6(hostname),cancel:()=>resolver.cancel(),destroy:()=>undefined};},createRequestOwnedAgent:(protocol)=>{const agent=protocol==="https:"?new https.Agent({keepAlive:false,maxSockets:1,maxFreeSockets:0}):new http.Agent({keepAlive:false,maxSockets:1,maxFreeSockets:0});const wrapper=Object.freeze({protocol,keepAlive:false as const,maxSockets:1 as const,maxFreeSockets:0 as const,destroy:()=>agent.destroy()});realAgents.set(wrapper,agent);return wrapper;},httpRequest:(options,callbacks)=>adaptNodeRequest("http:",options,callbacks),httpsRequest:(options,callbacks)=>adaptNodeRequest("https:",options,callbacks),bundledRootCertificates:productionBundledRoots,checkServerIdentity:(hostname,certificate)=>tls.checkServerIdentity(hostname,certificate as tls.PeerCertificate),clock:Object.freeze<NodeClockInternal>({monotonicNow:()=>nodePerformance.now(),timestampNow:()=>new Date().toISOString(),setTimer:(callback,milliseconds)=>nodeSetTimeout(callback,milliseconds),clearTimer:(handle)=>nodeClearTimeout(handle as ReturnType<typeof nodeSetTimeout>)})});
 
 function exactTimestampEpoch(value:unknown):number|null{
   if(typeof value!=="string"||!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(value))return null;
   const epoch=Date.parse(value);
   return Number.isFinite(epoch)&&new Date(epoch).toISOString()===value?epoch:null;
 }
+function isDataFunctionDescriptor(descriptor:PropertyDescriptor|undefined):boolean{
+  return descriptor!==undefined&&"value" in descriptor&&typeof descriptor.value==="function";
+}
 function productionFeaturesAvailable():boolean{
-  return typeof Resolver==="function"&&typeof http.Agent==="function"&&typeof https.Agent==="function"&&
-    typeof http.request==="function"&&typeof https.request==="function"&&typeof tls.checkServerIdentity==="function"&&
-    Array.isArray(tls.rootCertificates)&&Object.isFrozen(tls.rootCertificates)&&typeof nodeSetTimeout==="function"&&
-    typeof nodeClearTimeout==="function"&&typeof nodePerformance?.now==="function";
+  if(typeof Resolver!=="function"||nodePerformance===null||(typeof nodePerformance!=="object"&&typeof nodePerformance!=="function"))return false;
+  const resolverPrototypeDescriptor=Object.getOwnPropertyDescriptor(Resolver,"prototype");
+  if(!resolverPrototypeDescriptor||!("value" in resolverPrototypeDescriptor)||resolverPrototypeDescriptor.value===null||typeof resolverPrototypeDescriptor.value!=="object")return false;
+  const resolverPrototype=resolverPrototypeDescriptor.value as object;
+  const resolverBase=Object.getPrototypeOf(resolverPrototype) as unknown;
+  const performancePrototype=Object.getPrototypeOf(nodePerformance) as unknown;
+  const resolver4Descriptor=Object.getOwnPropertyDescriptor(resolverPrototype,"resolve4");
+  const resolver6Descriptor=Object.getOwnPropertyDescriptor(resolverPrototype,"resolve6");
+  const resolverCancelDescriptor=resolverBase===null?undefined:Object.getOwnPropertyDescriptor(resolverBase as object,"cancel");
+  const httpAgentDescriptor=Object.getOwnPropertyDescriptor(http,"Agent");
+  const httpRequestDescriptor=Object.getOwnPropertyDescriptor(http,"request");
+  const httpsAgentDescriptor=Object.getOwnPropertyDescriptor(https,"Agent");
+  const httpsRequestDescriptor=Object.getOwnPropertyDescriptor(https,"request");
+  const tlsIdentityDescriptor=Object.getOwnPropertyDescriptor(tls,"checkServerIdentity");
+  const rootsDescriptor=Object.getOwnPropertyDescriptor(tls,"rootCertificates");
+  const performanceNowDescriptor=performancePrototype===null?undefined:Object.getOwnPropertyDescriptor(performancePrototype as object,"now");
+  const rootsAvailable=rootsDescriptor!==undefined&&!("value" in rootsDescriptor)&&typeof rootsDescriptor.get==="function"&&rootsDescriptor.set===undefined&&Array.isArray(realNodeOperations.bundledRootCertificates)&&realNodeOperations.bundledRootCertificates.length>0&&Object.isFrozen(realNodeOperations.bundledRootCertificates);
+  return isDataFunctionDescriptor(resolver4Descriptor)&&isDataFunctionDescriptor(resolver6Descriptor)&&isDataFunctionDescriptor(resolverCancelDescriptor)&&
+    isDataFunctionDescriptor(httpAgentDescriptor)&&isDataFunctionDescriptor(httpRequestDescriptor)&&isDataFunctionDescriptor(httpsAgentDescriptor)&&isDataFunctionDescriptor(httpsRequestDescriptor)&&
+    isDataFunctionDescriptor(tlsIdentityDescriptor)&&rootsAvailable&&typeof nodeSetTimeout==="function"&&typeof nodeClearTimeout==="function"&&isDataFunctionDescriptor(performanceNowDescriptor);
 }
 export function createNodeRuntimeCapabilitiesInternal(ops:NodeOperationsInternal=realNodeOperations):NodeRuntimeCapabilitiesInternal{
   if(ops===realNodeOperations&&!productionFeaturesAvailable())transportFail("transport.unsupported-runtime");
@@ -287,6 +309,10 @@ function canonicalStringBytes(value:string):number{
   if(!hasWellFormedUtf16(value))return Number.POSITIVE_INFINITY;
   return Buffer.byteLength(JSON.stringify(value),"utf8");
 }
+function isNodeHeaderValue(value:string):boolean{
+  for(let index=0;index<value.length;index+=1){const unit=value.charCodeAt(index);if(unit!==0x09&&(unit<0x20||unit===0x7f||unit>0xff))return false;}
+  return true;
+}
 function validatedHeaders(value:unknown):readonly Readonly<{name:string;value:string}>[]{
   if(value===null||typeof value!=="object"||utilTypes.isProxy(value)||!Array.isArray(value)||Object.getPrototypeOf(value)!==Array.prototype)pinnedFail("pinned-runtime.invalid-input");
   const all=Object.getOwnPropertyDescriptors(value as object) as PropertyDescriptorMap;
@@ -304,7 +330,7 @@ function validatedHeaders(value:unknown):readonly Readonly<{name:string;value:st
     const name=header.name!.value;
     const headerValue=header.value!.value;
     if((name!=="accept"&&name!=="user-agent"&&name!=="authorization")||seenNames.has(name)||typeof headerValue!=="string")pinnedFail("pinned-runtime.invalid-input");
-    if(/[\u0000-\u001f\u007f-\u009f]/u.test(headerValue))pinnedFail("pinned-runtime.invalid-input");
+    if(!isNodeHeaderValue(headerValue))pinnedFail("pinned-runtime.invalid-input");
     const valueBytes=canonicalStringBytes(headerValue);
     if(!Number.isSafeInteger(valueBytes)||valueBytes>16_384)pinnedFail("pinned-runtime.invalid-input");
     aggregateCanonicalBytes+=Buffer.byteLength(name,"utf8")+valueBytes;
