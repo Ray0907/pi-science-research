@@ -44,7 +44,7 @@ const EMPTY: AbstractValue = Object.freeze({
   properties: Object.freeze(new Map<string, AbstractValue>()),
   unknownProperty: null,
 });
-const MAX_DEPTH = 8;
+const MAX_DEPTH = 32;
 const MAX_NODES = 4_096;
 const MAX_AST_DEPTH = 128;
 const MAX_PASSES = 64;
@@ -126,7 +126,7 @@ function moduleKind(specifier: string): "network" | "child" | "fixture" | "safe"
   const bare = specifier.startsWith("node:") ? specifier.slice(5) : specifier;
   const network = ["http", "https", "http2", "net", "tls", "dns", "dns/promises", "dgram", "undici", "node-fetch", "cross-fetch", "ws", "axios", "got", "superagent", "openai", "@aws-sdk", "proxy-agent", "http-proxy-agent", "https-proxy-agent", "socks-proxy-agent"];
   if (network.some((name) => bare === name || bare.startsWith(`${name}/`))) return "network";
-  if (["child_process", "worker_threads", "cluster", "module"].some((name) => bare === name || bare.startsWith(`${name}/`))) return "child";
+  if (["child_process", "worker_threads", "cluster", "module", "vm"].some((name) => bare === name || bare.startsWith(`${name}/`))) return "child";
   if (/\/(?:acquisition\/)?contracts\.(?:js|ts)$/u.test(specifier)) return "fixture";
   return "safe";
 }
@@ -134,24 +134,21 @@ function moduleKind(specifier: string): "network" | "child" | "fixture" | "safe"
 function moduleValue(specifier: string): AbstractValue {
   const kind = moduleKind(specifier);
   if (kind === "network") return valueOf(Capability.network, [], false, new Map(), valueOf(Capability.network));
-  if (kind === "child") return valueOf(Capability.child, [], false, new Map(), valueOf(Capability.child));
+  if(kind==="child"){const bare=specifier.startsWith("node:")?specifier.slice(5):specifier,flags=(bare==="vm"||bare.startsWith("vm/"))?Capability.child|Capability.codegen:Capability.child;return valueOf(flags,[],false,new Map(),valueOf(flags));}
   if (kind === "fixture") return valueOf(0, [], false, new Map([["createProviderRequestPartitionFixtureInternal", valueOf(Capability.fixture)]]));
   return EMPTY;
 }
 
-function staticPropertyName(name: ts.PropertyName, evaluate: (expression: ts.Expression) => AbstractValue): {values: readonly string[]; unknown: boolean} {
-  if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNumericLiteral(name) || ts.isNoSubstitutionTemplateLiteral(name)) return {values: [name.text], unknown: false};
-  if (ts.isComputedPropertyName(name)) {
-    const value = evaluate(name.expression);
-    return {values: [...value.strings], unknown: value.unknownString || value.strings.size === 0};
-  }
-  return {values: [], unknown: true};
+function staticPropertyName(name: ts.PropertyName, evaluate: (expression: ts.Expression) => AbstractValue): {values: readonly string[]; unknown: boolean; capability:AbstractValue} {
+  if(ts.isIdentifier(name)||ts.isStringLiteral(name)||ts.isNumericLiteral(name)||ts.isNoSubstitutionTemplateLiteral(name))return{values:[name.text],unknown:false,capability:EMPTY};
+  if(ts.isComputedPropertyName(name)){const value=evaluate(name.expression);return{values:[...value.strings],unknown:value.unknownString||value.strings.size===0,capability:value};}
+  return{values:[],unknown:true,capability:EMPTY};
 }
 
 export function createCapabilityAnalysis(source: string, relative: string): CapabilityAnalysis {
   const kind = relative.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
   const virtualName = `/capability-audit/${relative.replaceAll("\\", "/")}`;
-  const options: ts.CompilerOptions = {target:ts.ScriptTarget.Latest,module:ts.ModuleKind.ESNext,noResolve:true};
+  const options: ts.CompilerOptions = {target:ts.ScriptTarget.Latest,module:ts.ModuleKind.ESNext,noResolve:true,noLib:true};
   const host=ts.createCompilerHost(options),originalGetSourceFile=host.getSourceFile.bind(host);
   host.getSourceFile=(fileName,languageVersion,onError,shouldCreateNewSourceFile)=>fileName===virtualName?ts.createSourceFile(fileName,source,languageVersion,true,kind):originalGetSourceFile(fileName,languageVersion,onError,shouldCreateNewSourceFile);
   host.fileExists=fileName=>fileName===virtualName||ts.sys.fileExists(fileName);
@@ -212,7 +209,9 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
     if (node.body) { const visit = (child: ts.Node): void => { if (ts.isFunctionLike(child) && child !== node) return; if (ts.isReturnStatement(child) && child.expression) { result = join(result, evaluate(child.expression, depth + 1), depth + 1); return; } ts.forEachChild(child, visit); }; ts.forEachChild(node.body, visit); }
     return result;
   };
-  const derivedUnknown = (value: AbstractValue): AbstractValue => valueOf(value.flags, [], true, new Map(), value.flags === 0 ? EMPTY : valueOf(value.flags));
+  const functionResults=new Map<string,AbstractValue>(),activeFunctionResults=new Set<string>();
+  const declaredFunctionResult=(key:string,declaration:ts.FunctionDeclaration):AbstractValue=>{const cached=functionResults.get(key);if(cached)return cached;if(activeFunctionResults.has(key))return EMPTY;activeFunctionResults.add(key);try{const result=evaluateFunctionResult(declaration,0);functionResults.set(key,result);return result;}finally{activeFunctionResults.delete(key);}};
+  const derivedUnknown = (value: AbstractValue): AbstractValue => value.flags===TOP_CAPABILITY_FLAGS?TOP:valueOf(value.flags, [], true, new Map(), value.flags === 0 ? EMPTY : valueOf(value.flags));
 
   evaluate = (expression: ts.Expression, depth = 0): AbstractValue => {
     if (depth >= MAX_DEPTH) return TOP;
@@ -242,13 +241,17 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
       ]), valueOf(Capability.codegen));
       if (["setTimeout", "setInterval"].includes(value.text)) return valueOf(Capability.processRoot);
       const declaration = functionDeclarations.get(localBindingKey(value)??`ambient:${value.text}`);
-      if (declaration?.body) {const result=evaluateFunctionResult(declaration,depth+1);return result.flags===TOP_CAPABILITY_FLAGS?EMPTY:derivedUnknown(result);}
+      if(declaration?.body)return derivedUnknown(declaredFunctionResult(localBindingKey(value)??`ambient:${value.text}`,declaration));
       return EMPTY;
     }
+    const observation=(item:AbstractValue):AbstractValue=>(item.flags===TOP_CAPABILITY_FLAGS||(item.flags&Capability.analysisBound)!==0)?item:EMPTY;
+    if(ts.isPrefixUnaryExpression(value)&&value.operator===ts.SyntaxKind.ExclamationToken)return observation(evaluate(value.operand,depth+1));
+    if(ts.isTypeOfExpression(value))return observation(evaluate(value.expression,depth+1));
     if (ts.isConditionalExpression(value)) return join(evaluate(value.condition, depth + 1), join(evaluate(value.whenTrue, depth + 1), evaluate(value.whenFalse, depth + 1), depth + 1), depth + 1);
     if (ts.isBinaryExpression(value) && [ts.SyntaxKind.BarBarToken, ts.SyntaxKind.AmpersandAmpersandToken, ts.SyntaxKind.QuestionQuestionToken, ts.SyntaxKind.CommaToken].includes(value.operatorToken.kind)) return join(evaluate(value.left, depth + 1), evaluate(value.right, depth + 1), depth + 1);
+    if(ts.isBinaryExpression(value)&&[ts.SyntaxKind.EqualsEqualsToken,ts.SyntaxKind.ExclamationEqualsToken,ts.SyntaxKind.EqualsEqualsEqualsToken,ts.SyntaxKind.ExclamationEqualsEqualsToken,ts.SyntaxKind.LessThanToken,ts.SyntaxKind.LessThanEqualsToken,ts.SyntaxKind.GreaterThanToken,ts.SyntaxKind.GreaterThanEqualsToken,ts.SyntaxKind.InKeyword,ts.SyntaxKind.InstanceOfKeyword].includes(value.operatorToken.kind))return observation(join(evaluate(value.left,depth+1),evaluate(value.right,depth+1),depth+1));
     if (ts.isBinaryExpression(value) && value.operatorToken.kind === ts.SyntaxKind.PlusToken) {
-      const left = evaluate(value.left, depth + 1), right = evaluate(value.right, depth + 1), strings: string[] = [];
+      const left = evaluate(value.left, depth + 1), right = evaluate(value.right, depth + 1),combined=join(left,right,depth+1);if(combined.flags===TOP_CAPABILITY_FLAGS||(combined.flags&Capability.analysisBound)!==0)return combined;const leftType=checker.getTypeAtLocation(value.left),rightType=checker.getTypeAtLocation(value.right);if((leftType.flags&ts.TypeFlags.NumberLike)!==0&&(rightType.flags&ts.TypeFlags.NumberLike)!==0)return EMPTY;const strings: string[] = [];
       let unknown = left.unknownString || right.unknownString;
       for (const a of left.strings) for (const b of right.strings) {
         if (strings.length >= MAX_STRINGS) { unknown = true; break; }
@@ -280,13 +283,13 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
           continue;
         }
         if (ts.isPropertyAssignment(property)) {
-          const key = staticPropertyName(property.name, (item) => evaluate(item, depth + 1)), item = evaluate(property.initializer, depth + 1); flags |= item.flags;
+          const key = staticPropertyName(property.name, (item) => evaluate(item, depth + 1)), item = evaluate(property.initializer, depth + 1); flags|=item.flags|key.capability.flags;
           for (const name of key.values) properties.set(name, join(properties.get(name) ?? EMPTY, item));
           if (key.unknown) unknownProperty = join(unknownProperty ?? EMPTY, item);
         } else if (ts.isShorthandPropertyAssignment(property)) {
           const item = evaluate(property.name, depth + 1); flags |= item.flags; properties.set(property.name.text, join(properties.get(property.name.text) ?? EMPTY, item));
         } else if (ts.isMethodDeclaration(property) || ts.isGetAccessorDeclaration(property) || ts.isSetAccessorDeclaration(property)) {
-          const key = staticPropertyName(property.name, (item) => evaluate(item, depth + 1));
+          const key=staticPropertyName(property.name,(item)=>evaluate(item,depth+1));flags|=key.capability.flags;
           for (const name of key.values) properties.set(name, EMPTY);
           if (key.unknown) unknownProperty = join(unknownProperty ?? EMPTY, EMPTY);
         }
@@ -300,7 +303,7 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
       return valueOf(flags, [], false, properties, unknownProperty);
     }
     const extract = (base: AbstractValue, keys: readonly string[], unknownKey: boolean): AbstractValue => {
-      if (base.flags === TOP_CAPABILITY_FLAGS) return TOP;
+      if(base.flags===TOP_CAPABILITY_FLAGS)return TOP;if((base.flags&Capability.analysisBound)!==0)return base;
       let result = EMPTY;
       for (const key of keys) {
         result = join(result, base.properties.get(key) ?? base.unknownProperty ?? EMPTY);
@@ -329,6 +332,7 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
     if (ts.isPropertyAccessExpression(value)) return extract(evaluate(value.expression, depth + 1), [value.name.text], false);
     if (ts.isElementAccessExpression(value)) {
       const base=evaluate(value.expression,depth+1),key=value.argumentExpression?evaluate(value.argumentExpression,depth+1):valueOf(0,[],true),unknown=key.unknownString||key.strings.size!==1;
+      if(key.flags===TOP_CAPABILITY_FLAGS)return TOP;if((key.flags&Capability.analysisBound)!==0)return key;
       if(unknown&&base.flags!==TOP_CAPABILITY_FLAGS&&(base.flags&(Capability.introspector|Capability.codegen))!==0)return OPAQUE_DANGER;
       return extract(base,[...key.strings],key.unknownString||key.strings.size===0);
     }
@@ -339,7 +343,7 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
       const invocationMember=():Readonly<{base:AbstractValue;member:string|null;unknown:boolean}>|null=>{const target=unwrapExpression(value.expression);if(ts.isPropertyAccessExpression(target))return{base:evaluate(target.expression,depth+1),member:target.name.text,unknown:false};if(ts.isElementAccessExpression(target)){const base=evaluate(target.expression,depth+1),key=target.argumentExpression?evaluate(target.argumentExpression,depth+1):valueOf(0,[],true),exact=!key.unknownString&&key.strings.size===1;return{base,member:exact?[...key.strings][0]!:null,unknown:!exact};}return null;},invocation=invocationMember();
       if(invocation?.unknown&&invocation.base.flags!==TOP_CAPABILITY_FLAGS&&(invocation.base.flags&(Capability.introspector|Capability.codegen))!==0)return OPAQUE_DANGER;
       const introspectorCall = (callee: AbstractValue, args: readonly AbstractValue[]): AbstractValue | null => {
-        if (callee.flags===TOP_CAPABILITY_FLAGS||(callee.flags&Capability.introspector)===0)return null;
+        if(callee.flags===TOP_CAPABILITY_FLAGS)return TOP;if((callee.flags&Capability.introspector)===0)return null;
         const bound=boundArguments(callee);if(bound===null||bound.length+args.length>MAX_INTROSPECTOR_ARGUMENTS)return OPAQUE_DANGER;const logical=[...bound,...args],source=logical[0]??OPAQUE_DANGER,key=logical[1]??valueOf(0,[],true);
         const extracted = extract(source, [...key.strings], key.unknownString || key.strings.size === 0);
         if (callee.strings.has("introspector:get")) return extracted;
@@ -352,19 +356,19 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
             const item = extract(source, [name], false);
             if (item.flags !== 0) properties.set(name, descriptor(item));
           }
-          const dangerousSource = source.flags !== TOP_CAPABILITY_FLAGS && (source.flags & (Capability.globalRoot | Capability.processRoot | Capability.network | Capability.child)) !== 0;
+          const dangerousSource=(source.flags&(Capability.globalRoot|Capability.processRoot|Capability.network|Capability.child))!==0;
           return valueOf(0, [], false, properties, dangerousSource ? descriptor(OPAQUE_DANGER) : EMPTY);
         }
         return OPAQUE_DANGER;
       };
       if(invocation?.member==="bind"){
-        const base=invocation.base;if((base.flags&(Capability.introspector|Capability.codegen|Capability.network|Capability.child))!==0){if(base.flags===TOP_CAPABILITY_FLAGS||value.arguments.some(ts.isSpreadElement)||value.arguments.length===0||value.arguments.length-1>MAX_INTROSPECTOR_ARGUMENTS)return OPAQUE_DANGER;const preArguments=value.arguments.slice(1).map(argument=>evaluate(argument,depth+1)),properties=new Map(base.properties);properties.set("[[boundLength]]",valueOf(0,[String(preArguments.length)]));preArguments.forEach((argument,index)=>properties.set(`[[bound:${index}]]`,argument));return valueOf(base.flags,base.strings,base.unknownString,properties,base.unknownProperty);}}
+        const base=invocation.base;if((base.flags&(Capability.introspector|Capability.codegen|Capability.network|Capability.child))!==0){if(base.flags===TOP_CAPABILITY_FLAGS)return TOP;if(value.arguments.some(ts.isSpreadElement)||value.arguments.length===0||value.arguments.length-1>MAX_INTROSPECTOR_ARGUMENTS)return OPAQUE_DANGER;const preArguments=value.arguments.slice(1).map(argument=>evaluate(argument,depth+1)),properties=new Map(base.properties);properties.set("[[boundLength]]",valueOf(0,[String(preArguments.length)]));preArguments.forEach((argument,index)=>properties.set(`[[bound:${index}]]`,argument));return valueOf(base.flags,base.strings,base.unknownString,properties,base.unknownProperty);}}
       if(invocation?.member==="apply"){
-        const base=invocation.base;if((base.flags&(Capability.introspector|Capability.codegen))!==0){if(value.arguments.length!==2||value.arguments.some(ts.isSpreadElement))return OPAQUE_DANGER;const logical=denseArguments(evaluate(value.arguments[1]!,depth+1));if(logical===null)return OPAQUE_DANGER;const applied=introspectorCall(base,logical);return applied??OPAQUE_DANGER;}}
+        const base=invocation.base;if((base.flags&(Capability.introspector|Capability.codegen))!==0){if(base.flags===TOP_CAPABILITY_FLAGS)return TOP;if(value.arguments.length!==2||value.arguments.some(ts.isSpreadElement))return OPAQUE_DANGER;const argumentArray=evaluate(value.arguments[1]!,depth+1);if(argumentArray.flags===TOP_CAPABILITY_FLAGS)return TOP;const logical=denseArguments(argumentArray);if(logical===null)return OPAQUE_DANGER;const applied=introspectorCall(base,logical);return applied??OPAQUE_DANGER;}}
       if(invocation?.member==="call"){
         const base=invocation.base;if((base.flags&Capability.introspector)!==0){if(value.arguments.some(ts.isSpreadElement))return OPAQUE_DANGER;const called=introspectorCall(base,value.arguments.slice(1).map(argument=>evaluate(argument,depth+1)));if(called)return called;}
       }
-      const inspected = value.arguments.some(ts.isSpreadElement)?((evaluate(value.expression,depth+1).flags&Capability.introspector)!==0?OPAQUE_DANGER:null):introspectorCall(evaluate(value.expression, depth + 1), value.arguments.map(argument=>evaluate(argument,depth+1)));
+      const inspected = value.arguments.some(ts.isSpreadElement)?(()=>{const callee=evaluate(value.expression,depth+1);return callee.flags===TOP_CAPABILITY_FLAGS?TOP:(callee.flags&Capability.introspector)!==0?OPAQUE_DANGER:null;})():introspectorCall(evaluate(value.expression, depth + 1), value.arguments.map(argument=>evaluate(argument,depth+1)));
       if (inspected) return inspected;
       if (ts.isPropertyAccessExpression(value.expression) && value.expression.name.text === "slice") {
         const base = evaluate(value.expression.expression, depth + 1);
@@ -405,7 +409,7 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
   };
 
   const patternProperty = (sourceValue: AbstractValue, keys: readonly string[], unknown: boolean): AbstractValue => {
-    if (sourceValue.flags === TOP_CAPABILITY_FLAGS) return TOP;
+    if(sourceValue.flags===TOP_CAPABILITY_FLAGS)return TOP;if((sourceValue.flags&Capability.analysisBound)!==0)return sourceValue;
     let item = EMPTY;
     for (const key of keys) {
       item = join(item, sourceValue.properties.get(key) ?? sourceValue.unknownProperty ?? EMPTY);
@@ -439,8 +443,8 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
       let changed = false;
       for (const element of pattern.elements) {
         if (element.dotDotDotToken) { changed = extractPattern(element.name, sourceValue.unknownProperty ?? sourceValue, depth + 1) || changed; continue; }
-        const key = element.propertyName ? staticPropertyName(element.propertyName, (item) => evaluate(item, depth + 1)) : ts.isIdentifier(element.name) ? {values: [element.name.text], unknown: false} : {values: [], unknown: true};
-        const item = patternProperty(sourceValue, key.values, key.unknown);
+        const key = element.propertyName ? staticPropertyName(element.propertyName, (item) => evaluate(item, depth + 1)) : ts.isIdentifier(element.name)?{values:[element.name.text],unknown:false,capability:EMPTY}:{values:[],unknown:true,capability:EMPTY};
+        const item=key.capability.flags===TOP_CAPABILITY_FLAGS?TOP:(key.capability.flags&Capability.analysisBound)!==0?key.capability:patternProperty(sourceValue,key.values,key.unknown);
         changed = extractPattern(element.name, item, depth + 1) || changed;
       }
       return changed;
@@ -455,7 +459,7 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
         if (ts.isSpreadAssignment(property)) {changed = extractPattern(property.expression, sourceValue.unknownProperty ?? sourceValue, depth + 1) || changed; continue;}
         if (!ts.isPropertyAssignment(property) && !ts.isShorthandPropertyAssignment(property)) continue;
         const name = property.name, target = ts.isPropertyAssignment(property) ? property.initializer : property.name, key = staticPropertyName(name, (item) => evaluate(item, depth + 1));
-        const item = patternProperty(sourceValue, key.values, key.unknown);
+        const item=key.capability.flags===TOP_CAPABILITY_FLAGS?TOP:(key.capability.flags&Capability.analysisBound)!==0?key.capability:patternProperty(sourceValue,key.values,key.unknown);
         changed = extractPattern(target, item, depth + 1) || changed;
       }
       return changed;
@@ -471,11 +475,11 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
   const passLimit = Math.min(MAX_PASSES, requestedPasses);
   let stabilized = false;
   for (let pass = 0; pass < passLimit; pass += 1) {
-    let changed = false;
+    functionResults.clear();let changed = false;
     for (const operation of operations) changed = extractPattern(operation.pattern, evaluate(operation.source), 0) || changed;
     if (!changed) {stabilized = true; break;}
   }
-  if(!stabilized)for(const operation of operations)taintPattern(operation.pattern,BOUND);
+  if(!stabilized)for(const operation of operations)taintPattern(operation.pattern,BOUND);functionResults.clear();
 
   const contains = (value: AbstractValue, flag: number): boolean => (value.flags & flag) !== 0;
   const location = (node: ts.Node, category: string): string => {const point = file.getLineAndCharacterOfPosition(node.getStart(file));return `${relative}:${point.line + 1}:${point.character + 1}: ${category}`;};
