@@ -38,6 +38,7 @@ function staticString(expression: ts.Expression): string | undefined { const val
 function findingSet(values: readonly string[]): readonly string[] { return Object.freeze([...new Set(values)].sort()); }
 function auditSetupSource(file: ts.SourceFile, relative: string): readonly string[] {
     const errors: string[] = [];
+    let syncBuiltinImport: ts.Identifier | null = null, syncBuiltinCallCount = 0;
     const defaults = new Map([["node:http", "http"], ["node:https", "https"], ["node:http2", "http2"], ["node:net", "net"], ["node:tls", "tls"], ["node:dgram", "dgram"], ["node:dns", "dns"], ["node:dns/promises", "dnsPromises"]]);
     const named = new Map([["node:module", "syncBuiltinESMExports"], ["node:stream", "Duplex"], ["vitest", "afterAll"]]);
     const seen = new Set<string>();
@@ -68,6 +69,7 @@ function auditSetupSource(file: ts.SourceFile, relative: string): readonly strin
             const valid = clause && !clause.name && !clause.isTypeOnly && bindings && ts.isNamedImports(bindings) && bindings.elements.length === 1 && !bindings.elements[0]!.isTypeOnly && !bindings.elements[0]!.propertyName && bindings.elements[0]!.name.text === namedName;
             if (!valid)
                 errors.push(`${relative}:1:1: setup named import shape`);
+            else if (specifier === "node:module") syncBuiltinImport = bindings.elements[0]!.name;
         }
         else
             errors.push(`${relative}:1:1: setup import denied`);
@@ -78,6 +80,7 @@ function auditSetupSource(file: ts.SourceFile, relative: string): readonly strin
     const runtimeRoots = new Set(defaults.values());
     const insideType = (node: ts.Node): boolean => { for (let current: ts.Node | undefined = node.parent; current; current = current.parent) { if (ts.isTypeNode(current)) return true; if (ts.isStatement(current)) return false; } return false; };
     const visitSetup = (node: ts.Node): void => {
+        if (ts.isIdentifier(node) && node.text === "syncBuiltinESMExports") { const parent = node.parent, exactImport = node === syncBuiltinImport, exactCall = ts.isCallExpression(parent) && parent.expression === node && parent.arguments.length === 0; if (exactCall) syncBuiltinCallCount += 1; if (!exactImport && !exactCall) errors.push(`${relative}:1:1: setup module binding escape denied`); }
         if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression) && runtimeRoots.has(node.expression.text) && !insideType(node)) {
             const prototypeRoot = (node.expression.text === "dgram" && node.name.text === "Socket") || ((node.expression.text === "dns" || node.expression.text === "dnsPromises") && node.name.text === "Resolver");
             if (!prototypeRoot) errors.push(`${relative}:1:1: setup runtime member escape`);
@@ -98,6 +101,7 @@ function auditSetupSource(file: ts.SourceFile, relative: string): readonly strin
         ts.forEachChild(node, visitSetup);
     };
     visitSetup(file);
+    if (syncBuiltinImport === null || syncBuiltinCallCount !== 1) errors.push(`${relative}:1:1: setup syncBuiltinESMExports call cardinality`);
     const source = file.text;
     const required = ["class NoIoDuplex extends Duplex", "override _read(): void {}", "createConnection: () =>", "createConnectionCalls !== 1", "getPrototypeOf(session)", '["request", "ping", "settings"]', "installMethod(prototype, name, stub)", "session?.destroy()", "fakeDuplex?.destroy()", "syncBuiltinESMExports()", "attempts += 1", "attemptsAreZero()", "network-attempts=0"];
     for (const snippet of required)
@@ -176,12 +180,14 @@ function exactNpmCliPath(expression: ts.Expression | undefined): boolean { if (!
     return branch(value.whenTrue, ["node_modules", "npm", "bin", "npm-cli.js"]) && branch(value.whenFalse, ["..", "lib", "node_modules", "npm", "bin", "npm-cli.js"]); }
 function exactImportMetaDirname(expression: ts.Expression | undefined): boolean { if (!expression)
     return false; const value = unwrapExpression(expression); return ts.isPropertyAccessExpression(value) && value.name.text === "dirname" && ts.isMetaProperty(value.expression) && value.expression.keywordToken === ts.SyntaxKind.ImportKeyword && value.expression.name.text === "meta"; }
+function exactSetupModuleImport(node: ts.ImportDeclaration, relative: string): boolean { if (relative !== setupRelative || !ts.isStringLiteral(node.moduleSpecifier) || node.moduleSpecifier.text !== "node:module") return false; const clause = node.importClause, bindings = clause?.namedBindings; return !!clause && !clause.name && !clause.isTypeOnly && !!bindings && ts.isNamedImports(bindings) && bindings.elements.length === 1 && !bindings.elements[0]!.isTypeOnly && !bindings.elements[0]!.propertyName && bindings.elements[0]!.name.text === "syncBuiltinESMExports"; }
 function auditChildSource(source: string, relative: string): ChildAudit {
     const analysis = createCapabilityAnalysis(source, relative), file = analysis.file, errors: string[] = [], sites: string[] = [], candidateCalls: ts.CallExpression[] = [];
     let childImport: string | null = null, childImportCount = 0;
     const imports = new Set<string>(), initializers = new Map<string, ts.Expression>(), childSources = new Map<string, ts.Expression[]>();
     for (const statement of file.statements)
         if (ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier) && !isFullyErasedTypeOnlyImport(statement) && specifierKind(statement.moduleSpecifier.text) === "child") {
+            if (exactSetupModuleImport(statement, relative)) continue;
             childImportCount += 1;
             if (statement.moduleSpecifier.text !== "node:child_process" || !statement.importClause || statement.importClause.name || !statement.importClause.namedBindings || !ts.isNamedImports(statement.importClause.namedBindings) || statement.importClause.namedBindings.elements.length !== 1)
                 errors.push(`${relative}: child import shape`);
@@ -215,7 +221,9 @@ function auditChildSource(source: string, relative: string): ChildAudit {
         if (!changed)
             break;
     }
-    const processRoots = new Set(["process"]);
+    const processRoots = new Set(["process"]), moduleRoots = new Set(analysis.bindings.has("module") ? [] : ["module"]);
+    const resolvesModule = (value: ts.Expression): boolean => { const current = unwrapExpression(value); if (ts.isIdentifier(current)) return moduleRoots.has(current.text); return ts.isPropertyAccessExpression(current) && current.name.text === "module" && ts.isIdentifier(unwrapExpression(current.expression)) && ["globalThis", "global"].includes((unwrapExpression(current.expression) as ts.Identifier).text); };
+    for (let pass = 0; pass <= childSources.size; pass += 1) { let changed = false; for (const [name, values] of childSources) if (!moduleRoots.has(name) && values.some(resolvesModule)) { moduleRoots.add(name); changed = true; } if (!changed) break; }
     const resolvesProcess = (value: ts.Expression): boolean => { const current = unwrapExpression(value); if (ts.isIdentifier(current))
         return processRoots.has(current.text); return ts.isPropertyAccessExpression(current) && current.name.text === "process" && ts.isIdentifier(unwrapExpression(current.expression)) && ["globalThis", "global"].includes((unwrapExpression(current.expression) as ts.Identifier).text); };
     for (let pass = 0; pass <= childSources.size; pass += 1) {
@@ -228,6 +236,7 @@ function auditChildSource(source: string, relative: string): ChildAudit {
         if (!changed)
             break;
     }
+    const loaderMemberRoot = (expression: ts.Expression): boolean => { const base = unwrapExpression(expression), value = analysis.value(expression); return (ts.isIdentifier(base) && (moduleRoots.has(base.text) || processRoots.has(base.text) || ["globalThis", "global"].includes(base.text))) || (analysis.contains(value, Capability.child) && value.flags !== 31); };
     const visit = (node: ts.Node): void => {
         if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier) && !isFullyErasedTypeOnlyExport(node) && specifierKind(node.moduleSpecifier.text) === "child")
             errors.push(`${relative}: child export-from denied`);
@@ -240,11 +249,11 @@ function auditChildSource(source: string, relative: string): ChildAudit {
             if (!(ts.isCallExpression(node.parent) && node.parent.expression === node) && !(ts.isCallExpression(outer.parent) && outer.parent.expression === outer))
                 errors.push(`${relative}: subprocess binding escape`);
         }
-        if (ts.isPropertyAccessExpression(node) && ["require", "createRequire", "getBuiltinModule"].includes(node.name.text))
+        if (ts.isPropertyAccessExpression(node) && ["require", "getBuiltinModule", "createRequire", "_load", "register", "registerHooks"].includes(node.name.text) && (["require", "getBuiltinModule"].includes(node.name.text) || loaderMemberRoot(node.expression)))
             errors.push(`${relative}: loader property capability denied`);
         if (ts.isElementAccessExpression(node) && node.argumentExpression) {
-            const keyValue = analysis.value(node.argumentExpression), base = unwrapExpression(node.expression), dangerousRoot = ts.isIdentifier(base) && (["module", "globalThis", "global"].includes(base.text) || processRoots.has(base.text));
-            if ([...keyValue.strings].some((key) => ["require", "createRequire", "getBuiltinModule"].includes(key)) || ((keyValue.unknownString || keyValue.strings.size === 0) && dangerousRoot))
+            const keyValue = analysis.value(node.argumentExpression), base = unwrapExpression(node.expression), dangerousRoot = ts.isIdentifier(base) && (["globalThis", "global"].includes(base.text) || processRoots.has(base.text) || moduleRoots.has(base.text));
+            if ([...keyValue.strings].some((key) => ["require", "createRequire", "getBuiltinModule", "_load", "register", "registerHooks"].includes(key)) || ((keyValue.unknownString || keyValue.strings.size === 0) && dangerousRoot))
                 errors.push(`${relative}: computed loader capability denied`);
         }
         if (ts.isCallExpression(node)) {
@@ -357,7 +366,8 @@ function auditChildSource(source: string, relative: string): ChildAudit {
     const canonicalCallee = canonicalCall === null ? null : unwrapExpression(canonicalCall.expression);
     const isCanonicalCalleeUse = (call: ts.CallExpression): boolean => call === canonicalCall && unwrapExpression(call.expression) === canonicalCallee;
     let childPotential = false, hasProcessRoot = false, hasComputedPattern = false;
-    const detectChild = (node: ts.Node): void => { if(ts.isIdentifier(node)&&node.text==="process")hasProcessRoot=true;if(ts.isIdentifier(node)&&node.text==="Worker"&&analysis.contains(analysis.value(node),Capability.child))childPotential=true;if(ts.isComputedPropertyName(node)&&(ts.isPropertyAssignment(node.parent)||ts.isBindingElement(node.parent)))hasComputedPattern=true; if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier) && !isFullyErasedTypeOnlyImport(node) && moduleCapabilityKind(node.moduleSpecifier.text) === "child") { const named=node.importClause?.namedBindings;const item=named&&ts.isNamedImports(named)&&named.elements.length===1?named.elements[0]:undefined;const exactApproved=node.moduleSpecifier.text==="node:child_process"&&!node.importClause?.name&&item&&!item.propertyName&&((relative==="tests/package.test.ts"&&item.name.text==="execFile")||(relative==="tests/storage/run-root.test.ts"&&item.name.text==="spawn"));if(!exactApproved)childPotential=true; } if (ts.isIdentifier(node) && ["require", "getBuiltinModule", "createRequire"].includes(node.text)) childPotential = true; if (ts.isPropertyAccessExpression(node) && ["require", "getBuiltinModule", "createRequire"].includes(node.name.text)) childPotential = true; if (ts.isElementAccessExpression(node)) { const base = unwrapExpression(node.expression); if (ts.isIdentifier(base) && (processRoots.has(base.text) || ["module", "globalThis", "global"].includes(base.text))) childPotential = true; } ts.forEachChild(node, detectChild); };
+    const identifierValueUse = (node: ts.Identifier): boolean => { const parent = node.parent; if ((ts.isPropertyAccessExpression(parent) && parent.name === node) || (ts.isPropertyAssignment(parent) && parent.name === node) || (ts.isMethodDeclaration(parent) && parent.name === node) || (ts.isPropertyDeclaration(parent) && parent.name === node) || (ts.isPropertySignature(parent) && parent.name === node) || ts.isImportSpecifier(parent) || ts.isExportSpecifier(parent)) return false; for (let current: ts.Node | undefined = parent; current && !ts.isStatement(current); current = current.parent) if (ts.isTypeNode(current)) return false; return true; };
+    const detectChild = (node: ts.Node): void => { if(ts.isIdentifier(node)&&node.text==="process")hasProcessRoot=true;if(ts.isIdentifier(node)&&((node.text==="Worker"&&analysis.contains(analysis.value(node),Capability.child))||(node.text==="module"&&!analysis.bindings.has("module")&&identifierValueUse(node))))childPotential=true;if(ts.isComputedPropertyName(node)&&(ts.isPropertyAssignment(node.parent)||ts.isBindingElement(node.parent)))hasComputedPattern=true; if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier) && !isFullyErasedTypeOnlyImport(node) && moduleCapabilityKind(node.moduleSpecifier.text) === "child") { const named=node.importClause?.namedBindings;const item=named&&ts.isNamedImports(named)&&named.elements.length===1?named.elements[0]:undefined;const exactApproved=exactSetupModuleImport(node,relative)||(node.moduleSpecifier.text==="node:child_process"&&!node.importClause?.name&&item&&!item.propertyName&&((relative==="tests/package.test.ts"&&item.name.text==="execFile")||(relative==="tests/storage/run-root.test.ts"&&item.name.text==="spawn")));if(!exactApproved)childPotential=true; } if (ts.isIdentifier(node) && ["require", "getBuiltinModule", "createRequire"].includes(node.text)) childPotential = true; if (ts.isPropertyAccessExpression(node) && ["require", "getBuiltinModule", "createRequire", "_load", "register", "registerHooks"].includes(node.name.text) && (["require", "getBuiltinModule"].includes(node.name.text) || loaderMemberRoot(node.expression))) childPotential = true; if (ts.isElementAccessExpression(node)) { const base = unwrapExpression(node.expression); if (ts.isIdentifier(base) && (processRoots.has(base.text) || moduleRoots.has(base.text) || ["globalThis", "global"].includes(base.text))) childPotential = true; } ts.forEachChild(node, detectChild); };
     detectChild(file);
     childPotential = childPotential || (hasProcessRoot && hasComputedPattern);
     if (childPotential) for (const operation of analysis.operations) if (analysis.contains(analysis.value(operation.source), Capability.child)) errors.push(analysis.location(operation.node, "child capability storage"));
@@ -453,6 +463,13 @@ describe("default-deny test network policy", () => {
     test("rejects acquisition child-process alternate-network imports aliases and calls", () => { for (const source of ['import {spawn as run} from "node:child_process";run("x");', 'import net from "node:net";net.connect(1);', 'const cp=require("node:child_process");cp.exec("x");']) {
         expect(auditNetworkSource(source, "tests/acquisition/escape.test.ts").length + auditChildSource(source, "tests/acquisition/escape.test.ts").errors.length, source).toBeGreaterThan(0);
     } });
+    test("rejects node module loader escapes outside the exact setup import and call", () => {
+        const reviewer = 'import Module from "node:module";const {Worker}=(Module as any)._load("node:worker_threads");new Worker("void 0",{eval:true});';
+        for (const source of [reviewer, 'import * as Module from "node:module";Module.createRequire(import.meta.url);', 'import {createRequire as make} from "module";make(import.meta.url);', 'const Module=await import("node:module");Module["_"+"load"]("node:worker_threads");', 'const Module=require("module/subpath");Module.register("x");', 'export {registerHooks} from "node:module";', 'import Module=require("node:module");new Module();', 'import Module from "node:module";Module._load.bind(null);', 'import * as Module from "node:module";Module.register.apply(null,args);', 'const load=process.getBuiltinModule("node:module")._load;load("node:cluster");', 'const m=false||module;m[unknownKey()]("node:worker_threads");', 'const m=globalThis.module;const load=m[unknownKey()];load("node:cluster");']) expect(auditChildSource(source, "tests/escape.test.ts").errors.length, source).toBeGreaterThan(0);
+        expect(auditChildSource('import type Module from "node:module";import {type Module as ModuleType} from "module";', "tests/escape.test.ts").errors).toEqual([]);
+        const setupSource = fs.readFileSync(setupPath, "utf8"); expect(auditSetupSource(parse(setupSource, setupRelative), setupRelative)).toEqual([]); expect(auditChildSource(setupSource, setupRelative).errors).toEqual([]);
+        for (const malicious of [setupSource.replace('{syncBuiltinESMExports} from "node:module"', '{syncBuiltinESMExports,createRequire} from "node:module"'), setupSource.replace('from "node:module"', 'from "module"'), setupSource.replace('import {syncBuiltinESMExports}', 'import * as Module'), setupSource.replace('syncBuiltinESMExports();', 'const sync=syncBuiltinESMExports;sync();'), setupSource.replace('syncBuiltinESMExports();', 'syncBuiltinESMExports();syncBuiltinESMExports();')]) { expect(malicious).not.toBe(setupSource); expect(auditSetupSource(parse(malicious, setupRelative), setupRelative).length, malicious).toBeGreaterThan(0); }
+    });
     test("rejects worker-thread and cluster runtime escapes while preserving erased types and source strings", () => {
         const workerPayload = 'require("node:https").get("https://example.invalid")';
         for (const source of [`import {Worker} from "node:worker_threads";new Worker(${JSON.stringify(workerPayload)},{eval:true});`, 'import {Worker as W} from "worker_threads";new W("void 0",{eval:true});', 'const {Worker:W}=await import("node:worker_threads");new W("void 0",{eval:true});', 'const wt=process.getBuiltinModule("node:worker_threads");wt.receiveMessageOnPort(port);', 'const wt=require("worker_threads/subpath");wt.Worker;', 'import cluster from "node:cluster";cluster.fork();', 'export {Worker} from "node:worker_threads";', 'import wt=require("node:worker_threads");wt.Worker;']) expect(auditChildSource(source, "tests/escape.test.ts").errors.length, source).toBeGreaterThan(0);

@@ -116,7 +116,7 @@ function moduleKind(specifier: string): "network" | "child" | "fixture" | "safe"
   const bare = specifier.startsWith("node:") ? specifier.slice(5) : specifier;
   const network = ["http", "https", "http2", "net", "tls", "dns", "dns/promises", "dgram", "undici", "node-fetch", "cross-fetch", "ws", "axios", "got", "superagent", "openai", "@aws-sdk"];
   if (network.some((name) => bare === name || bare.startsWith(`${name}/`))) return "network";
-  if (["child_process", "worker_threads", "cluster"].some((name) => bare === name || bare.startsWith(`${name}/`))) return "child";
+  if (["child_process", "worker_threads", "cluster", "module"].some((name) => bare === name || bare.startsWith(`${name}/`))) return "child";
   if (/\/(?:acquisition\/)?contracts\.(?:js|ts)$/u.test(specifier)) return "fixture";
   return "safe";
 }
@@ -203,6 +203,7 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
     if (ts.isIdentifier(value)) {
       if (value.text === "globalThis" || value.text === "global") return valueOf(Capability.globalRoot);
       if (value.text === "process") return valueOf(Capability.processRoot);
+      if (value.text === "module") return bindings.has(value.text) ? bindings.get(value.text)! : valueOf(Capability.child);
       if (value.text === "fetch" || value.text === "WebSocket") return bindings.has(value.text) ? bindings.get(value.text)! : valueOf(Capability.network);
       if (value.text === "require" || value.text === "getBuiltinModule" || value.text === "createRequire") return valueOf(Capability.child);
       if (value.text === "Worker") return bindings.has(value.text) ? bindings.get(value.text)! : valueOf(Capability.child);
@@ -271,6 +272,7 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
         if ((base.flags & Capability.globalRoot) !== 0) {
           if (key === "fetch" || key === "WebSocket") result = join(result, valueOf(Capability.network));
           if (key === "process") result = join(result, valueOf(Capability.processRoot));
+          if (key === "module") result = join(result, valueOf(Capability.child));
         }
         if ((base.flags & Capability.processRoot) !== 0 && key === "getBuiltinModule") result = join(result, valueOf(Capability.child));
         if ((base.flags & (Capability.network | Capability.child | Capability.fixture)) !== 0) result = join(result, valueOf(base.flags & (Capability.network | Capability.child | Capability.fixture)));
@@ -335,6 +337,7 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
       item = join(item, sourceValue.properties.get(key) ?? sourceValue.unknownProperty ?? EMPTY);
       if ((sourceValue.flags & Capability.globalRoot) !== 0 && (key === "fetch" || key === "WebSocket")) item = join(item, valueOf(Capability.network));
       if ((sourceValue.flags & Capability.globalRoot) !== 0 && key === "process") item = join(item, valueOf(Capability.processRoot));
+      if ((sourceValue.flags & Capability.globalRoot) !== 0 && key === "module") item = join(item, valueOf(Capability.child));
       if ((sourceValue.flags & Capability.processRoot) !== 0 && key === "getBuiltinModule") item = join(item, valueOf(Capability.child));
       if ((sourceValue.flags & (Capability.network | Capability.child | Capability.fixture)) !== 0) item = join(item, valueOf(sourceValue.flags));
     }
