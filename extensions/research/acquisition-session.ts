@@ -119,9 +119,21 @@ type ManagerState={
   controller:AbortController;client:AcademicAcquisitionClient|null;normalized:NormalizedAcquisitionOptionsInternal|null;shutdownPromise:Promise<void>|null;
 };
 const managerStates=new WeakMap<object,ManagerState>();
+const callContinuationStates=new WeakMap<object,Readonly<{manager:ManagerState;external:AbortSignal|null}>>();
 function managerState(value:unknown):ManagerState {
   if(value===null||typeof value!=="object"||NATIVE_IS_PROXY(value)||!NATIVE_IS_FROZEN(value)) toolFail("academic-tool.internal-contract");
   const state=managerStates.get(value as object);if(!state) toolFail("academic-tool.internal-contract");return state!;
+}
+function assertManagerStateLifecycle(state:ManagerState):void {
+  if(state.lifecycle==="stale-generation") toolFail("academic-tool.stale-generation");
+  if(state.lifecycle==="shutdown") toolFail("academic-tool.shutdown");
+}
+export function assertAcademicSessionManagerLifecycleInternal(manager:AcademicSessionManager):void {assertManagerStateLifecycle(managerState(manager));}
+export function assertAcademicSessionCallContinuationInternal(manager:AcademicSessionManager,result:AcademicAcquisitionResult):void {
+  const state=managerState(manager);assertManagerStateLifecycle(state);
+  if(result===null||typeof result!=="object"||NATIVE_IS_PROXY(result)) toolFail("academic-tool.internal-contract");
+  const continuation=callContinuationStates.get(result);if(!continuation||continuation.manager!==state) toolFail("academic-tool.internal-contract");
+  if(continuation!.external!==null&&ABORTED.call(continuation!.external)) toolFail("academic-tool.cancelled");
 }
 function genuineSignal(value:unknown):AbortSignal|null {
   if(value===undefined) return null;
@@ -227,7 +239,9 @@ async function invoke(state:ManagerState,kind:"search"|"fetch",input:unknown,sig
   try {
     const capability=createAcademicAcquisitionCallCapabilities({signal:controller.signal});
     const result=kind==="search"?await acquisitionClient.search(inputValue as AcademicSearchInput,capability):await acquisitionClient.fetch(inputValue as AcademicFetchInput,capability);
-    if(state.lifecycle!=="open") toolFail(state.lifecycle==="stale-generation"?"academic-tool.stale-generation":"academic-tool.shutdown");
+    assertManagerStateLifecycle(state);
+    if(result===null||typeof result!=="object"||NATIVE_IS_PROXY(result)||callContinuationStates.has(result)) toolFail("academic-tool.internal-contract");
+    callContinuationStates.set(result,NATIVE_FREEZE({manager:state,external}));
     return result;
   } catch(error) {return mapped(error,state,external);}
   finally {REMOVE_EVENT_LISTENER.call(generationSignal,"abort",abortGeneration);if(external!==null) REMOVE_EVENT_LISTENER.call(external,"abort",abortExternal);}
