@@ -329,6 +329,7 @@ const topHard = {
   sinkSettlementTimeoutMs:30_000,shutdownGraceMs:30_000,maxStructureDepth:64,maxStructureNodes:100_000,
   maxStructureKeys:100_000,maxStringCanonicalBytes:1_048_576,maxScalarCanonicalBytes:8_388_608,
 } as const;
+const topMinimums={maxVisibleBytes:1_024,maxVisibleLines:5} as const;
 const topKeys = Object.keys(topDefaults);
 const transportKeys = Object.keys(transportDefaults);
 const providerKeys = Object.keys(providerHard);
@@ -387,7 +388,7 @@ export function normalizeAcquisitionOptions(raw:unknown):NormalizedAcquisitionOp
   if(!plain(data)||Reflect.ownKeys(data).some((key)=>typeof key!=="string"&&true))fail("acquisition-contract.invalid-options");
   const transportData=data.transport===undefined?{}:requireClosed(data.transport,transportKeys,"acquisition-contract.invalid-options");
   const providerData=data.providers===undefined?{}:requireClosed(data.providers,providerKeys,"acquisition-contract.invalid-options");
-  const top={} as Record<string,number>;for(const key of topKeys){const k=key as keyof typeof topDefaults;top[key]=data[key]===undefined?topDefaults[k]:integer(data[key],topHard[k],"acquisition-contract.invalid-options");}
+  const top={} as Record<string,number>;for(const key of topKeys){const k=key as keyof typeof topDefaults;top[key]=data[key]===undefined?topDefaults[k]:integer(data[key],topHard[k],"acquisition-contract.invalid-options");}for(const [key,minimum] of Object.entries(topMinimums))if(top[key]!<minimum)fail("acquisition-contract.invalid-options");
   const transport={} as Record<string,number>;for(const key of transportKeys){const k=key as keyof typeof transportDefaults;transport[key]=transportData[key]===undefined?transportDefaults[k]:integer(transportData[key],transportHard[k],"acquisition-contract.invalid-options");}
   const aliases:Record<string,number>={maxPartitions:top.maxPartitions!,maxAggregateDrafts:top.maxAggregateCandidates!,maxConditionalFacts:top.maxPartitions!,maxAggregateConditionalFactsCanonicalBytes:top.maxAggregateResultCanonicalBytes!,maxExecutionCanonicalBytes:top.maxAggregateResultCanonicalBytes!};
   const providers={} as Record<string,number>;for(const key of providerKeys){const k=key as keyof typeof providerHard;const fallback=key in aliases?aliases[key]!:providerBaseDefaults[key as keyof typeof providerBaseDefaults];providers[key]=providerData[key]===undefined?fallback:integer(providerData[key],providerHard[k],"acquisition-contract.invalid-options");}

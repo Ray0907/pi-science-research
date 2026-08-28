@@ -279,6 +279,7 @@ describe("immutable acquisition contracts", () => {
     const invalid = [
       { maxConcurrency: 2, maxPerOriginConcurrency: 3 },
       { transport: { connectTimeoutMs: 20_000, requestDeadlineMs: 10_000 } },
+      { maxVisibleBytes: 1_023 }, { maxVisibleLines: 4 },
       { maxVisibleBytes: 49_153 }, { maxVisibleLines: 2_001 },
       { maxResultsPerQuery: 50, providers: { maxProviderRecords: 49 } },
       { maxResultsPerQuery: 50, providers: { maxJoinedPmids: 49 } },

@@ -50,6 +50,9 @@ const ABORTED = Object.getOwnPropertyDescriptor(AbortSignal.prototype,"aborted")
 const THROW_IF_ABORTED = AbortSignal.prototype.throwIfAborted;
 const ADD_EVENT_LISTENER = AbortSignal.prototype.addEventListener;
 const REMOVE_EVENT_LISTENER = AbortSignal.prototype.removeEventListener;
+const NATIVE_IS_PROMISE=utilTypes.isPromise,NATIVE_PROMISE=Promise,NATIVE_PROMISE_PROTOTYPE=Promise.prototype,NATIVE_PROMISE_THEN=Promise.prototype.then;
+const NATIVE_PROMISE_CONSTRUCTOR_DESCRIPTOR=Object.getOwnPropertyDescriptor(Promise.prototype,"constructor")!,NATIVE_PROMISE_THEN_DESCRIPTOR=Object.getOwnPropertyDescriptor(Promise.prototype,"then")!,NATIVE_PROMISE_SPECIES_DESCRIPTOR=Object.getOwnPropertyDescriptor(Promise,Symbol.species)!,NATIVE_PROMISE_SPECIES_GETTER=NATIVE_PROMISE_SPECIES_DESCRIPTOR.get;
+function authenticBasePromise(value:unknown):value is Promise<void>{if(value===null||typeof value!=="object"||NATIVE_IS_PROXY(value)||!NATIVE_IS_PROMISE(value))return false;try{if(NATIVE_GET_PROTOTYPE_OF(value)!==NATIVE_PROMISE_PROTOTYPE||NATIVE_GET_OWN_PROPERTY_DESCRIPTOR(value,"constructor")!==undefined||NATIVE_GET_OWN_PROPERTY_DESCRIPTOR(value,"then")!==undefined)return false;const constructorDescriptor=NATIVE_GET_OWN_PROPERTY_DESCRIPTOR(NATIVE_PROMISE_PROTOTYPE,"constructor"),thenDescriptor=NATIVE_GET_OWN_PROPERTY_DESCRIPTOR(NATIVE_PROMISE_PROTOTYPE,"then"),speciesDescriptor=NATIVE_GET_OWN_PROPERTY_DESCRIPTOR(NATIVE_PROMISE,Symbol.species);return !!constructorDescriptor&&"value" in constructorDescriptor&&constructorDescriptor.value===NATIVE_PROMISE&&constructorDescriptor.writable===NATIVE_PROMISE_CONSTRUCTOR_DESCRIPTOR.writable&&constructorDescriptor.enumerable===NATIVE_PROMISE_CONSTRUCTOR_DESCRIPTOR.enumerable&&constructorDescriptor.configurable===NATIVE_PROMISE_CONSTRUCTOR_DESCRIPTOR.configurable&&!!thenDescriptor&&"value" in thenDescriptor&&thenDescriptor.value===NATIVE_PROMISE_THEN&&thenDescriptor.writable===NATIVE_PROMISE_THEN_DESCRIPTOR.writable&&thenDescriptor.enumerable===NATIVE_PROMISE_THEN_DESCRIPTOR.enumerable&&thenDescriptor.configurable===NATIVE_PROMISE_THEN_DESCRIPTOR.configurable&&!!speciesDescriptor&&"get" in speciesDescriptor&&speciesDescriptor.get===NATIVE_PROMISE_SPECIES_GETTER&&speciesDescriptor.set===NATIVE_PROMISE_SPECIES_DESCRIPTOR.set&&speciesDescriptor.enumerable===NATIVE_PROMISE_SPECIES_DESCRIPTOR.enumerable&&speciesDescriptor.configurable===NATIVE_PROMISE_SPECIES_DESCRIPTOR.configurable;}catch{return false;}}
 
 export class AcademicToolError extends Error {
   declare readonly name:"AcademicToolError";
@@ -116,7 +119,7 @@ export interface AcademicSessionManager {
 }
 type ManagerState={
   dependencies:DependencyState;generation:number;lifecycle:"open"|"stale-generation"|"shutdown";
-  controller:AbortController;client:AcademicAcquisitionClient|null;normalized:NormalizedAcquisitionOptionsInternal|null;shutdownPromise:Promise<void>|null;
+  controller:AbortController;client:AcademicAcquisitionClient|null;normalized:NormalizedAcquisitionOptionsInternal|null;shutdownPromise:Promise<void>|null;continuationWaiters:number;
 };
 const managerStates=new WeakMap<object,ManagerState>();
 const callContinuationStates=new WeakMap<object,Readonly<{manager:ManagerState;external:AbortSignal|null}>>();
@@ -129,12 +132,10 @@ function assertManagerStateLifecycle(state:ManagerState):void {
   if(state.lifecycle==="shutdown") toolFail("academic-tool.shutdown");
 }
 export function assertAcademicSessionManagerLifecycleInternal(manager:AcademicSessionManager):void {assertManagerStateLifecycle(managerState(manager));}
-export function assertAcademicSessionCallContinuationInternal(manager:AcademicSessionManager,result:AcademicAcquisitionResult):void {
-  const state=managerState(manager);assertManagerStateLifecycle(state);
-  if(result===null||typeof result!=="object"||NATIVE_IS_PROXY(result)) toolFail("academic-tool.internal-contract");
-  const continuation=callContinuationStates.get(result);if(!continuation||continuation.manager!==state) toolFail("academic-tool.internal-contract");
-  if(continuation!.external!==null&&ABORTED.call(continuation!.external)) toolFail("academic-tool.cancelled");
-}
+function continuationState(manager:AcademicSessionManager,result:AcademicAcquisitionResult):Readonly<{state:ManagerState;external:AbortSignal|null}>{const state=managerState(manager);assertManagerStateLifecycle(state);if(result===null||typeof result!=="object"||NATIVE_IS_PROXY(result))toolFail("academic-tool.internal-contract");const continuation=callContinuationStates.get(result);if(!continuation||continuation.manager!==state)toolFail("academic-tool.internal-contract");return NATIVE_FREEZE({state,external:continuation!.external});}
+export function assertAcademicSessionCallContinuationInternal(manager:AcademicSessionManager,result:AcademicAcquisitionResult):void {const continuation=continuationState(manager,result);if(continuation.external!==null&&ABORTED.call(continuation.external))toolFail("academic-tool.cancelled");}
+export function awaitAcademicSessionContinuationInternal(manager:AcademicSessionManager,result:AcademicAcquisitionResult,update:unknown):Promise<void>{const continuation=continuationState(manager,result),state=continuation.state,external=continuation.external;if(!authenticBasePromise(update))toolFail("academic-tool.internal-contract");return new NATIVE_PROMISE<void>((resolve,reject)=>{let terminal=false,installed=false;const generationSignal=state.controller.signal;const cleanup=()=>{if(!installed)return;installed=false;REMOVE_EVENT_LISTENER.call(generationSignal,"abort",generationAbort);if(external!==null)REMOVE_EVENT_LISTENER.call(external,"abort",externalAbort);state.continuationWaiters-=1;};const finish=(code:AcademicToolErrorCode|null)=>{if(terminal)return;terminal=true;cleanup();if(code===null)resolve();else reject(new AcademicToolError(code));};const lifecycleCode=():AcademicToolErrorCode=>state.lifecycle==="stale-generation"?"academic-tool.stale-generation":state.lifecycle==="shutdown"?"academic-tool.shutdown":"academic-tool.internal-contract";const generationAbort=()=>finish(lifecycleCode()),externalAbort=()=>finish(state.lifecycle==="open"?"academic-tool.cancelled":lifecycleCode());ADD_EVENT_LISTENER.call(generationSignal,"abort",generationAbort,{once:true});if(external!==null)ADD_EVENT_LISTENER.call(external,"abort",externalAbort,{once:true});installed=true;state.continuationWaiters+=1;try{NATIVE_PROMISE_THEN.call(update,()=>finish(null),()=>finish("academic-tool.internal-contract"));}catch{finish("academic-tool.internal-contract");return;}if(state.lifecycle!=="open"||ABORTED.call(generationSignal))generationAbort();else if(external!==null&&ABORTED.call(external))externalAbort();});}
+export function assertAcademicSessionContinuationIdleInternal(manager:AcademicSessionManager):void {const state=managerState(manager);if(state.continuationWaiters!==0)toolFail("academic-tool.internal-contract");}
 function genuineSignal(value:unknown):AbortSignal|null {
   if(value===undefined) return null;
   if(value===null||typeof value!=="object"||NATIVE_IS_PROXY(value)) toolFail("academic-tool.internal-contract");
@@ -250,7 +251,7 @@ export function createAcademicSessionManager(dependencies:AcademicToolDependenci
   const dependency=getAcademicToolDependenciesInternal(dependencies);
   if(!Number.isSafeInteger(generation)||generation<1) toolFail("academic-tool.internal-contract");
   let manager!:AcademicSessionManager;
-  const state:ManagerState={dependencies:dependency,generation,controller:new AbortController(),lifecycle:"open",client:null,normalized:null,shutdownPromise:null};
+  const state:ManagerState={dependencies:dependency,generation,controller:new AbortController(),lifecycle:"open",client:null,normalized:null,shutdownPromise:null,continuationWaiters:0};
   manager=NATIVE_FREEZE({
     generation,
     search(input:AcademicSearchInput,signal?:AbortSignal){return invoke(state,"search",input,signal);},
