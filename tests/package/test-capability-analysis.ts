@@ -469,7 +469,20 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
     if (ts.isArrayLiteralExpression(expression)) {
       let changed = false; expression.elements.forEach((element, index) => {if (!ts.isOmittedExpression(element)) changed = extractPattern(ts.isSpreadElement(element) ? element.expression : element, sourceValue.properties.get(String(index)) ?? sourceValue.unknownProperty ?? EMPTY, depth + 1) || changed;}); return changed;
     }
-    return false;
+    const dangerousStorage=sourceValue.flags===TOP_CAPABILITY_FLAGS||(sourceValue.flags&(Capability.network|Capability.child|Capability.codegen|Capability.analysisBound))!==0;
+    if(dangerousStorage&&(ts.isPropertyAccessExpression(expression)||ts.isElementAccessExpression(expression))){
+      const assignMember=(target:ts.Expression,item:AbstractValue,memberDepth:number):boolean=>{
+        if(memberDepth>=MAX_DEPTH)return taintPattern(target,BOUND);
+        const unwrapped=unwrapExpression(target);
+        if(ts.isIdentifier(unwrapped)){const previous=getBinding(unwrapped)??EMPTY,next=join(previous,item);if(sameValue(previous,next))return false;setBinding(unwrapped,next);return true;}
+        if(!ts.isPropertyAccessExpression(unwrapped)&&!ts.isElementAccessExpression(unwrapped))return taintPattern(unwrapped,TOP);
+        const receiver=unwrapped.expression,base=evaluate(receiver,memberDepth+1);let keys:readonly string[],unknown:boolean,keyCapability=EMPTY;
+        if(ts.isPropertyAccessExpression(unwrapped)){keys=[unwrapped.name.text];unknown=false;}else{keyCapability=unwrapped.argumentExpression?evaluate(unwrapped.argumentExpression,memberDepth+1):valueOf(0,[],true);if(keyCapability.flags===TOP_CAPABILITY_FLAGS)return taintPattern(receiver,TOP);if((keyCapability.flags&Capability.analysisBound)!==0)return taintPattern(receiver,keyCapability);keys=[...keyCapability.strings];unknown=keyCapability.unknownString||keyCapability.strings.size===0;}
+        const properties=new Map(base.properties);for(const key of keys)properties.set(key,join(properties.get(key)??EMPTY,item));const unknownProperty=unknown?join(base.unknownProperty??EMPTY,item):base.unknownProperty,updated=valueOf(base.flags|item.flags|keyCapability.flags,base.strings,base.unknownString,properties,unknownProperty);return assignMember(receiver,updated,memberDepth+1);
+      };
+      return assignMember(expression,sourceValue,depth+1);
+    }
+    return dangerousStorage?taintPattern(pattern,TOP):false;
   };
 
   const passCountSafe = operations.length <= Number.MAX_SAFE_INTEGER - bindings.size - 1;
