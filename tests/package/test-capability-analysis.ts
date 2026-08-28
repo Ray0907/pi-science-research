@@ -6,7 +6,9 @@ export const Capability = {
   network: 1 << 2,
   child: 1 << 3,
   fixture: 1 << 4,
+  processObject: 1 << 5,
 } as const;
+export const ALL_CAPABILITY_FLAGS = Capability.globalRoot | Capability.processRoot | Capability.network | Capability.child | Capability.fixture | Capability.processObject;
 
 export interface AbstractValue {
   readonly flags: number;
@@ -42,7 +44,7 @@ const MAX_DEPTH = 8;
 const MAX_NODES = 4_096;
 const MAX_PASSES = 64;
 const MAX_STRINGS = 32;
-const ALL_CAPABILITIES = Capability.globalRoot | Capability.processRoot | Capability.network | Capability.child | Capability.fixture;
+const ALL_CAPABILITIES = ALL_CAPABILITY_FLAGS;
 const TOP_LEAF: AbstractValue = Object.freeze({flags: ALL_CAPABILITIES, strings: Object.freeze(new Set<string>()), unknownString: true, properties: Object.freeze(new Map<string, AbstractValue>()), unknownProperty: null});
 const TOP: AbstractValue = Object.freeze({flags: ALL_CAPABILITIES, strings: Object.freeze(new Set<string>()), unknownString: true, properties: Object.freeze(new Map<string, AbstractValue>()), unknownProperty: TOP_LEAF});
 
@@ -202,7 +204,7 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
     if (ts.isNumericLiteral(value)) return valueOf(0, [value.text]);
     if (ts.isIdentifier(value)) {
       if (value.text === "globalThis" || value.text === "global") return valueOf(Capability.globalRoot);
-      if (value.text === "process") return valueOf(Capability.processRoot);
+      if (value.text === "process") return valueOf(Capability.processRoot | Capability.processObject);
       if (value.text === "module") return bindings.has(value.text) ? bindings.get(value.text)! : valueOf(Capability.child);
       if (value.text === "fetch" || value.text === "WebSocket") return bindings.has(value.text) ? bindings.get(value.text)! : valueOf(Capability.network);
       if (value.text === "require" || value.text === "getBuiltinModule" || value.text === "createRequire") return valueOf(Capability.child);
@@ -271,7 +273,7 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
         result = join(result, base.properties.get(key) ?? base.unknownProperty ?? EMPTY);
         if ((base.flags & Capability.globalRoot) !== 0) {
           if (key === "fetch" || key === "WebSocket") result = join(result, valueOf(Capability.network));
-          if (key === "process") result = join(result, valueOf(Capability.processRoot));
+          if (key === "process") result = join(result, valueOf(Capability.processRoot | Capability.processObject));
           if (key === "module") result = join(result, valueOf(Capability.child));
         }
         if ((base.flags & Capability.processRoot) !== 0 && key === "getBuiltinModule") result = join(result, valueOf(Capability.child));
@@ -280,7 +282,7 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
       }
       if (unknownKey) {
         result = join(result, base.unknownProperty ?? EMPTY);
-        if ((base.flags & Capability.globalRoot) !== 0) result = join(result, valueOf(Capability.network | Capability.processRoot));
+        if ((base.flags & Capability.globalRoot) !== 0) result = join(result, valueOf(Capability.network | Capability.processRoot | Capability.processObject));
         if ((base.flags & Capability.processRoot) !== 0) result = join(result, valueOf(Capability.child));
         if ((base.flags & (Capability.network | Capability.child | Capability.fixture)) !== 0) result = join(result, valueOf(base.flags));
       }
@@ -336,14 +338,14 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
     for (const key of keys) {
       item = join(item, sourceValue.properties.get(key) ?? sourceValue.unknownProperty ?? EMPTY);
       if ((sourceValue.flags & Capability.globalRoot) !== 0 && (key === "fetch" || key === "WebSocket")) item = join(item, valueOf(Capability.network));
-      if ((sourceValue.flags & Capability.globalRoot) !== 0 && key === "process") item = join(item, valueOf(Capability.processRoot));
+      if ((sourceValue.flags & Capability.globalRoot) !== 0 && key === "process") item = join(item, valueOf(Capability.processRoot | Capability.processObject));
       if ((sourceValue.flags & Capability.globalRoot) !== 0 && key === "module") item = join(item, valueOf(Capability.child));
       if ((sourceValue.flags & Capability.processRoot) !== 0 && key === "getBuiltinModule") item = join(item, valueOf(Capability.child));
       if ((sourceValue.flags & (Capability.network | Capability.child | Capability.fixture)) !== 0) item = join(item, valueOf(sourceValue.flags));
     }
     if (unknown) {
       item = join(item, sourceValue.unknownProperty ?? EMPTY);
-      if ((sourceValue.flags & Capability.globalRoot) !== 0) item = join(item, valueOf(Capability.network | Capability.processRoot));
+      if ((sourceValue.flags & Capability.globalRoot) !== 0) item = join(item, valueOf(Capability.network | Capability.processRoot | Capability.processObject));
       if ((sourceValue.flags & Capability.processRoot) !== 0) item = join(item, valueOf(Capability.child));
     }
     return item;
