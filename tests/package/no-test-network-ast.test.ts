@@ -352,27 +352,24 @@ function auditChildSource(source: string, relative: string): ChildAudit {
         if (childImport !== expected || childImportCount !== 1) errors.push(`${relative}: child binding denied`);
         if (sites.length !== 1) errors.push(`${relative}: subprocess call cardinality`);
     }
-    let capabilityAnalysis = analysis;
-    if (errors.length === 0 && candidateCalls.length === 1) {
-        const candidate = candidateCalls[0]!, width = candidate.end - candidate.getStart(file);
-        const masked = `${source.slice(0, candidate.getStart(file))}undefined${" ".repeat(Math.max(0, width - "undefined".length))}${source.slice(candidate.end)}`;
-        capabilityAnalysis = createCapabilityAnalysis(masked, relative);
-    }
+    const canonicalCall = errors.length === 0 && candidateCalls.length === 1 ? candidateCalls[0]! : null;
+    const canonicalCallee = canonicalCall === null ? null : unwrapExpression(canonicalCall.expression);
+    const isCanonicalCalleeUse = (call: ts.CallExpression): boolean => call === canonicalCall && unwrapExpression(call.expression) === canonicalCallee;
     let childPotential = false, hasProcessRoot = false, hasComputedPattern = false;
     const detectChild = (node: ts.Node): void => { if(ts.isIdentifier(node)&&node.text==="process")hasProcessRoot=true;if(ts.isComputedPropertyName(node)&&(ts.isPropertyAssignment(node.parent)||ts.isBindingElement(node.parent)))hasComputedPattern=true; if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier) && !isFullyErasedTypeOnlyImport(node) && moduleCapabilityKind(node.moduleSpecifier.text) === "child") { const named=node.importClause?.namedBindings;const item=named&&ts.isNamedImports(named)&&named.elements.length===1?named.elements[0]:undefined;const exactApproved=node.moduleSpecifier.text==="node:child_process"&&!node.importClause?.name&&item&&!item.propertyName&&((relative==="tests/package.test.ts"&&item.name.text==="execFile")||(relative==="tests/storage/run-root.test.ts"&&item.name.text==="spawn"));if(!exactApproved)childPotential=true; } if (ts.isIdentifier(node) && ["require", "getBuiltinModule", "createRequire"].includes(node.text)) childPotential = true; if (ts.isPropertyAccessExpression(node) && ["require", "getBuiltinModule", "createRequire"].includes(node.name.text)) childPotential = true; if (ts.isElementAccessExpression(node)) { const base = unwrapExpression(node.expression); if (ts.isIdentifier(base) && (processRoots.has(base.text) || ["module", "globalThis", "global"].includes(base.text))) childPotential = true; } ts.forEachChild(node, detectChild); };
-    detectChild(capabilityAnalysis.file);
+    detectChild(file);
     childPotential = childPotential || (hasProcessRoot && hasComputedPattern);
-    if (childPotential) for (const operation of capabilityAnalysis.operations) if (capabilityAnalysis.contains(capabilityAnalysis.value(operation.source), Capability.child)) errors.push(capabilityAnalysis.location(operation.node, "child capability storage"));
+    if (childPotential) for (const operation of analysis.operations) if (analysis.contains(analysis.value(operation.source), Capability.child)) errors.push(analysis.location(operation.node, "child capability storage"));
     const capabilityVisit = (node: ts.Node): void => {
         if (ts.isCallExpression(node)) {
-            if (capabilityAnalysis.contains(capabilityAnalysis.value(node.expression), Capability.child)) errors.push(capabilityAnalysis.location(node, "child capability call"));
-            for (const argument of node.arguments) if (capabilityAnalysis.contains(capabilityAnalysis.value(argument), Capability.child)) errors.push(capabilityAnalysis.location(argument, "child capability escape"));
+            if (!isCanonicalCalleeUse(node) && analysis.contains(analysis.value(node.expression), Capability.child)) errors.push(analysis.location(node, "child capability call"));
+            for (const argument of node.arguments) if (analysis.contains(analysis.value(argument), Capability.child)) errors.push(analysis.location(argument, "child capability escape"));
         }
-        if (ts.isNewExpression(node) && capabilityAnalysis.contains(capabilityAnalysis.value(node.expression), Capability.child)) errors.push(capabilityAnalysis.location(node, "child capability construct"));
-        if (ts.isReturnStatement(node) && node.expression && capabilityAnalysis.contains(capabilityAnalysis.value(node.expression), Capability.child)) errors.push(capabilityAnalysis.location(node, "child capability return"));
+        if (ts.isNewExpression(node) && analysis.contains(analysis.value(node.expression), Capability.child)) errors.push(analysis.location(node, "child capability construct"));
+        if (ts.isReturnStatement(node) && node.expression && analysis.contains(analysis.value(node.expression), Capability.child)) errors.push(analysis.location(node, "child capability return"));
         ts.forEachChild(node, capabilityVisit);
     };
-    if (childPotential) capabilityVisit(capabilityAnalysis.file);
+    if (childPotential) capabilityVisit(file);
     return { errors: Object.freeze([...new Set(errors)]), sites: Object.freeze(sites) };
 }
 function auditChildTree(): ChildAudit { const errors: string[] = [], sites: string[] = []; for (const file of enumerateRepositorySources()) {
@@ -500,10 +497,16 @@ describe("default-deny test network policy", () => {
         expect(auditFixtureConstructor(`const box=${nested("{fixture:(await import(\"../../src/acquisition/contracts.js\")).createProviderRequestPartitionFixtureInternal}")};wrap(box);`, "tests/escape.test.ts").length).toBeGreaterThan(0);
         expect(auditMockConstructor(`const box=${nested("{send:globalThis.fetch}")};export function createMockSecureTransportCapabilities(){return box;}`).length).toBeGreaterThan(0);
     });
-    test("suppresses only the exact canonical allowlisted child call node", () => {
-        const bypass = 'const key="getBuiltinModule";const {[key]:load}=process;load("node:child_process").exec("x")';
-        for (const relative of ["tests/package.test.ts", "tests/storage/run-root.test.ts"]) expect(auditChildSource(bypass, relative).errors.length, relative).toBeGreaterThan(0);
-        for (const source of ['import {execFile} from "node:child_process";execFile.bind(null);', 'import {spawn} from "node:child_process";const box={run:spawn};box.run("x");']) expect(auditChildSource(source, "tests/package.test.ts").errors.length, source).toBeGreaterThan(0);
+    test("suppresses only the exact canonical allowlisted child callee expression", () => {
+        const packageRelative = "tests/package.test.ts", runRootRelative = "tests/storage/run-root.test.ts";
+        const packageSource = fs.readFileSync(path.join(root, packageRelative), "utf8"), runRootSource = fs.readFileSync(path.join(root, runRootRelative), "utf8");
+        expect(auditChildSource(packageSource, packageRelative).errors).toEqual([]); expect(auditChildSource(runRootSource, runRootRelative).errors).toEqual([]);
+        const malicious = 'const key="getBuiltinModule";const {[key]:load}=process;load("node:child_process").exec("x");';
+        const maliciousCallback = packageSource.replace("(error,output)=>{if(error)", `(error,output)=>{${malicious}if(error)`);
+        expect(maliciousCallback).not.toBe(packageSource); expect(auditChildSource(maliciousCallback, packageRelative).errors.length).toBeGreaterThan(0);
+        const maliciousSpawnOption = runRootSource.replace("cwd:root,shell:false,", `cwd:(()=>{${malicious}return root;})(),shell:false,`);
+        expect(maliciousSpawnOption).not.toBe(runRootSource); expect(auditChildSource(maliciousSpawnOption, runRootRelative).errors.length).toBeGreaterThan(0);
+        for (const source of ['import {execFile} from "node:child_process";execFile.bind(null);', 'import {spawn} from "node:child_process";const box={run:spawn};box.run("x");']) expect(auditChildSource(source, packageRelative).errors.length, source).toBeGreaterThan(0);
     });
     test("allows only the two exact setup function declaration exports", () => {
         const setupSource = fs.readFileSync(setupPath, "utf8");
