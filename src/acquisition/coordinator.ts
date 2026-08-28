@@ -16,7 +16,7 @@ import {
   assertMaterializedProviderPartitionInternal,createAcquisitionPlanningCapabilitiesInternal,
   createConditionalMaterializationFactsInternal,getAcquisitionExecutionPlanSnapshotInternal,
   listInvocationConcretePartitionsInternal,listInvocationConditionalReservationsInternal,planAcquisitionInvocation,
-  AcademicAcquisitionError,type AcademicAcquisitionErrorCode,type AuthenticatedAcquisitionExecutionPlanInternal,type ConditionalPartitionReservationInternal,
+  AcademicAcquisitionError,getAcademicAcquisitionErrorCodeInternal,type AcademicAcquisitionErrorCode,type AuthenticatedAcquisitionExecutionPlanInternal,type ConditionalPartitionReservationInternal,
 } from "./planner-internal.js";
 import {
   assertInvocationSchedulerCapabilitiesInternal,createDefaultInvocationSchedulerCapabilitiesInternal,createInvocationExecutorCapabilitiesInternal,
@@ -37,7 +37,7 @@ import {
   type PhysicalRequestAbortReasonInternal,type SecureJsonTransport,type SecureTransportRequestHandleInternal,
 } from "./secure-json-transport-internal.js";
 
-export {AcademicAcquisitionError};
+export {AcademicAcquisitionError,getAcademicAcquisitionErrorCodeInternal};
 export type {AcademicAcquisitionErrorCode} from "./planner-internal.js";
 const fail=(code:AcademicAcquisitionErrorCode):never=>{throw new AcademicAcquisitionError(code);};
 const NATIVE_IS_PROMISE=utilTypes.isPromise,NATIVE_IS_PROXY=utilTypes.isProxy,NATIVE_GET_PROTOTYPE_OF=Object.getPrototypeOf,NATIVE_GET_OWN_PROPERTY_DESCRIPTOR=Object.getOwnPropertyDescriptor;

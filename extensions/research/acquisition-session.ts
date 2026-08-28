@@ -1,55 +1,258 @@
 import {types as utilTypes} from "node:util";
 import {
-  AcademicAcquisitionError,
   assertAcademicAcquisitionDependencyFactoryInternal,
   createAcademicAcquisitionCallCapabilities,
   createAcademicAcquisitionClient,
   createDefaultAcademicAcquisitionDependencyFactoryInternal,
   getAcademicAcquisitionClientNormalizedOptionsInternal,
+  getAcademicAcquisitionErrorCodeInternal,
   type AcademicAcquisitionClient,
   type AcademicAcquisitionDependencyFactoryInternal,
 } from "../../src/acquisition/coordinator.js";
 import type {
-  AcademicAcquisitionOptions,AcademicAcquisitionResult,AcademicFetchInput,AcademicSearchInput,
+  AcademicAcquisitionOptions,
+  AcademicAcquisitionResult,
+  AcademicFetchInput,
+  AcademicSearchInput,
   NormalizedAcquisitionOptionsInternal,
 } from "../../src/acquisition/contracts.js";
 
-export type AcademicToolErrorCode=
- |"academic-tool.invalid-input"|"academic-tool.invalid-options"
- |"academic-tool.disabled"|"academic-tool.pre-session"|"academic-tool.unavailable"
- |"academic-tool.stale-generation"|"academic-tool.shutdown"
- |"academic-tool.cancelled"|"academic-tool.deadline-exceeded"
- |"academic-tool.security-policy"|"academic-tool.sink-settlement-failure"
- |"academic-tool.provider-failure"|"academic-tool.result-too-large"
- |"academic-tool.truncation-invariant"|"academic-tool.internal-contract";
-export class AcademicToolError extends Error{declare readonly name:"AcademicToolError";readonly code:AcademicToolErrorCode;constructor(code:AcademicToolErrorCode){super(code);this.code=code;Object.defineProperty(this,"name",{value:"AcademicToolError",enumerable:true,writable:false,configurable:true});}}
-const toolFail=(code:AcademicToolErrorCode):never=>{throw new AcademicToolError(code);};
+export type AcademicToolErrorCode =
+  | "academic-tool.invalid-input" | "academic-tool.invalid-options"
+  | "academic-tool.disabled" | "academic-tool.pre-session" | "academic-tool.unavailable"
+  | "academic-tool.stale-generation" | "academic-tool.shutdown"
+  | "academic-tool.cancelled" | "academic-tool.deadline-exceeded"
+  | "academic-tool.security-policy" | "academic-tool.sink-settlement-failure"
+  | "academic-tool.provider-failure" | "academic-tool.result-too-large"
+  | "academic-tool.truncation-invariant" | "academic-tool.internal-contract";
 
-export interface AcademicToolDependenciesDescriptor{readonly enabled?:boolean;readonly options?:AcademicAcquisitionOptions;readonly acquisitionDependencyFactory?:AcademicAcquisitionDependencyFactoryInternal;}
-export interface AcademicToolDependencies{readonly capabilityKind:"academic-tool-dependencies";}
+const TOOL_ERROR_CODES = Object.freeze([
+  "academic-tool.invalid-input", "academic-tool.invalid-options", "academic-tool.disabled",
+  "academic-tool.pre-session", "academic-tool.unavailable", "academic-tool.stale-generation",
+  "academic-tool.shutdown", "academic-tool.cancelled", "academic-tool.deadline-exceeded",
+  "academic-tool.security-policy", "academic-tool.sink-settlement-failure",
+  "academic-tool.provider-failure", "academic-tool.result-too-large",
+  "academic-tool.truncation-invariant", "academic-tool.internal-contract",
+] as const satisfies readonly AcademicToolErrorCode[]);
+const TOOL_ERROR_CODE_SET = new Set<string>(TOOL_ERROR_CODES);
+const academicToolErrorStates = new WeakMap<object,AcademicToolErrorCode>();
+const academicRenderInvariantErrors = new WeakSet<object>();
+const NATIVE_IS_PROXY = utilTypes.isProxy;
+const NATIVE_GET_PROTOTYPE_OF = Object.getPrototypeOf;
+const NATIVE_GET_OWN_PROPERTY_DESCRIPTOR = Object.getOwnPropertyDescriptor;
+const NATIVE_GET_OWN_PROPERTY_DESCRIPTORS = Object.getOwnPropertyDescriptors;
+const NATIVE_IS_FROZEN = Object.isFrozen;
+const NATIVE_FREEZE = Object.freeze;
+const NATIVE_DEFINE_PROPERTY = Object.defineProperty;
+const NATIVE_OWN_KEYS = Reflect.ownKeys;
+const NATIVE_ARRAY_IS_ARRAY = Array.isArray;
+const ABORTED = Object.getOwnPropertyDescriptor(AbortSignal.prototype,"aborted")!.get!;
+const THROW_IF_ABORTED = AbortSignal.prototype.throwIfAborted;
+const ADD_EVENT_LISTENER = AbortSignal.prototype.addEventListener;
+const REMOVE_EVENT_LISTENER = AbortSignal.prototype.removeEventListener;
+
+export class AcademicToolError extends Error {
+  declare readonly name:"AcademicToolError";
+  declare readonly code:AcademicToolErrorCode;
+  constructor(code:AcademicToolErrorCode) {
+    const safeCode = TOOL_ERROR_CODE_SET.has(code) ? code : "academic-tool.internal-contract";
+    super(safeCode);
+    NATIVE_DEFINE_PROPERTY(this,"code",{value:safeCode,enumerable:true,writable:false,configurable:false});
+    NATIVE_DEFINE_PROPERTY(this,"name",{value:"AcademicToolError",enumerable:true,writable:false,configurable:false});
+    academicToolErrorStates.set(this,safeCode);
+  }
+}
+function authenticatedToolErrorCode(value:unknown):AcademicToolErrorCode|null {
+  if(value===null||typeof value!=="object") return null;
+  return academicToolErrorStates.get(value)??null;
+}
+const toolFail=(code:AcademicToolErrorCode):never=>{throw new AcademicToolError(code);};
+export function freshAcademicToolErrorInternal(error:unknown,fallback:AcademicToolErrorCode="academic-tool.internal-contract"):never {
+  return toolFail(authenticatedToolErrorCode(error)??fallback);
+}
+export function academicRenderInvariantInternal():never {
+  const error=new AcademicToolError("academic-tool.truncation-invariant");academicRenderInvariantErrors.add(error);throw error;
+}
+export function mapAcademicRenderErrorInternal(error:unknown):never {
+  if(error!==null&&typeof error==="object"&&academicRenderInvariantErrors.has(error)) toolFail("academic-tool.truncation-invariant");
+  return toolFail("academic-tool.internal-contract");
+}
+
+export interface AcademicToolDependenciesDescriptor {
+  readonly enabled?:boolean;
+  readonly options?:AcademicAcquisitionOptions;
+  readonly acquisitionDependencyFactory?:AcademicAcquisitionDependencyFactoryInternal;
+}
+export interface AcademicToolDependencies {readonly capabilityKind:"academic-tool-dependencies";}
 type DependencyState=Readonly<{enabled:boolean;options:AcademicAcquisitionOptions|undefined;factory:AcademicAcquisitionDependencyFactoryInternal}>;
 const dependencyStates=new WeakMap<object,DependencyState>();
-function plainDescriptor(value:unknown):PropertyDescriptorMap{if(value===null||typeof value!=="object"||utilTypes.isProxy(value)||Object.getPrototypeOf(value)!==Object.prototype)toolFail("academic-tool.internal-contract");const descriptors=Object.getOwnPropertyDescriptors(value),keys=Reflect.ownKeys(descriptors),allowed=["enabled","options","acquisitionDependencyFactory"];if(keys.some(key=>typeof key!=="string"||!allowed.includes(key))||keys.length>allowed.length)toolFail("academic-tool.internal-contract");for(const key of keys as string[]){const descriptor=descriptors[key]!;if(!descriptor.enumerable||!("value" in descriptor))toolFail("academic-tool.internal-contract");}return descriptors;}
-export function createAcademicToolDependencies(descriptor:AcademicToolDependenciesDescriptor={}):AcademicToolDependencies{const d=plainDescriptor(descriptor),enabledValue=d.enabled?.value;if(enabledValue!==undefined&&typeof enabledValue!=="boolean")toolFail("academic-tool.internal-contract");const factory=(d.acquisitionDependencyFactory?.value??createDefaultAcademicAcquisitionDependencyFactoryInternal()) as AcademicAcquisitionDependencyFactoryInternal;try{assertAcademicAcquisitionDependencyFactoryInternal(factory);}catch{return toolFail("academic-tool.internal-contract");}const output=Object.freeze({capabilityKind:"academic-tool-dependencies" as const});dependencyStates.set(output,Object.freeze({enabled:enabledValue??true,options:d.options?.value as AcademicAcquisitionOptions|undefined,factory}));return output;}
-export function createDefaultAcademicToolDependencies():AcademicToolDependencies{return createAcademicToolDependencies();}
-export function getAcademicToolDependenciesInternal(value:AcademicToolDependencies):DependencyState{if(value===null||typeof value!=="object"||utilTypes.isProxy(value)||!Object.isFrozen(value))toolFail("academic-tool.internal-contract");const state=dependencyStates.get(value as object);if(!state)toolFail("academic-tool.internal-contract");return state!;}
+function plainDescriptor(value:unknown):PropertyDescriptorMap {
+  if(value===null||typeof value!=="object"||NATIVE_IS_PROXY(value)||NATIVE_GET_PROTOTYPE_OF(value)!==Object.prototype) toolFail("academic-tool.internal-contract");
+  const descriptors=NATIVE_GET_OWN_PROPERTY_DESCRIPTORS(value),keys=NATIVE_OWN_KEYS(descriptors),allowed=["enabled","options","acquisitionDependencyFactory"];
+  if(keys.some(key=>typeof key!=="string"||!allowed.includes(key))||keys.length>allowed.length) toolFail("academic-tool.internal-contract");
+  for(const key of keys as string[]) {const descriptor=descriptors[key]!;if(!descriptor.enumerable||!("value" in descriptor)) toolFail("academic-tool.internal-contract");}
+  return descriptors;
+}
+export function createAcademicToolDependencies(descriptor:AcademicToolDependenciesDescriptor={}):AcademicToolDependencies {
+  const d=plainDescriptor(descriptor),enabledValue=d.enabled?.value;
+  if(enabledValue!==undefined&&typeof enabledValue!=="boolean") toolFail("academic-tool.internal-contract");
+  const factory=(d.acquisitionDependencyFactory?.value??createDefaultAcademicAcquisitionDependencyFactoryInternal()) as AcademicAcquisitionDependencyFactoryInternal;
+  try {assertAcademicAcquisitionDependencyFactoryInternal(factory);} catch {return toolFail("academic-tool.internal-contract");}
+  const output=NATIVE_FREEZE({capabilityKind:"academic-tool-dependencies" as const});
+  dependencyStates.set(output,NATIVE_FREEZE({enabled:enabledValue??true,options:d.options?.value as AcademicAcquisitionOptions|undefined,factory}));
+  return output;
+}
+export function createDefaultAcademicToolDependencies():AcademicToolDependencies {return createAcademicToolDependencies();}
+export function getAcademicToolDependenciesInternal(value:AcademicToolDependencies):DependencyState {
+  if(value===null||typeof value!=="object"||NATIVE_IS_PROXY(value)||!NATIVE_IS_FROZEN(value)) toolFail("academic-tool.internal-contract");
+  const state=dependencyStates.get(value as object);if(!state) toolFail("academic-tool.internal-contract");return state!;
+}
 
-export interface AcademicSessionManager{readonly generation:number;search(input:AcademicSearchInput,signal?:AbortSignal):Promise<AcademicAcquisitionResult>;fetch(input:AcademicFetchInput,signal?:AbortSignal):Promise<AcademicAcquisitionResult>;shutdown():Promise<void>;}
-type ManagerState={dependencies:DependencyState;generation:number;lifecycle:"open"|"stale-generation"|"shutdown";controller:AbortController;client:AcademicAcquisitionClient|null;normalized:NormalizedAcquisitionOptionsInternal|null;shutdownPromise:Promise<void>|null;};
+export interface AcademicSessionManager {
+  readonly generation:number;
+  search(input:AcademicSearchInput,signal?:AbortSignal):Promise<AcademicAcquisitionResult>;
+  fetch(input:AcademicFetchInput,signal?:AbortSignal):Promise<AcademicAcquisitionResult>;
+  shutdown():Promise<void>;
+}
+type ManagerState={
+  dependencies:DependencyState;generation:number;lifecycle:"open"|"stale-generation"|"shutdown";
+  controller:AbortController;client:AcademicAcquisitionClient|null;normalized:NormalizedAcquisitionOptionsInternal|null;shutdownPromise:Promise<void>|null;
+};
 const managerStates=new WeakMap<object,ManagerState>();
-const ABORTED=Object.getOwnPropertyDescriptor(AbortSignal.prototype,"aborted")!.get!,THROW=AbortSignal.prototype.throwIfAborted,ADD=AbortSignal.prototype.addEventListener,REMOVE=AbortSignal.prototype.removeEventListener;
-function managerState(value:unknown):ManagerState{if(value===null||typeof value!=="object"||utilTypes.isProxy(value)||!Object.isFrozen(value))toolFail("academic-tool.internal-contract");const state=managerStates.get(value as object);if(!state)toolFail("academic-tool.internal-contract");return state!;}
-function genuineSignal(value:unknown):AbortSignal|null{if(value===undefined)return null;if(value===null||typeof value!=="object"||utilTypes.isProxy(value))toolFail("academic-tool.internal-contract");try{if(Object.getOwnPropertyDescriptor(value,"aborted")!==undefined||Object.getOwnPropertyDescriptor(value,"throwIfAborted")!==undefined)toolFail("academic-tool.internal-contract");const aborted=ABORTED.call(value) as boolean;let threw=false;try{THROW.call(value);}catch{threw=true;}if(aborted!==threw)toolFail("academic-tool.internal-contract");return value as AbortSignal;}catch(error){if(error instanceof AcademicToolError)throw new AcademicToolError(error.code);return toolFail("academic-tool.internal-contract");}}
-function ownData(value:unknown,allowed:readonly string[],required:readonly string[]):PropertyDescriptorMap{if(value===null||typeof value!=="object"||utilTypes.isProxy(value)||Object.getPrototypeOf(value)!==Object.prototype)toolFail("academic-tool.invalid-input");const d=Object.getOwnPropertyDescriptors(value),keys=Reflect.ownKeys(d);if(keys.some(key=>typeof key!=="string"||!allowed.includes(key))||required.some(key=>!keys.includes(key)))toolFail("academic-tool.invalid-input");for(const key of keys as string[]){const item=d[key]!;if(!item.enumerable||!("value" in item))toolFail("academic-tool.invalid-input");}return d;}
-function denseStrings(value:unknown,maximum:number,enums?:readonly string[]):readonly string[]{if(!Array.isArray(value)||utilTypes.isProxy(value)){toolFail("academic-tool.invalid-input");}const lengthDescriptor=Object.getOwnPropertyDescriptor(value,"length");if(!lengthDescriptor||!("value" in lengthDescriptor)||!Number.isSafeInteger(lengthDescriptor.value)||lengthDescriptor.value<0||lengthDescriptor.value>maximum)toolFail("academic-tool.invalid-input");const length=lengthDescriptor!.value as number,d=Object.getOwnPropertyDescriptors(value),keys=Reflect.ownKeys(d);if(keys.length!==length+1)toolFail("academic-tool.invalid-input");const output:string[]=[];for(let index=0;index<length;index++){const item=d[String(index)];if(!item||!("value" in item)||!item.enumerable||typeof item.value!=="string"||(enums&&!enums.includes(item.value)))toolFail("academic-tool.invalid-input");output.push(item.value);}return Object.freeze(output);}
-function integer(value:unknown,minimum:number,maximum:number):number{if(typeof value!=="number"||!Number.isSafeInteger(value)||value<minimum||value>maximum)toolFail("academic-tool.invalid-input");return value as number;}
-function searchInput(value:unknown):AcademicSearchInput{const d=ownData(value,["queries","providers","maxResultsPerQuery","publicationTypes","fromYear","toYear"],["queries"]),queries=denseStrings(d.queries!.value,16);if(queries.length<1)toolFail("academic-tool.invalid-input");const output:Record<string,unknown>={queries};if(d.providers)output.providers=denseStrings(d.providers.value,3,["crossref","openalex","pubmed"]);if(d.maxResultsPerQuery)output.maxResultsPerQuery=integer(d.maxResultsPerQuery.value,1,100);if(d.publicationTypes)output.publicationTypes=denseStrings(d.publicationTypes.value,4,["journal-article","review","dataset","other"]);if(d.fromYear)output.fromYear=integer(d.fromYear.value,1,9999);if(d.toYear)output.toYear=integer(d.toYear.value,1,9999);return Object.freeze(output) as unknown as AcademicSearchInput;}
-function fetchInput(value:unknown):AcademicFetchInput{const d=ownData(value,["identifierKind","identifier"],["identifierKind","identifier"]),kind=d.identifierKind!.value,identifier=d.identifier!.value;if(!["doi","pmid","pmcid"].includes(kind)||typeof identifier!=="string")toolFail("academic-tool.invalid-input");return Object.freeze({identifierKind:kind,identifier}) as AcademicFetchInput;}
-const acquisitionMap:Readonly<Record<string,AcademicToolErrorCode>>=Object.freeze({"acquisition.invalid-input":"academic-tool.invalid-input","acquisition.too-many-queries":"academic-tool.invalid-input","acquisition.query-too-large":"academic-tool.invalid-input","acquisition.too-many-partitions":"academic-tool.invalid-input","acquisition.invalid-options":"academic-tool.invalid-options","acquisition.closed":"academic-tool.shutdown","acquisition.cancelled":"academic-tool.cancelled","acquisition.deadline-exceeded":"academic-tool.deadline-exceeded","acquisition.security-failure":"academic-tool.security-policy","acquisition.sink-settlement-failure":"academic-tool.sink-settlement-failure","acquisition.provider-failure":"academic-tool.provider-failure","acquisition.result-too-large":"academic-tool.result-too-large","acquisition.internal-contract":"academic-tool.internal-contract"});
-export function mapAcademicAcquisitionErrorInternal(error:unknown):never{if(error instanceof AcademicAcquisitionError){const d=Object.getOwnPropertyDescriptor(error,"code"),code=d&&"value" in d?d.value:null;if(typeof code==="string"&&acquisitionMap[code])return toolFail(acquisitionMap[code]!);}return toolFail("academic-tool.internal-contract");}
-function mapped(error:unknown,state:ManagerState,external:AbortSignal|null,constructing=false):never{if(state.lifecycle==="stale-generation")return toolFail("academic-tool.stale-generation");if(state.lifecycle==="shutdown")return toolFail("academic-tool.shutdown");if(external&&ABORTED.call(external))return toolFail("academic-tool.cancelled");if(error instanceof AcademicToolError)return toolFail(error.code);if(constructing&&error instanceof AcademicAcquisitionError){const d=Object.getOwnPropertyDescriptor(error,"code"),code=d&&"value" in d?d.value:null;if(code==="acquisition.invalid-capability")return toolFail("academic-tool.unavailable");}if(constructing&&!(error instanceof AcademicAcquisitionError))return toolFail("academic-tool.unavailable");return mapAcademicAcquisitionErrorInternal(error);}
-function client(state:ManagerState):AcademicAcquisitionClient{if(state.lifecycle!=="open")toolFail(state.lifecycle==="stale-generation"?"academic-tool.stale-generation":"academic-tool.shutdown");if(!state.dependencies.enabled)toolFail("academic-tool.disabled");if(state.client)return state.client;try{const created=createAcademicAcquisitionClient(state.dependencies.options,state.dependencies.factory);state.client=created;state.normalized=getAcademicAcquisitionClientNormalizedOptionsInternal(created);return created;}catch(error){return mapped(error,state,null,true);}}
-async function invoke(state:ManagerState,kind:"search"|"fetch",input:unknown,signalValue?:AbortSignal):Promise<AcademicAcquisitionResult>{if(!state.dependencies.enabled)toolFail("academic-tool.disabled");if(state.lifecycle!=="open")toolFail(state.lifecycle==="stale-generation"?"academic-tool.stale-generation":"academic-tool.shutdown");let inputValue:AcademicSearchInput|AcademicFetchInput,external:AbortSignal|null=null;try{inputValue=kind==="search"?searchInput(input):fetchInput(input);external=genuineSignal(signalValue);if(external&&ABORTED.call(external))toolFail("academic-tool.cancelled");}catch(error){return mapped(error,state,external??null);}const controller=new AbortController(),generationSignal=state.controller.signal,abortGeneration=()=>controller.abort(),abortExternal=()=>controller.abort();ADD.call(generationSignal,"abort",abortGeneration,{once:true});if(external)ADD.call(external,"abort",abortExternal,{once:true});if(ABORTED.call(generationSignal))abortGeneration();if(external&&ABORTED.call(external))abortExternal();try{const acquisitionClient=client(state),capability=createAcademicAcquisitionCallCapabilities({signal:controller.signal}),result=kind==="search"?await acquisitionClient.search(inputValue as AcademicSearchInput,capability):await acquisitionClient.fetch(inputValue as AcademicFetchInput,capability);if(state.lifecycle!=="open")toolFail(state.lifecycle==="stale-generation"?"academic-tool.stale-generation":"academic-tool.shutdown");return result;}catch(error){return mapped(error,state,external);}finally{REMOVE.call(generationSignal,"abort",abortGeneration);if(external)REMOVE.call(external,"abort",abortExternal);}}
-export function createAcademicSessionManager(dependencies:AcademicToolDependencies,generation:number):AcademicSessionManager{const dependency=getAcademicToolDependenciesInternal(dependencies);if(!Number.isSafeInteger(generation)||generation<1)toolFail("academic-tool.internal-contract");let manager!:AcademicSessionManager;const state:ManagerState={dependencies:dependency,generation,controller:new AbortController(),lifecycle:"open",client:null,normalized:null,shutdownPromise:null};manager=Object.freeze({generation,search(input:AcademicSearchInput,signal?:AbortSignal){return invoke(state,"search",input,signal);},fetch(input:AcademicFetchInput,signal?:AbortSignal){return invoke(state,"fetch",input,signal);},shutdown(){if(state.shutdownPromise)return state.shutdownPromise;if(state.lifecycle==="open")state.lifecycle="shutdown";state.controller.abort();state.shutdownPromise=(async()=>{if(state.client)try{await state.client.close();}catch{/* redacted */}})();return state.shutdownPromise;}});managerStates.set(manager,state);return manager;}
-export function detachAcademicSessionManagerInternal(manager:AcademicSessionManager,reason:"stale-generation"|"shutdown"):void{const state=managerState(manager);if(state.lifecycle!=="open")return;state.lifecycle=reason;state.controller.abort();}
-export function getAcademicSessionNormalizedOptionsInternal(manager:AcademicSessionManager):NormalizedAcquisitionOptionsInternal|null{return managerState(manager).normalized;}
+function managerState(value:unknown):ManagerState {
+  if(value===null||typeof value!=="object"||NATIVE_IS_PROXY(value)||!NATIVE_IS_FROZEN(value)) toolFail("academic-tool.internal-contract");
+  const state=managerStates.get(value as object);if(!state) toolFail("academic-tool.internal-contract");return state!;
+}
+function genuineSignal(value:unknown):AbortSignal|null {
+  if(value===undefined) return null;
+  if(value===null||typeof value!=="object"||NATIVE_IS_PROXY(value)) toolFail("academic-tool.internal-contract");
+  try {
+    if(NATIVE_GET_OWN_PROPERTY_DESCRIPTOR(value,"aborted")!==undefined||NATIVE_GET_OWN_PROPERTY_DESCRIPTOR(value,"throwIfAborted")!==undefined) toolFail("academic-tool.internal-contract");
+    const aborted=ABORTED.call(value) as boolean;let threw=false;
+    try {THROW_IF_ABORTED.call(value);} catch {threw=true;}
+    if(aborted!==threw) toolFail("academic-tool.internal-contract");
+    return value as AbortSignal;
+  } catch {return toolFail("academic-tool.internal-contract");}
+}
+function ownData(value:unknown,allowed:readonly string[],required:readonly string[]):PropertyDescriptorMap {
+  if(value===null||typeof value!=="object"||NATIVE_IS_PROXY(value)||NATIVE_GET_PROTOTYPE_OF(value)!==Object.prototype) toolFail("academic-tool.invalid-input");
+  const d=NATIVE_GET_OWN_PROPERTY_DESCRIPTORS(value),keys=NATIVE_OWN_KEYS(d);
+  if(keys.some(key=>typeof key!=="string"||!allowed.includes(key))||required.some(key=>!keys.includes(key))) toolFail("academic-tool.invalid-input");
+  for(const key of keys as string[]) {const item=d[key]!;if(!item.enumerable||!("value" in item)) toolFail("academic-tool.invalid-input");}
+  return d;
+}
+function denseStrings(value:unknown,maximum:number,enums?:readonly string[]):readonly string[] {
+  if(!NATIVE_ARRAY_IS_ARRAY(value)||NATIVE_IS_PROXY(value)) toolFail("academic-tool.invalid-input");
+  const lengthDescriptor=NATIVE_GET_OWN_PROPERTY_DESCRIPTOR(value,"length");
+  if(!lengthDescriptor||!("value" in lengthDescriptor)||!Number.isSafeInteger(lengthDescriptor.value)||lengthDescriptor.value<0||lengthDescriptor.value>maximum) toolFail("academic-tool.invalid-input");
+  const length=lengthDescriptor!.value as number,d=NATIVE_GET_OWN_PROPERTY_DESCRIPTORS(value),keys=NATIVE_OWN_KEYS(d);
+  if(keys.length!==length+1) toolFail("academic-tool.invalid-input");
+  const output:string[]=[];
+  for(let index=0;index<length;index++) {const item=d[String(index)];if(!item||!("value" in item)||!item.enumerable||typeof item.value!=="string"||(enums&&!enums.includes(item.value))) toolFail("academic-tool.invalid-input");output.push(item.value);}
+  return NATIVE_FREEZE(output);
+}
+function integer(value:unknown,minimum:number,maximum:number):number {
+  if(typeof value!=="number"||!Number.isSafeInteger(value)||value<minimum||value>maximum) toolFail("academic-tool.invalid-input");return value as number;
+}
+function searchInput(value:unknown):AcademicSearchInput {
+  const d=ownData(value,["queries","providers","maxResultsPerQuery","publicationTypes","fromYear","toYear"],["queries"]),queries=denseStrings(d.queries!.value,16);
+  if(queries.length<1) toolFail("academic-tool.invalid-input");
+  const output:Record<string,unknown>={queries};
+  if(d.providers) output.providers=denseStrings(d.providers.value,3,["crossref","openalex","pubmed"]);
+  if(d.maxResultsPerQuery) output.maxResultsPerQuery=integer(d.maxResultsPerQuery.value,1,100);
+  if(d.publicationTypes) output.publicationTypes=denseStrings(d.publicationTypes.value,4,["journal-article","review","dataset","other"]);
+  if(d.fromYear) output.fromYear=integer(d.fromYear.value,1,9999);
+  if(d.toYear) output.toYear=integer(d.toYear.value,1,9999);
+  return NATIVE_FREEZE(output) as unknown as AcademicSearchInput;
+}
+function fetchInput(value:unknown):AcademicFetchInput {
+  const d=ownData(value,["identifierKind","identifier"],["identifierKind","identifier"]),kind=d.identifierKind!.value,identifier=d.identifier!.value;
+  if(typeof kind!=="string"||!["doi","pmid","pmcid"].includes(kind)||typeof identifier!=="string") toolFail("academic-tool.invalid-input");
+  return NATIVE_FREEZE({identifierKind:kind,identifier}) as AcademicFetchInput;
+}
+const acquisitionMap:Readonly<Record<string,AcademicToolErrorCode>>=NATIVE_FREEZE({
+  "acquisition.invalid-input":"academic-tool.invalid-input",
+  "acquisition.too-many-queries":"academic-tool.invalid-input",
+  "acquisition.query-too-large":"academic-tool.invalid-input",
+  "acquisition.too-many-partitions":"academic-tool.invalid-input",
+  "acquisition.invalid-options":"academic-tool.invalid-options",
+  "acquisition.closed":"academic-tool.shutdown",
+  "acquisition.cancelled":"academic-tool.cancelled",
+  "acquisition.deadline-exceeded":"academic-tool.deadline-exceeded",
+  "acquisition.security-failure":"academic-tool.security-policy",
+  "acquisition.sink-settlement-failure":"academic-tool.sink-settlement-failure",
+  "acquisition.provider-failure":"academic-tool.provider-failure",
+  "acquisition.result-too-large":"academic-tool.result-too-large",
+  "acquisition.internal-contract":"academic-tool.internal-contract",
+});
+export function mapAcademicAcquisitionErrorInternal(error:unknown):never {
+  const code=getAcademicAcquisitionErrorCodeInternal(error);return toolFail(code===null?("academic-tool.internal-contract"):acquisitionMap[code]??"academic-tool.internal-contract");
+}
+function mapped(error:unknown,state:ManagerState,external:AbortSignal|null):never {
+  if(state.lifecycle==="stale-generation") toolFail("academic-tool.stale-generation");
+  if(state.lifecycle==="shutdown") toolFail("academic-tool.shutdown");
+  if(external!==null&&ABORTED.call(external)) toolFail("academic-tool.cancelled");
+  const toolCode=authenticatedToolErrorCode(error);if(toolCode!==null) toolFail(toolCode);
+  return mapAcademicAcquisitionErrorInternal(error);
+}
+function client(state:ManagerState):AcademicAcquisitionClient {
+  if(state.lifecycle!=="open") toolFail(state.lifecycle==="stale-generation"?"academic-tool.stale-generation":"academic-tool.shutdown");
+  if(!state.dependencies.enabled) toolFail("academic-tool.disabled");
+  if(state.client!==null) return state.client;
+  try {
+    const created=createAcademicAcquisitionClient(state.dependencies.options,state.dependencies.factory);
+    const normalized=getAcademicAcquisitionClientNormalizedOptionsInternal(created);
+    state.client=created;state.normalized=normalized;return created;
+  } catch(error) {
+    const code=getAcademicAcquisitionErrorCodeInternal(error);
+    if(code==="acquisition.invalid-options") toolFail("academic-tool.invalid-options");
+    return toolFail("academic-tool.unavailable");
+  }
+}
+async function invoke(state:ManagerState,kind:"search"|"fetch",input:unknown,signalValue?:AbortSignal):Promise<AcademicAcquisitionResult> {
+  if(!state.dependencies.enabled) toolFail("academic-tool.disabled");
+  if(state.lifecycle!=="open") toolFail(state.lifecycle==="stale-generation"?"academic-tool.stale-generation":"academic-tool.shutdown");
+  const acquisitionClient=client(state);
+  let inputValue:AcademicSearchInput|AcademicFetchInput,external:AbortSignal|null=null;
+  try {
+    inputValue=kind==="search"?searchInput(input):fetchInput(input);
+    external=genuineSignal(signalValue);
+    if(external!==null&&ABORTED.call(external)) toolFail("academic-tool.cancelled");
+  } catch(error) {return mapped(error,state,external);}
+  const controller=new AbortController(),generationSignal=state.controller.signal,abortGeneration=()=>controller.abort(),abortExternal=()=>controller.abort();
+  ADD_EVENT_LISTENER.call(generationSignal,"abort",abortGeneration,{once:true});
+  if(external!==null) ADD_EVENT_LISTENER.call(external,"abort",abortExternal,{once:true});
+  if(ABORTED.call(generationSignal)) abortGeneration();
+  if(external!==null&&ABORTED.call(external)) abortExternal();
+  try {
+    const capability=createAcademicAcquisitionCallCapabilities({signal:controller.signal});
+    const result=kind==="search"?await acquisitionClient.search(inputValue as AcademicSearchInput,capability):await acquisitionClient.fetch(inputValue as AcademicFetchInput,capability);
+    if(state.lifecycle!=="open") toolFail(state.lifecycle==="stale-generation"?"academic-tool.stale-generation":"academic-tool.shutdown");
+    return result;
+  } catch(error) {return mapped(error,state,external);}
+  finally {REMOVE_EVENT_LISTENER.call(generationSignal,"abort",abortGeneration);if(external!==null) REMOVE_EVENT_LISTENER.call(external,"abort",abortExternal);}
+}
+export function createAcademicSessionManager(dependencies:AcademicToolDependencies,generation:number):AcademicSessionManager {
+  const dependency=getAcademicToolDependenciesInternal(dependencies);
+  if(!Number.isSafeInteger(generation)||generation<1) toolFail("academic-tool.internal-contract");
+  let manager!:AcademicSessionManager;
+  const state:ManagerState={dependencies:dependency,generation,controller:new AbortController(),lifecycle:"open",client:null,normalized:null,shutdownPromise:null};
+  manager=NATIVE_FREEZE({
+    generation,
+    search(input:AcademicSearchInput,signal?:AbortSignal){return invoke(state,"search",input,signal);},
+    fetch(input:AcademicFetchInput,signal?:AbortSignal){return invoke(state,"fetch",input,signal);},
+    shutdown(){
+      if(state.shutdownPromise!==null) return state.shutdownPromise;
+      if(state.lifecycle==="open") state.lifecycle="shutdown";
+      state.controller.abort();
+      const created=state.client;
+      state.shutdownPromise=(async()=>{if(created!==null) try {await created.close();} catch {/* closed and redacted */}})();
+      return state.shutdownPromise;
+    },
+  });
+  managerStates.set(manager,state);return manager;
+}
+export function detachAcademicSessionManagerInternal(manager:AcademicSessionManager,reason:"stale-generation"|"shutdown"):void {
+  const state=managerState(manager);if(state.lifecycle!=="open") return;state.lifecycle=reason;state.controller.abort();
+}
+export function getAcademicSessionNormalizedOptionsInternal(manager:AcademicSessionManager):NormalizedAcquisitionOptionsInternal|null {return managerState(manager).normalized;}
