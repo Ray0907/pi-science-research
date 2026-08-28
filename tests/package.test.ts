@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const projectRoot = new URL("../", import.meta.url);
@@ -87,9 +87,13 @@ describe("Pi package manifest", () => {
     expect(manifest.files).toEqual(["extensions", "src", "LICENSE"]);
 
     const packageTemp=await mkdtemp(join(tmpdir(),"pi-science-research-pack-"));
-    const npmExecutable=process.platform==="win32"?"npm.cmd":"npm";
+    const npmCliPath=process.platform==="win32"
+      ?resolve(dirname(process.execPath),"node_modules","npm","bin","npm-cli.js")
+      :resolve(dirname(process.execPath),"..","lib","node_modules","npm","bin","npm-cli.js");
+    const npmCliStatus=await stat(npmCliPath).catch(()=>null);
+    if(!npmCliStatus?.isFile())throw new Error("npm CLI unavailable at trusted installation path");
     let stdout:string;
-    try { stdout=await new Promise<string>((resolvePromise,reject)=>{execFile(npmExecutable,["pack","--dry-run","--json","--ignore-scripts"],{cwd:projectRoot,shell:false,env:{PATH:process.env.PATH,SystemRoot:process.env.SystemRoot,ComSpec:process.env.ComSpec,PATHEXT:process.env.PATHEXT,HOME:packageTemp,TMPDIR:packageTemp,TMP:packageTemp,TEMP:packageTemp}},(error,output)=>{if(error)reject(error);else resolvePromise(output);});}); }
+    try { stdout=await new Promise<string>((resolvePromise,reject)=>{execFile(process.execPath,[npmCliPath,"pack","--dry-run","--json","--ignore-scripts"],{cwd:projectRoot,shell:false,env:{PATH:process.env.PATH,SystemRoot:process.env.SystemRoot,ComSpec:process.env.ComSpec,PATHEXT:process.env.PATHEXT,HOME:packageTemp,TMPDIR:packageTemp,TMP:packageTemp,TEMP:packageTemp}},(error,output)=>{if(error)reject(error);else resolvePromise(output);});}); }
     finally { await rm(packageTemp,{recursive:true,force:true}); }
     const packed = JSON.parse(stdout) as [{ files: Array<{ path: string }> }];
     const paths = packed[0]!.files.map(({ path }) => path);

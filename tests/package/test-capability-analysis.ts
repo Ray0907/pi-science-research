@@ -116,7 +116,7 @@ function moduleKind(specifier: string): "network" | "child" | "fixture" | "safe"
   const bare = specifier.startsWith("node:") ? specifier.slice(5) : specifier;
   const network = ["http", "https", "http2", "net", "tls", "dns", "dns/promises", "dgram", "undici", "node-fetch", "cross-fetch", "ws", "axios", "got", "superagent", "openai", "@aws-sdk"];
   if (network.some((name) => bare === name || bare.startsWith(`${name}/`))) return "network";
-  if (bare === "child_process" || bare.startsWith("child_process/")) return "child";
+  if (["child_process", "worker_threads", "cluster"].some((name) => bare === name || bare.startsWith(`${name}/`))) return "child";
   if (/\/(?:acquisition\/)?contracts\.(?:js|ts)$/u.test(specifier)) return "fixture";
   return "safe";
 }
@@ -143,6 +143,7 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
   const file = ts.createSourceFile(relative, source, ts.ScriptTarget.Latest, true, kind);
   const bindings = new Map<string, AbstractValue>();
   const operations: AnalysisOperation[] = [];
+  const functionDeclarations = new Map<string, ts.FunctionDeclaration>();
 
   const seedImport = (node: ts.ImportDeclaration): void => {
     if (!ts.isStringLiteral(node.moduleSpecifier) || isFullyErasedTypeOnlyImport(node)) return;
@@ -162,6 +163,7 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
 
   const seedPatternNames = (pattern: ts.Node): void => {if (ts.isIdentifier(pattern)) {if (!bindings.has(pattern.text)) bindings.set(pattern.text, EMPTY); return;} ts.forEachChild(pattern, seedPatternNames);};
   const collect = (node: ts.Node): void => {
+    if (ts.isFunctionDeclaration(node) && node.name && node.body) functionDeclarations.set(node.name.text, node);
     if (ts.isVariableDeclaration(node) || ts.isParameter(node)) seedPatternNames(node.name);
     if (ts.isVariableDeclaration(node) && node.initializer) operations.push({pattern: node.name, source: node.initializer, node});
     if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) operations.push({pattern: unwrapExpression(node.left as ts.Expression), source: node.right, node});
@@ -169,7 +171,30 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
   };
   collect(file);
 
-  const evaluate = (expression: ts.Expression, depth = 0): AbstractValue => {
+  let evaluate: (expression: ts.Expression, depth?: number) => AbstractValue;
+  const evaluateDescendants = (node: ts.Node, depth: number): AbstractValue => {
+    let result = EMPTY;
+    const visit = (child: ts.Node): void => {
+      if (ts.isExpression(child)) { result = join(result, evaluate(child, depth + 1), depth + 1); return; }
+      ts.forEachChild(child, visit);
+    };
+    ts.forEachChild(node, visit);
+    return result;
+  };
+  const evaluateExpressionList = (expressions: readonly ts.Expression[], depth: number): AbstractValue => {
+    let result = EMPTY;
+    for (const expression of expressions) result = join(result, evaluate(expression, depth + 1), depth + 1);
+    return result;
+  };
+  const evaluateFunctionResult = (node: ts.FunctionLikeDeclaration, depth: number): AbstractValue => {
+    if (ts.isArrowFunction(node) && !ts.isBlock(node.body)) return evaluate(node.body, depth + 1);
+    let result = EMPTY;
+    if (node.body) { const visit = (child: ts.Node): void => { if (ts.isFunctionLike(child) && child !== node) return; if (ts.isReturnStatement(child) && child.expression) { result = join(result, evaluate(child.expression, depth + 1), depth + 1); return; } ts.forEachChild(child, visit); }; ts.forEachChild(node.body, visit); }
+    return result;
+  };
+  const derivedUnknown = (value: AbstractValue): AbstractValue => valueOf(value.flags, [], true, new Map(), value.flags === 0 ? EMPTY : valueOf(value.flags));
+
+  evaluate = (expression: ts.Expression, depth = 0): AbstractValue => {
     if (depth >= MAX_DEPTH) return TOP;
     if (depth === 0) { let nodes = 0, exceeded = false; const stack: Array<readonly [ts.Node, number]> = [[expression, 0]]; while (stack.length > 0 && !exceeded) { const [node, nodeDepth] = stack.pop()!; if (!Number.isSafeInteger(nodes) || nodes >= MAX_NODES || nodeDepth >= MAX_DEPTH) { exceeded = true; break; } nodes += 1; ts.forEachChild(node, child => { stack.push([child, nodeDepth + 1]); }); } if (exceeded) return TOP; }
     const value = unwrapExpression(expression);
@@ -180,10 +205,14 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
       if (value.text === "process") return valueOf(Capability.processRoot);
       if (value.text === "fetch" || value.text === "WebSocket") return bindings.has(value.text) ? bindings.get(value.text)! : valueOf(Capability.network);
       if (value.text === "require" || value.text === "getBuiltinModule" || value.text === "createRequire") return valueOf(Capability.child);
-      if (["setTimeout", "setInterval", "Worker"].includes(value.text)) return valueOf(Capability.processRoot);
+      if (value.text === "Worker") return bindings.has(value.text) ? bindings.get(value.text)! : valueOf(Capability.child);
+      if (["setTimeout", "setInterval"].includes(value.text)) return valueOf(Capability.processRoot);
+      const declaration = functionDeclarations.get(value.text);
+      if (declaration?.body) return derivedUnknown(evaluateFunctionResult(declaration, depth + 1));
       return bindings.get(value.text) ?? EMPTY;
     }
-    if (ts.isConditionalExpression(value)) return join(evaluate(value.whenTrue, depth + 1), evaluate(value.whenFalse, depth + 1), depth + 1);
+    if (ts.isConditionalExpression(value)) return join(evaluate(value.condition, depth + 1), join(evaluate(value.whenTrue, depth + 1), evaluate(value.whenFalse, depth + 1), depth + 1), depth + 1);
+    if (ts.isBinaryExpression(value) && [ts.SyntaxKind.BarBarToken, ts.SyntaxKind.AmpersandAmpersandToken, ts.SyntaxKind.QuestionQuestionToken, ts.SyntaxKind.CommaToken].includes(value.operatorToken.kind)) return join(evaluate(value.left, depth + 1), evaluate(value.right, depth + 1), depth + 1);
     if (ts.isBinaryExpression(value) && value.operatorToken.kind === ts.SyntaxKind.PlusToken) {
       const left = evaluate(value.left, depth + 1), right = evaluate(value.right, depth + 1), strings: string[] = [];
       let unknown = left.unknownString || right.unknownString;
@@ -262,6 +291,18 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
     }
     if (ts.isAwaitExpression(value)) return evaluate(value.expression, depth + 1);
     if (ts.isCallExpression(value)) {
+      if (ts.isPropertyAccessExpression(value.expression) && value.expression.name.text === "slice") {
+        const base = evaluate(value.expression.expression, depth + 1);
+        const indexes: number[] = [];
+        let exact = !base.unknownString && base.strings.size > 0 && value.arguments.length <= 2;
+        for (const argument of value.arguments) {
+          const item = unwrapExpression(argument);
+          if (!ts.isNumericLiteral(item) || !Number.isSafeInteger(Number(item.text))) { exact = false; break; }
+          indexes.push(Number(item.text));
+        }
+        if (exact) return valueOf(base.flags, [...base.strings].map((item) => item.slice(indexes[0], indexes[1])), false, new Map(), base.unknownProperty);
+        return derivedUnknown(join(base, evaluateExpressionList(value.arguments, depth + 1), depth + 1));
+      }
       if (ts.isPropertyAccessExpression(value.expression) && ["importActual", "importMock"].includes(value.expression.name.text)) {
         const argument = value.arguments[0] ? evaluate(value.arguments[0]!, depth + 1) : valueOf(0, [], true);
         let result = EMPTY; for (const specifier of argument.strings) result = join(result, moduleValue(specifier));
@@ -274,16 +315,18 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
         return argument.unknownString ? join(result, valueOf(Capability.network | Capability.child | Capability.fixture)) : result;
       }
       const callee = evaluate(value.expression, depth + 1);
+      const descendants = join(callee, evaluateExpressionList(value.arguments, depth + 1), depth + 1);
       if ((callee.flags & Capability.child) !== 0) {
         const argument = value.arguments[0] ? evaluate(value.arguments[0]!, depth + 1) : valueOf(0, [], true);
-        let result = valueOf(Capability.child);
+        let result = join(valueOf(Capability.child), descendants, depth + 1);
         for (const specifier of argument.strings) result = join(result, moduleValue(specifier));
         return argument.unknownString ? join(result, valueOf(Capability.child)) : result;
       }
-      return valueOf(callee.flags & (Capability.network | Capability.child | Capability.fixture), [], false, new Map(), callee.unknownProperty);
+      return derivedUnknown(descendants);
     }
-    if (ts.isNewExpression(value)) return evaluate(value.expression, depth + 1);
-    return EMPTY;
+    if (ts.isNewExpression(value)) return derivedUnknown(join(evaluate(value.expression, depth + 1), evaluateExpressionList(value.arguments ?? [], depth + 1), depth + 1));
+    if (ts.isArrowFunction(value) || ts.isFunctionExpression(value)) return derivedUnknown(evaluateFunctionResult(value, depth + 1));
+    return derivedUnknown(evaluateDescendants(value, depth + 1));
   };
 
   const patternProperty = (sourceValue: AbstractValue, keys: readonly string[], unknown: boolean): AbstractValue => {
