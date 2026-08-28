@@ -15,8 +15,17 @@ describe("production acquisition network capability policy",()=>{
  const reflectiveDenied=[
   'const get=Object.getOwnPropertyDescriptor;const d=get(globalThis,"fetch");d.value("x")',
   'const get=Object.getOwnPropertyDescriptor;const d=get.apply(Object,[globalThis,"fetch"]);d.value("x")',
+  'const get=Object.getOwnPropertyDescriptor;const d=get["apply"](Object,[globalThis,"fetch"]);d.value("x")',
+  'const get=Object.getOwnPropertyDescriptor;const d=get[`call`](Object,globalThis,"fetch");d.value("x")',
+  'const get=Object.getOwnPropertyDescriptor,member="bi"+"nd";const bound=get[member](Object,globalThis,"fetch");bound().value("x")',
+  'const get=Object.getOwnPropertyDescriptor;get[unknownMember](Object,[globalThis,"fetch"])',
   'const get=Object.getOwnPropertyDescriptor;const d=get.call(Object,globalThis,"fetch");d.value("x")',
   'const get=Reflect.get;const f=get.apply(Reflect,[globalThis,"fetch"]);f("x")',
+  'const get=Reflect.get;const f=get["apply"](Reflect,[globalThis,"fetch"]);f("x")',
+  'const get=Reflect.get,member=`ca${"ll"}`;const f=get[member](Reflect,globalThis,"fetch");f("x")',
+  'const get=Reflect.get;get[unknownMember](Reflect,[globalThis,"fetch"])',
+  'const get=Reflect.get;const bound=get["bind"](Reflect,globalThis);bound("fetch")("x")',
+  'Function[unknownMember]("return fetch(\"x\")")',
   'const get=Reflect.get;const f=get.call(Reflect,globalThis,"fetch");f("x")',
   'const get=Reflect.get;const f=get.apply(Reflect,{0:globalThis,1:"fetch",length:2});f("x")',
   'const get=Object.getOwnPropertyDescriptor;const d=get.apply(Object);d.value("x")',
@@ -54,5 +63,5 @@ describe("production acquisition network capability policy",()=>{
  ];
  for(const source of reflectiveDenied)expect(audit(source).length,source).toBeGreaterThan(0);
  const overBound=`const values=[${Array.from({length:4_200},(_,index)=>index).join(",")}];const f=values[unknownKey];f()`;expect(audit(overBound).length).toBeGreaterThan(0);const passBound=`let a0=globalThis;${Array.from({length:80},(_,index)=>`let a${index+1}=a${index};`).join("")}a80.fetch("x")`;expect(audit(passBound).length).toBeGreaterThan(0);
- for(const source of ['client.fetch(value);adapter.fetch(value);','const object={safe(){}};const get=Object.getOwnPropertyDescriptor;get.apply(Object,[object,"safe"])!.value();get.apply(Object,{0:object,1:"safe",length:2})!.value();get.call(Object,object,"safe")!.value();get.bind(Object,object,"safe")()!.value();','const d=Object.getOwnPropertyDescriptor(Promise.prototype,"then");d?.value.call(Promise.resolve(),()=>{});','const d=Object.getOwnPropertyDescriptor(signal,"aborted");void d?.value;','import type {RequestOptions} from "node:https";','import {type Worker} from "node:worker_threads";'])expect(audit(source),source).toEqual([]);const allowed='import {Resolver} from "node:dns/promises";import http from "node:http";import https from "node:https";import tls from "node:tls";http.request({});https.request({});tls.checkServerIdentity("x",{});new Resolver().resolve4("x",()=>{});';expect(audit(allowed,adapter)).toEqual([]);expect(audit('import net from "node:net";net.connect(1);',adapter).length).toBeGreaterThan(0);expect(audit('import http from "node:http";http.get("x");',adapter).length).toBeGreaterThan(0);expect(audit('import zlib from "node:zlib";zlib.gunzipSync(value);').length).toBeGreaterThan(0);});
+ for(const source of ['client.fetch(value);adapter.fetch(value);','const object={safe(){}};object["safe"]();object[`safe`]();const member="sa"+"fe";object[member]();','const object={safe(){}};const get=Object.getOwnPropertyDescriptor;get.apply(Object,[object,"safe"])!.value();get.apply(Object,{0:object,1:"safe",length:2})!.value();get.call(Object,object,"safe")!.value();get.bind(Object,object,"safe")()!.value();','const d=Object.getOwnPropertyDescriptor(Promise.prototype,"then");d?.value.call(Promise.resolve(),()=>{});','const d=Object.getOwnPropertyDescriptor(signal,"aborted");void d?.value;','import type {RequestOptions} from "node:https";','import {type Worker} from "node:worker_threads";'])expect(audit(source),source).toEqual([]);const allowed='import {Resolver} from "node:dns/promises";import http from "node:http";import https from "node:https";import tls from "node:tls";http.request({});https.request({});tls.checkServerIdentity("x",{});new Resolver().resolve4("x",()=>{});';expect(audit(allowed,adapter)).toEqual([]);expect(audit('import net from "node:net";net.connect(1);',adapter).length).toBeGreaterThan(0);expect(audit('import http from "node:http";http.get("x");',adapter).length).toBeGreaterThan(0);expect(audit('import zlib from "node:zlib";zlib.gunzipSync(value);').length).toBeGreaterThan(0);});
 });
