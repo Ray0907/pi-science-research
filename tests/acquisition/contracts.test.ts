@@ -207,6 +207,7 @@ describe("immutable acquisition contracts", () => {
     expect(normalizeAcquisitionOptions({ maxQueries: 4 }).maxQueries).toBe(4);
     expect(canonicalCounter.calls).toBe(4); // key, scalar, raw snapshot, normalized hash
     expect(normalizeAcquisitionOptions({ maxPartitions: 64, maxCleanupDiagnostics: 323 }).maxPartitions).toBe(64);
+    expect(normalizeAcquisitionOptions({ maxVisibleBytes: 1, maxVisibleLines: 1 })).toMatchObject({ maxVisibleBytes: 1, maxVisibleLines: 1 });
     expect(errorCode(() => normalizeAcquisitionOptions({ maxPartitions: 65, maxCleanupDiagnostics: 328 }))).toBe("acquisition-contract.invalid-options");
   });
 
@@ -279,7 +280,6 @@ describe("immutable acquisition contracts", () => {
     const invalid = [
       { maxConcurrency: 2, maxPerOriginConcurrency: 3 },
       { transport: { connectTimeoutMs: 20_000, requestDeadlineMs: 10_000 } },
-      { maxVisibleBytes: 1_023 }, { maxVisibleLines: 4 },
       { maxVisibleBytes: 49_153 }, { maxVisibleLines: 2_001 },
       { maxResultsPerQuery: 50, providers: { maxProviderRecords: 49 } },
       { maxResultsPerQuery: 50, providers: { maxJoinedPmids: 49 } },
