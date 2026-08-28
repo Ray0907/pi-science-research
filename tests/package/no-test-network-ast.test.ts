@@ -50,9 +50,12 @@ function auditSetupSource(file: ts.SourceFile, relative: string): readonly strin
             errors.push(`${relative}:1:1: setup export assignment denied`);
         if (ts.isExportDeclaration(statement))
             errors.push(`${relative}:1:1: setup export declaration denied`);
-        if (ts.isFunctionDeclaration(statement) && statement.modifiers?.some(item => item.kind === ts.SyntaxKind.DefaultKeyword)) errors.push(`${relative}:1:1: setup default export denied`);
-        if (ts.isFunctionDeclaration(statement) && statement.modifiers?.some(item => item.kind === ts.SyntaxKind.ExportKeyword) && !["createIsolatedNetworkStubInternal", "getInstalledHttp2ClientSessionMethodsInternal"].includes(statement.name?.text ?? ""))
-            errors.push(`${relative}:1:1: setup local export denied`);
+        const modifiers = ts.canHaveModifiers(statement) ? ts.getModifiers(statement) : undefined;
+        if (modifiers?.some(item => item.kind === ts.SyntaxKind.DefaultKeyword)) errors.push(`${relative}:1:1: setup default export denied`);
+        if (modifiers?.some(item => item.kind === ts.SyntaxKind.ExportKeyword)) {
+            const exactHelper = ts.isFunctionDeclaration(statement) && ["createIsolatedNetworkStubInternal", "getInstalledHttp2ClientSessionMethodsInternal"].includes(statement.name?.text ?? "");
+            if (!exactHelper) errors.push(`${relative}:1:1: setup local export denied`);
+        }
         if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier))
             continue;
         const specifier = statement.moduleSpecifier.text;
@@ -114,7 +117,14 @@ function auditNetworkSource(source: string, relative = "tests/fixture.test.ts", 
     if (allowSetup)
         return auditSetupSource(analysis.file, relative);
     const errors: string[] = [];
+    let potential = false;
+    const globalRoots=new Set(["globalThis","global"]);for(let pass=0;pass<Math.min(64,analysis.operations.length+1);pass+=1){let changed=false;for(const operation of analysis.operations){const pattern=unwrapExpression(operation.pattern as ts.Expression),value=unwrapExpression(operation.source);if(ts.isIdentifier(pattern)&&ts.isIdentifier(value)&&globalRoots.has(value.text)&&!globalRoots.has(pattern.text)){globalRoots.add(pattern.text);changed=true;}}if(!changed)break;}
+    const directGlobal=(expression:ts.Expression):boolean=>{const value=unwrapExpression(expression);return ts.isIdentifier(value)&&globalRoots.has(value.text);};
+    if(analysis.operations.some(operation=>directGlobal(operation.source)&&!ts.isIdentifier(operation.pattern)))potential=true;const hasNetworkSyntax=(node:ts.Node):boolean=>{let found=false;const visit=(item:ts.Node):void=>{if(found)return;if(ts.isPropertyAccessExpression(item)&&["fetch","WebSocket"].includes(item.name.text)&&directGlobal(item.expression))found=true;if(ts.isElementAccessExpression(item)&&directGlobal(item.expression))found=true;if(ts.isIdentifier(item)&&["fetch","WebSocket"].includes(item.text)){const parent=item.parent;if((ts.isCallExpression(parent)||ts.isNewExpression(parent))&&parent.expression===item)found=true;}ts.forEachChild(item,visit);};visit(node);return found;};const dangerous=(node:ts.Node,value:ReturnType<typeof analysis.value>):boolean=>analysis.contains(value,Capability.network)&&(value.flags!==31||hasNetworkSyntax(node));
+    const detect = (node: ts.Node): void => { if (ts.isImportEqualsDeclaration(node)) potential = true; if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier) && moduleCapabilityKind(node.moduleSpecifier.text) === "network") potential = true; if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier) && !isFullyErasedTypeOnlyImport(node) && moduleCapabilityKind(node.moduleSpecifier.text) === "network") potential = true; if(ts.isIdentifier(node)&&["fetch","WebSocket"].includes(node.text)){const parent=node.parent;if((ts.isCallExpression(parent)||ts.isNewExpression(parent))&&parent.expression===node)potential=true;}if(ts.isPropertyAccessExpression(node)&&["fetch","WebSocket"].includes(node.name.text)&&directGlobal(node.expression))potential=true;if(ts.isElementAccessExpression(node)&&directGlobal(node.expression))potential=true;if(ts.isBinaryExpression(node)&&node.operatorToken.kind===ts.SyntaxKind.EqualsToken&&directGlobal(node.right)&&ts.isObjectLiteralExpression(unwrapExpression(node.left as ts.Expression)))potential=true;if(ts.isIdentifier(node)&&node.text==="require")potential=true;if(ts.isCallExpression(node)&&(node.expression.kind===ts.SyntaxKind.ImportKeyword||(ts.isPropertyAccessExpression(node.expression)&&["importActual","importMock"].includes(node.expression.name.text)))){const argument=node.arguments[0];if(!argument||!ts.isStringLiteral(argument)||moduleCapabilityKind(argument.text)==="network")potential=true;} ts.forEachChild(node, detect); };
+    detect(analysis.file);
     const visit = (node: ts.Node): void => {
+        if(ts.isElementAccessExpression(node)&&directGlobal(node.expression))errors.push(analysis.location(node,"computed global capability"));
         if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier) && !isFullyErasedTypeOnlyImport(node) && moduleCapabilityKind(node.moduleSpecifier.text) === "network")
             errors.push(analysis.location(node, "runtime network import"));
         if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier) && !isFullyErasedTypeOnlyExport(node) && moduleCapabilityKind(node.moduleSpecifier.text) === "network")
@@ -122,23 +132,22 @@ function auditNetworkSource(source: string, relative = "tests/fixture.test.ts", 
         if (ts.isImportEqualsDeclaration(node))
             errors.push(analysis.location(node, "runtime import-equals denied"));
         if (ts.isCallExpression(node)) {
-            if (analysis.contains(analysis.value(node.expression), Capability.network))
+            if((node.expression.kind===ts.SyntaxKind.ImportKeyword||(ts.isPropertyAccessExpression(node.expression)&&["importActual","importMock"].includes(node.expression.name.text)))&&node.arguments[0]&&ts.isStringLiteral(node.arguments[0])&&moduleCapabilityKind(node.arguments[0].text)==="network")errors.push(analysis.location(node,"runtime network importer"));
+            if (dangerous(node.expression,analysis.value(node.expression)))
                 errors.push(analysis.location(node, "network call"));
             for (const argument of node.arguments)
-                if (!(ts.isIdentifier(unwrapExpression(node.expression)) && (unwrapExpression(node.expression) as ts.Identifier).text === "expect") && analysis.contains(analysis.value(argument), Capability.network))
+                if (!ts.isArrowFunction(argument) && !ts.isFunctionExpression(argument) && !(ts.isIdentifier(unwrapExpression(node.expression)) && (unwrapExpression(node.expression) as ts.Identifier).text === "expect") && dangerous(argument,analysis.value(argument)))
                     errors.push(analysis.location(argument, "network capability escape"));
         }
-        if (ts.isNewExpression(node) && analysis.contains(analysis.value(node.expression), Capability.network))
+        if (ts.isNewExpression(node) && dangerous(node.expression,analysis.value(node.expression)))
             errors.push(analysis.location(node, "network construct"));
-        if (ts.isExpressionStatement(node) && analysis.contains(analysis.value(node.expression), Capability.network))
-            errors.push(analysis.location(node, "network capability expression"));
-        if (ts.isReturnStatement(node) && node.expression && analysis.contains(analysis.value(node.expression), Capability.network))
+        if (ts.isReturnStatement(node) && node.expression && dangerous(node.expression,analysis.value(node.expression)))
             errors.push(analysis.location(node, "network return"));
         ts.forEachChild(node, visit);
     };
-    visit(analysis.file);
-    for (const operation of analysis.operations)
-        if (analysis.contains(analysis.value(operation.source), Capability.network))
+    if (potential) visit(analysis.file);
+    if (potential) for (const operation of analysis.operations)
+        if (dangerous(operation.source,analysis.value(operation.source)))
             errors.push(analysis.location(operation.node, "network capability storage"));
     return findingSet(errors);
 }
@@ -167,7 +176,7 @@ function exactNpmExecutable(expression: ts.Expression | undefined): boolean { if
 function exactImportMetaDirname(expression: ts.Expression | undefined): boolean { if (!expression)
     return false; const value = unwrapExpression(expression); return ts.isPropertyAccessExpression(value) && value.name.text === "dirname" && ts.isMetaProperty(value.expression) && value.expression.keywordToken === ts.SyntaxKind.ImportKeyword && value.expression.name.text === "meta"; }
 function auditChildSource(source: string, relative: string): ChildAudit {
-    const analysis = createCapabilityAnalysis(source, relative), file = analysis.file, errors: string[] = [], sites: string[] = [];
+    const analysis = createCapabilityAnalysis(source, relative), file = analysis.file, errors: string[] = [], sites: string[] = [], candidateCalls: ts.CallExpression[] = [];
     let childImport: string | null = null, childImportCount = 0;
     const imports = new Set<string>(), initializers = new Map<string, ts.Expression>(), childSources = new Map<string, ts.Expression[]>();
     for (const statement of file.statements)
@@ -316,7 +325,7 @@ function auditChildSource(source: string, relative: string): ChildAudit {
                         const expected = ["pack", "--dry-run", "--json", "--ignore-scripts"];
                         if (JSON.stringify(args.elements.map((item) => ts.isStringLiteral(item) ? item.text : "<dynamic>")) !== JSON.stringify(expected))
                             errors.push(`${relative}: npm args`);
-                        sites.push(`${relative}:execFile`);
+                        sites.push(`${relative}:execFile`); candidateCalls.push(node);
                     }
                     else if (relative === "tests/storage/run-root.test.ts") {
                         if (!exactIdentifier(cwd?.initializer, "root"))
@@ -328,7 +337,7 @@ function auditChildSource(source: string, relative: string): ChildAudit {
                         const exactVitest = vitest && ts.isCallExpression(vitest) && ts.isIdentifier(vitest.expression) && vitest.expression.text === "resolve" && vitest.arguments.length === 2 && exactImportMetaDirname(vitest.arguments[0]) && ts.isStringLiteral(vitest.arguments[1]!) && vitest.arguments[1]!.text === "../../node_modules/vitest/vitest.mjs";
                         if (elements.length !== 5 || !exactVitest || !ts.isStringLiteral(elements[1]!) || elements[1]!.text !== "run" || !ts.isStringLiteral(elements[2]!) || elements[2]!.text !== "--root" || !ts.isIdentifier(elements[3]!) || elements[3]!.text !== "root" || !ts.isStringLiteral(elements[4]!) || elements[4]!.text !== "child.test.ts" || !localRoot)
                             errors.push(`${relative}: vitest args or local-root provenance`);
-                        sites.push(`${relative}:spawn`);
+                        sites.push(`${relative}:spawn`); candidateCalls.push(node);
                     }
                     else
                         errors.push(`${relative}: subprocess site denied`);
@@ -338,29 +347,32 @@ function auditChildSource(source: string, relative: string): ChildAudit {
         ts.forEachChild(node, visit);
     };
     visit(file);
-    const approvedChildCall = (node: ts.CallExpression): boolean => ts.isIdentifier(unwrapExpression(node.expression)) && ((relative === "tests/package.test.ts" && (unwrapExpression(node.expression) as ts.Identifier).text === "execFile") || (relative === "tests/storage/run-root.test.ts" && (unwrapExpression(node.expression) as ts.Identifier).text === "spawn"));
-    if (relative !== "tests/package.test.ts" && relative !== "tests/storage/run-root.test.ts")
-        for (const operation of analysis.operations)
-            if (!(ts.isCallExpression(unwrapExpression(operation.source)) && approvedChildCall(unwrapExpression(operation.source) as ts.CallExpression)) && analysis.contains(analysis.value(operation.source), Capability.child))
-                errors.push(analysis.location(operation.node, "child capability storage"));
-    const capabilityVisit = (node: ts.Node): void => { if (ts.isCallExpression(node)) {
-        if (!approvedChildCall(node) && analysis.contains(analysis.value(node.expression), Capability.child))
-            errors.push(analysis.location(node, "child capability call"));
-        for (const argument of node.arguments)
-            if (analysis.contains(analysis.value(argument), Capability.child))
-                errors.push(analysis.location(argument, "child capability escape"));
-    } if (ts.isNewExpression(node) && analysis.contains(analysis.value(node.expression), Capability.child))
-        errors.push(analysis.location(node, "child capability construct")); if (ts.isReturnStatement(node) && node.expression && analysis.contains(analysis.value(node.expression), Capability.child))
-        errors.push(analysis.location(node, "child capability return")); ts.forEachChild(node, capabilityVisit); };
-    if (relative !== "tests/package.test.ts" && relative !== "tests/storage/run-root.test.ts")
-        capabilityVisit(file);
     if (childImport !== null) {
         const expected = relative === "tests/package.test.ts" ? "execFile:execFile" : relative === "tests/storage/run-root.test.ts" ? "spawn:spawn" : null;
-        if (childImport !== expected || childImportCount !== 1)
-            errors.push(`${relative}: child binding denied`);
-        if (sites.length !== 1)
-            errors.push(`${relative}: subprocess call cardinality`);
+        if (childImport !== expected || childImportCount !== 1) errors.push(`${relative}: child binding denied`);
+        if (sites.length !== 1) errors.push(`${relative}: subprocess call cardinality`);
     }
+    let capabilityAnalysis = analysis;
+    if (errors.length === 0 && candidateCalls.length === 1) {
+        const candidate = candidateCalls[0]!, width = candidate.end - candidate.getStart(file);
+        const masked = `${source.slice(0, candidate.getStart(file))}undefined${" ".repeat(Math.max(0, width - "undefined".length))}${source.slice(candidate.end)}`;
+        capabilityAnalysis = createCapabilityAnalysis(masked, relative);
+    }
+    let childPotential = false, hasProcessRoot = false, hasComputedPattern = false;
+    const detectChild = (node: ts.Node): void => { if(ts.isIdentifier(node)&&node.text==="process")hasProcessRoot=true;if(ts.isComputedPropertyName(node)&&(ts.isPropertyAssignment(node.parent)||ts.isBindingElement(node.parent)))hasComputedPattern=true; if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier) && !isFullyErasedTypeOnlyImport(node) && moduleCapabilityKind(node.moduleSpecifier.text) === "child") { const named=node.importClause?.namedBindings;const item=named&&ts.isNamedImports(named)&&named.elements.length===1?named.elements[0]:undefined;const exactApproved=node.moduleSpecifier.text==="node:child_process"&&!node.importClause?.name&&item&&!item.propertyName&&((relative==="tests/package.test.ts"&&item.name.text==="execFile")||(relative==="tests/storage/run-root.test.ts"&&item.name.text==="spawn"));if(!exactApproved)childPotential=true; } if (ts.isIdentifier(node) && ["require", "getBuiltinModule", "createRequire"].includes(node.text)) childPotential = true; if (ts.isPropertyAccessExpression(node) && ["require", "getBuiltinModule", "createRequire"].includes(node.name.text)) childPotential = true; if (ts.isElementAccessExpression(node)) { const base = unwrapExpression(node.expression); if (ts.isIdentifier(base) && (processRoots.has(base.text) || ["module", "globalThis", "global"].includes(base.text))) childPotential = true; } ts.forEachChild(node, detectChild); };
+    detectChild(capabilityAnalysis.file);
+    childPotential = childPotential || (hasProcessRoot && hasComputedPattern);
+    if (childPotential) for (const operation of capabilityAnalysis.operations) if (capabilityAnalysis.contains(capabilityAnalysis.value(operation.source), Capability.child)) errors.push(capabilityAnalysis.location(operation.node, "child capability storage"));
+    const capabilityVisit = (node: ts.Node): void => {
+        if (ts.isCallExpression(node)) {
+            if (capabilityAnalysis.contains(capabilityAnalysis.value(node.expression), Capability.child)) errors.push(capabilityAnalysis.location(node, "child capability call"));
+            for (const argument of node.arguments) if (capabilityAnalysis.contains(capabilityAnalysis.value(argument), Capability.child)) errors.push(capabilityAnalysis.location(argument, "child capability escape"));
+        }
+        if (ts.isNewExpression(node) && capabilityAnalysis.contains(capabilityAnalysis.value(node.expression), Capability.child)) errors.push(capabilityAnalysis.location(node, "child capability construct"));
+        if (ts.isReturnStatement(node) && node.expression && capabilityAnalysis.contains(capabilityAnalysis.value(node.expression), Capability.child)) errors.push(capabilityAnalysis.location(node, "child capability return"));
+        ts.forEachChild(node, capabilityVisit);
+    };
+    if (childPotential) capabilityVisit(capabilityAnalysis.file);
     return { errors: Object.freeze([...new Set(errors)]), sites: Object.freeze(sites) };
 }
 function auditChildTree(): ChildAudit { const errors: string[] = [], sites: string[] = []; for (const file of enumerateRepositorySources()) {
@@ -382,14 +394,14 @@ function auditFixtureConstructor(source: string, relative: string): readonly str
     else
         errors.push(`${relative}: fixture constructor indirect or re-exported`);
 } ts.forEachChild(node, visit); }; visit(file); if ((imports > 0 || calls > 0) && (!allowed.has(relative) || imports !== 1 || calls !== 1))
-    errors.push(`${relative}: fixture constructor cardinality`); for (const operation of analysis.operations)
+    errors.push(`${relative}: fixture constructor cardinality`); let fixturePotential=imports>0||calls>0;const detectFixture=(node:ts.Node):void=>{if(ts.isIdentifier(node)&&node.text==="createProviderRequestPartitionFixtureInternal")fixturePotential=true;if(ts.isIdentifier(node)&&node.text==="createProviderRequestPartitionFixtureInternal")fixturePotential=true;if(ts.isElementAccessExpression(node)&&node.argumentExpression&&ts.isStringLiteral(node.argumentExpression)&&node.argumentExpression.text==="createProviderRequestPartitionFixtureInternal")fixturePotential=true;if(ts.isCallExpression(node)&&node.expression.kind===ts.SyntaxKind.ImportKeyword&&node.arguments[0]&&ts.isStringLiteral(node.arguments[0])&&moduleCapabilityKind(node.arguments[0].text)==="fixture")fixturePotential=true;ts.forEachChild(node,detectFixture);};detectFixture(file);const exactAllowedFixture=allowed.has(relative)&&imports===1&&calls===1&&errors.length===0;if(exactAllowedFixture)fixturePotential=false; if(fixturePotential) for (const operation of analysis.operations)
     if (analysis.contains(analysis.value(operation.source), Capability.fixture))
         errors.push(analysis.location(operation.node, "fixture capability storage")); const capabilityVisit = (node: ts.Node): void => { if (ts.isCallExpression(node)) {
     const exact = ts.isIdentifier(unwrapExpression(node.expression)) && (unwrapExpression(node.expression) as ts.Identifier).text === "createProviderRequestPartitionFixtureInternal" && allowed.has(relative);
     if (!exact && analysis.contains(analysis.value(node.expression), Capability.fixture))
         errors.push(analysis.location(node, "fixture capability call"));
 } if (ts.isReturnStatement(node) && node.expression && !(ts.isCallExpression(unwrapExpression(node.expression)) && ts.isIdentifier(unwrapExpression((unwrapExpression(node.expression) as ts.CallExpression).expression)) && (unwrapExpression((unwrapExpression(node.expression) as ts.CallExpression).expression) as ts.Identifier).text === "createProviderRequestPartitionFixtureInternal" && allowed.has(relative)) && analysis.contains(analysis.value(node.expression), Capability.fixture))
-    errors.push(analysis.location(node, "fixture capability return")); ts.forEachChild(node, capabilityVisit); }; capabilityVisit(file); return errors; }
+    errors.push(analysis.location(node, "fixture capability return")); ts.forEachChild(node, capabilityVisit); }; if(fixturePotential)capabilityVisit(file); return errors; }
 function auditFixtureTree(): readonly string[] { const errors: string[] = [], expected = new Set(["tests/acquisition/crossref.test.ts", "tests/acquisition/openalex.test.ts", "tests/acquisition/pubmed.test.ts", "tests/acquisition/pmc.test.ts"]), seen = new Set<string>(); for (const file of [...enumerate(path.join(root, "tests")), path.join(root, "vitest.config.ts")]) {
     const relative = path.relative(root, file).replaceAll("\\", "/"), source = fs.readFileSync(file, "utf8");
     errors.push(...auditFixtureConstructor(source, relative));
@@ -480,4 +492,22 @@ describe("default-deny test network policy", () => {
     test("regresses tree-wide fixture confinement and mock outer capability captures", () => { for (const bypass of ['import {createProviderRequestPartitionFixtureInternal as fixture} from "../../src/acquisition/contracts.js";fixture(value);', 'import * as fixtures from "../../src/acquisition/contracts.js";fixtures["createProviderRequestPartitionFixtureInternal"](value);', 'const fixtures=await import("../../src/acquisition/contracts.js");fixtures.createProviderRequestPartitionFixtureInternal(value);', 'import {createProviderRequestPartitionFixtureInternal} from "../../src/acquisition/contracts.js";void createProviderRequestPartitionFixtureInternal;'])
         expect(auditFixtureConstructor(bypass, "tests/acquisition/crossref.test.ts").length, bypass).toBeGreaterThan(0); const captured = 'const box={realFetch:globalThis["fet"+"ch"]};const {realFetch}=box;export function createMockSecureTransportCapabilities(){return {send:()=>realFetch("x")};}'; expect(auditMockConstructor(captured).length).toBeGreaterThan(0); });
     test("regresses fully erased type-only imports consistently across audits", () => { expect(auditChildSource('import type {ChildProcess} from "node:child_process";', "tests/fixture.test.ts").errors).toEqual([]); expect(auditNetworkSource('import type {RequestOptions} from "node:https";import {type Socket} from "node:net";')).toEqual([]); expect(auditNetworkSource('import {type Socket,connect} from "node:net";void connect;').length).toBeGreaterThan(0); expect(auditNetworkSource('export {type Socket} from "node:net";')).toEqual([]); });
+    test("fails closed when capability analysis complexity bounds are reached", () => {
+        const nested = (leaf: string): string => Array.from({ length: 40 }, (_, index) => `level${index}`).reduceRight((value, key) => `{${key}:${value}}`, leaf);
+        const destructure = Array.from({ length: 40 }, (_, index) => `level${index}`).reduceRight((value, key) => `{${key}:${value}}`, "{fetch:send}");
+        expect(auditNetworkSource(`const box=${nested("{fetch:globalThis.fetch}")};let send;(${destructure}=box);send(\"x\")`).length).toBeGreaterThan(0);
+        expect(auditChildSource(`const box=${nested("{load:process.getBuiltinModule}")};wrap(box);`, "tests/escape.test.ts").errors.length).toBeGreaterThan(0);
+        expect(auditFixtureConstructor(`const box=${nested("{fixture:(await import(\"../../src/acquisition/contracts.js\")).createProviderRequestPartitionFixtureInternal}")};wrap(box);`, "tests/escape.test.ts").length).toBeGreaterThan(0);
+        expect(auditMockConstructor(`const box=${nested("{send:globalThis.fetch}")};export function createMockSecureTransportCapabilities(){return box;}`).length).toBeGreaterThan(0);
+    });
+    test("suppresses only the exact canonical allowlisted child call node", () => {
+        const bypass = 'const key="getBuiltinModule";const {[key]:load}=process;load("node:child_process").exec("x")';
+        for (const relative of ["tests/package.test.ts", "tests/storage/run-root.test.ts"]) expect(auditChildSource(bypass, relative).errors.length, relative).toBeGreaterThan(0);
+        for (const source of ['import {execFile} from "node:child_process";execFile.bind(null);', 'import {spawn} from "node:child_process";const box={run:spawn};box.run("x");']) expect(auditChildSource(source, "tests/package.test.ts").errors.length, source).toBeGreaterThan(0);
+    });
+    test("allows only the two exact setup function declaration exports", () => {
+        const setupSource = fs.readFileSync(setupPath, "utf8");
+        for (const declaration of ["export const unexpected=1;", "export class Unexpected{}", "export type Unexpected=string;", "export interface Unexpected{}", "export default function unexpected(){}"])
+            expect(auditNetworkSource(`${setupSource}\n${declaration}`, setupRelative, true).length, declaration).toBeGreaterThan(0);
+    });
 });

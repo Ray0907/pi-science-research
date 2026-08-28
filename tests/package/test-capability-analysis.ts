@@ -38,8 +38,13 @@ const EMPTY: AbstractValue = Object.freeze({
   properties: Object.freeze(new Map<string, AbstractValue>()),
   unknownProperty: null,
 });
-const MAX_DEPTH = 6;
+const MAX_DEPTH = 8;
+const MAX_NODES = 4_096;
+const MAX_PASSES = 64;
 const MAX_STRINGS = 32;
+const ALL_CAPABILITIES = Capability.globalRoot | Capability.processRoot | Capability.network | Capability.child | Capability.fixture;
+const TOP_LEAF: AbstractValue = Object.freeze({flags: ALL_CAPABILITIES, strings: Object.freeze(new Set<string>()), unknownString: true, properties: Object.freeze(new Map<string, AbstractValue>()), unknownProperty: null});
+const TOP: AbstractValue = Object.freeze({flags: ALL_CAPABILITIES, strings: Object.freeze(new Set<string>()), unknownString: true, properties: Object.freeze(new Map<string, AbstractValue>()), unknownProperty: TOP_LEAF});
 
 export function isFullyErasedTypeOnlyImport(node: ts.ImportDeclaration): boolean {
   const clause = node.importClause;
@@ -90,12 +95,13 @@ function sameValue(left: AbstractValue, right: AbstractValue): boolean {
 }
 
 function join(left: AbstractValue, right: AbstractValue, depth = 0): AbstractValue {
+  if ((left.flags === ALL_CAPABILITIES && left.unknownString) || (right.flags === ALL_CAPABILITIES && right.unknownString)) return TOP;
   if (sameValue(left, right)) return left;
-  if (depth > MAX_DEPTH) return valueOf(left.flags | right.flags, [], true, new Map(), valueOf(left.flags | right.flags));
+  if (depth >= MAX_DEPTH) return TOP;
   const strings = new Set(left.strings);
   let unknownString = left.unknownString || right.unknownString;
   for (const item of right.strings) {
-    if (strings.size >= MAX_STRINGS) { unknownString = true; break; }
+    if (strings.size >= MAX_STRINGS) return TOP;
     strings.add(item);
   }
   const properties = new Map(left.properties);
@@ -164,7 +170,8 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
   collect(file);
 
   const evaluate = (expression: ts.Expression, depth = 0): AbstractValue => {
-    if (depth > MAX_DEPTH) return valueOf(0, [], true);
+    if (depth >= MAX_DEPTH) return TOP;
+    if (depth === 0) { let nodes = 0, exceeded = false; const stack: Array<readonly [ts.Node, number]> = [[expression, 0]]; while (stack.length > 0 && !exceeded) { const [node, nodeDepth] = stack.pop()!; if (!Number.isSafeInteger(nodes) || nodes >= MAX_NODES || nodeDepth >= MAX_DEPTH) { exceeded = true; break; } nodes += 1; ts.forEachChild(node, child => { stack.push([child, nodeDepth + 1]); }); } if (exceeded) return TOP; }
     const value = unwrapExpression(expression);
     if (ts.isStringLiteral(value) || ts.isNoSubstitutionTemplateLiteral(value)) return valueOf(0, [value.text]);
     if (ts.isNumericLiteral(value)) return valueOf(0, [value.text]);
@@ -295,8 +302,9 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
     }
     return item;
   };
+  const taintPattern = (pattern: ts.Node): boolean => {let changed = false; const visit = (node: ts.Node): void => {if (ts.isIdentifier(node)) {const previous = bindings.get(node.text) ?? EMPTY, next = join(previous, TOP); if (!sameValue(previous, next)) {bindings.set(node.text, next); changed = true;} return;} ts.forEachChild(node, visit);}; visit(pattern); return changed;};
   const extractPattern = (pattern: ts.Node, sourceValue: AbstractValue, depth = 0): boolean => {
-    if (depth > MAX_DEPTH) return false;
+    if (depth >= MAX_DEPTH) return taintPattern(pattern);
     if (ts.isIdentifier(pattern)) {
       const previous = bindings.get(pattern.text) ?? EMPTY, next = join(previous, sourceValue);
       if (sameValue(previous, next)) return false;
@@ -333,11 +341,16 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
     return false;
   };
 
-  for (let pass = 0; pass <= Math.min(64, operations.length + bindings.size + 1); pass += 1) {
+  const passCountSafe = operations.length <= Number.MAX_SAFE_INTEGER - bindings.size - 1;
+  const requestedPasses = passCountSafe ? operations.length + bindings.size + 1 : MAX_PASSES;
+  const passLimit = Math.min(MAX_PASSES, requestedPasses);
+  let stabilized = false;
+  for (let pass = 0; pass < passLimit; pass += 1) {
     let changed = false;
     for (const operation of operations) changed = extractPattern(operation.pattern, evaluate(operation.source), 0) || changed;
-    if (!changed) break;
+    if (!changed) {stabilized = true; break;}
   }
+  if (!stabilized) for (const operation of operations) taintPattern(operation.pattern);
 
   const contains = (value: AbstractValue, flag: number): boolean => (value.flags & flag) !== 0;
   const location = (node: ts.Node, category: string): string => {const point = file.getLineAndCharacterOfPosition(node.getStart(file));return `${relative}:${point.line + 1}:${point.character + 1}: ${category}`;};
