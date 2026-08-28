@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import ts from "typescript";
 import { describe, expect, test } from "vitest";
+import {isFullyErasedTypeOnlyImport} from "./test-capability-analysis.js";
 
 import * as contentDecodingModule from "../../src/acquisition/content-decoding-internal.js";
 import * as jsonScannerModule from "../../src/acquisition/json-wire-scanner-internal.js";
@@ -309,7 +310,6 @@ function auditAdapter(source:string):string[]{
   return errors;
 }
 
-function isFullyErasedTypeOnlyImport(node:ts.ImportDeclaration):boolean{const clause=node.importClause;if(!clause)return false;if(clause.isTypeOnly)return true;if(clause.name||!clause.namedBindings||!ts.isNamedImports(clause.namedBindings)||clause.namedBindings.elements.length===0)return false;return clause.namedBindings.elements.every((item)=>item.isTypeOnly);}
 function isNetworkCapableSpecifier(specifier:string):boolean{const normalized=specifier.startsWith("node:")?specifier.slice(5):specifier;return["http","https","http2","net","tls","dgram","dns","child_process","worker_threads","vm","undici"].some((base)=>normalized===base||normalized.startsWith(`${base}/`))||isForbiddenPackage(normalized);}
 function exactUtilImport(node:ts.ImportDeclaration):boolean{return ts.isStringLiteral(node.moduleSpecifier)&&node.moduleSpecifier.text==="node:util"&&JSON.stringify(importedNames(node.importClause).sort())===JSON.stringify(["utilTypes"]);}
 function auditNonAdapterSource(source:string,allowPromiseConstructorInspection=false):string[]{
