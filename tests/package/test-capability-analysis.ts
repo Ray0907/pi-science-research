@@ -309,6 +309,7 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
         result = join(result, base.properties.get(key) ?? base.unknownProperty ?? EMPTY);
         if ((base.flags & Capability.globalRoot) !== 0) {
           if (key === "fetch" || key === "WebSocket") result = join(result, valueOf(Capability.network));
+          if(key==="eval"||key==="Function")result=join(result,valueOf(Capability.codegen));
           if (key === "process") result = join(result, valueOf(Capability.processRoot | Capability.processObject));
           if (key === "module") result = join(result, valueOf(Capability.child));
         }
@@ -414,6 +415,7 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
     for (const key of keys) {
       item = join(item, sourceValue.properties.get(key) ?? sourceValue.unknownProperty ?? EMPTY);
       if ((sourceValue.flags & Capability.globalRoot) !== 0 && (key === "fetch" || key === "WebSocket")) item = join(item, valueOf(Capability.network));
+      if((sourceValue.flags&Capability.globalRoot)!==0&&(key==="eval"||key==="Function"))item=join(item,valueOf(Capability.codegen));
       if ((sourceValue.flags & Capability.globalRoot) !== 0 && key === "process") item = join(item, valueOf(Capability.processRoot | Capability.processObject));
       if ((sourceValue.flags & Capability.globalRoot) !== 0 && key === "module") item = join(item, valueOf(Capability.child));
       if ((sourceValue.flags & Capability.processRoot) !== 0 && key === "getBuiltinModule") item = join(item, valueOf(Capability.child));

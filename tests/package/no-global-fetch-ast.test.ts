@@ -26,6 +26,23 @@ describe("production acquisition network capability policy",()=>{
   'import vm from "node:vm";const run=vm["runIn"+"ThisContext"];run("x")',
   'import vm from "node:vm";const {Script:S}=vm;new S("x")',
  ];for(const source of vmDenied)expect(audit(source).length,source).toBeGreaterThan(0);
+ const globalCodegenDenied=[
+  'globalThis.eval("fetch(\\"x\\")")',
+  'globalThis.Function("return fetch(\\"x\\")")()',
+  'globalThis["eval"]("fetch(\\"x\\")")',
+  'globalThis[`Function`]("return fetch(\\"x\\")")()',
+  'globalThis["ev"+"al"]("fetch(\\"x\\")")',
+  'const key="ev"+"al";globalThis[key]("fetch(\\"x\\")")',
+  'const member="eval";globalThis[member]("fetch(\\"x\\")")',
+  'const root=globalThis;const execute=root.eval;execute("fetch(\\"x\\")")',
+  'const {eval:execute}=globalThis;execute("fetch(\\"x\\")")',
+  'let execute;({Function:execute}=globalThis);execute("return fetch(\\"x\\")")()',
+  'let build;build=globalThis.Function;build("return fetch(\\"x\\")")()',
+  'const box={execute:globalThis.eval};box.execute("fetch(\\"x\\")")',
+  'function execute(){return globalThis.eval}execute()("fetch(\\"x\\")")',
+  'global.eval("fetch(\\"x\\")")',
+  'global.Function("return fetch(\\"x\\")")()',
+ ];for(const source of globalCodegenDenied)expect(audit(source).length,source).toBeGreaterThan(0);const unknownCodegen=createCapabilityAnalysis('globalThis[unknownKey]("x")',"src/acquisition/fixture.ts");let unknownTarget:ts.Expression|undefined;const findUnknown=(node:ts.Node):void=>{if(ts.isCallExpression(node))unknownTarget=node.expression;ts.forEachChild(node,findUnknown);};findUnknown(unknownCodegen.file);expect(unknownTarget).toBeDefined();expect(unknownCodegen.contains(unknownCodegen.value(unknownTarget!),Capability.codegen)).toBe(true);
  const reflectiveDenied=[
   'const get=Object.getOwnPropertyDescriptor;const d=get(globalThis,"fetch");d.value("x")',
   'const get=Object.getOwnPropertyDescriptor;const d=get.apply(Object,[globalThis,"fetch"]);d.value("x")',
@@ -77,5 +94,5 @@ describe("production acquisition network capability policy",()=>{
  ];
  for(const source of reflectiveDenied)expect(audit(source).length,source).toBeGreaterThan(0);
  const maxDepthTunnel=`const tunnel=${Array.from({length:40},()=>"{value:").join("")}globalThis${Array.from({length:40},()=>"}").join("")};const escaped=tunnel${Array.from({length:40},()=>".value").join("")}.fetch;escaped("x")`;expect(audit(maxDepthTunnel).length).toBeGreaterThan(0);const maxNodes=`const values=[${Array.from({length:4_200},(_,index)=>index).join(",")}];const f=values[unknownKey];f()`;expect(audit(maxNodes).length).toBeGreaterThan(0);const maxPasses=`let a0=globalThis;${Array.from({length:80},(_,index)=>`let a${index+1}=a${index};`).join("")}a80.fetch("x")`;expect(audit(maxPasses).length).toBeGreaterThan(0);const maxStrings=`let member="fetch";${Array.from({length:40},(_,index)=>`member="member${index}";`).join("")}globalThis[member]("x")`;expect(audit(maxStrings).length).toBeGreaterThan(0);
- for(const source of ['client.fetch(value);adapter.fetch(value);','const object={safe(){}};object["safe"]();object[`safe`]();const member="sa"+"fe";object[member]();','const object={safe(){}};const get=Object.getOwnPropertyDescriptor;get.apply(Object,[object,"safe"])!.value();get.apply(Object,{0:object,1:"safe",length:2})!.value();get.call(Object,object,"safe")!.value();get.bind(Object,object,"safe")()!.value();','const d=Object.getOwnPropertyDescriptor(Promise.prototype,"then");d?.value.call(Promise.resolve(),()=>{});','const d=Object.getOwnPropertyDescriptor(signal,"aborted");void d?.value;','import type {RequestOptions} from "node:https";','import {type Worker} from "node:worker_threads";','import type {Script} from "node:vm";','import {type Context} from "vm";','export type {Context} from "node:vm";'])expect(audit(source),source).toEqual([]);const allowed='import {Resolver} from "node:dns/promises";import http from "node:http";import https from "node:https";import tls from "node:tls";http.request({});https.request({});tls.checkServerIdentity("x",{});new Resolver().resolve4("x",()=>{});';expect(audit(allowed,adapter)).toEqual([]);expect(audit('import net from "node:net";net.connect(1);',adapter).length).toBeGreaterThan(0);expect(audit('import http from "node:http";http.get("x");',adapter).length).toBeGreaterThan(0);expect(audit('import zlib from "node:zlib";zlib.gunzipSync(value);').length).toBeGreaterThan(0);});
+ for(const source of ['client.fetch(value);adapter.fetch(value);','const object={eval(){},Function(){return()=>{}}};object.eval();object["eval"]();object[`Function`]()();const key="Func"+"tion";object[key]()();','const object={safe(){}};object["safe"]();object[`safe`]();const member="sa"+"fe";object[member]();','const object={safe(){}};const get=Object.getOwnPropertyDescriptor;get.apply(Object,[object,"safe"])!.value();get.apply(Object,{0:object,1:"safe",length:2})!.value();get.call(Object,object,"safe")!.value();get.bind(Object,object,"safe")()!.value();','const d=Object.getOwnPropertyDescriptor(Promise.prototype,"then");d?.value.call(Promise.resolve(),()=>{});','const d=Object.getOwnPropertyDescriptor(signal,"aborted");void d?.value;','import type {RequestOptions} from "node:https";','import {type Worker} from "node:worker_threads";','import type {Script} from "node:vm";','import {type Context} from "vm";','export type {Context} from "node:vm";'])expect(audit(source),source).toEqual([]);const allowed='import {Resolver} from "node:dns/promises";import http from "node:http";import https from "node:https";import tls from "node:tls";http.request({});https.request({});tls.checkServerIdentity("x",{});new Resolver().resolve4("x",()=>{});';expect(audit(allowed,adapter)).toEqual([]);expect(audit('import net from "node:net";net.connect(1);',adapter).length).toBeGreaterThan(0);expect(audit('import http from "node:http";http.get("x");',adapter).length).toBeGreaterThan(0);expect(audit('import zlib from "node:zlib";zlib.gunzipSync(value);').length).toBeGreaterThan(0);});
 });
