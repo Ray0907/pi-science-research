@@ -116,7 +116,7 @@ function join(left: AbstractValue, right: AbstractValue, depth = 0): AbstractVal
 
 function moduleKind(specifier: string): "network" | "child" | "fixture" | "safe" {
   const bare = specifier.startsWith("node:") ? specifier.slice(5) : specifier;
-  const network = ["http", "https", "http2", "net", "tls", "dns", "dns/promises", "dgram", "undici", "node-fetch", "cross-fetch", "ws", "axios", "got", "superagent", "openai", "@aws-sdk"];
+  const network = ["http", "https", "http2", "net", "tls", "dns", "dns/promises", "dgram", "undici", "node-fetch", "cross-fetch", "ws", "axios", "got", "superagent", "openai", "@aws-sdk", "proxy-agent", "http-proxy-agent", "https-proxy-agent", "socks-proxy-agent"];
   if (network.some((name) => bare === name || bare.startsWith(`${name}/`))) return "network";
   if (["child_process", "worker_threads", "cluster", "module"].some((name) => bare === name || bare.startsWith(`${name}/`))) return "child";
   if (/\/(?:acquisition\/)?contracts\.(?:js|ts)$/u.test(specifier)) return "fixture";

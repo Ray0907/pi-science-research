@@ -53,3 +53,32 @@ export { CitationError, assignCitationMappings, assignCitationMappingsFromRecord
 export type {
   CitationErrorCode, CitationBinding, BibliographyMetadataProjection, CitationOptions,
 } from "./evidence/citations.js";
+
+export {
+  AcquisitionContractError, createAcademicCandidate, createAcademicDocument,
+  createAcquisitionTrace, validateAcademicAcquisitionResult,
+} from "./acquisition/contracts.js";
+export type {
+  AcquisitionProvider, AcquisitionOperation, AcquisitionAccessLevel, AcquisitionProvenanceStatus,
+  AcademicAuthor, AcademicCandidate, AcademicCandidateGroup, AcademicDocumentSection, AcademicDocument,
+  AcquisitionTraceUrl, AcquisitionTraceRedirect, AcquisitionTraceSettlement, AcquisitionTraceSettlementCode,
+  AcquisitionTraceWarning, AcquisitionTraceWarningCode, AcquisitionTrace, AcquisitionFailure,
+  AcademicSearchInput, AcademicFetchInput, AcademicPartitionSummary, AcademicAcquisitionResult,
+  AcquisitionProvenanceSink, AcademicAcquisitionOptions,
+} from "./acquisition/contracts.js";
+export { AcademicAcquisitionError, createAcademicAcquisitionCallCapabilities } from "./acquisition/coordinator.js";
+export type {
+  AcademicAcquisitionCallCapabilitiesDescriptor, AcademicAcquisitionCallCapabilities, AcademicAcquisitionClient,
+} from "./acquisition/coordinator.js";
+
+import type { AcademicAcquisitionOptions } from "./acquisition/contracts.js";
+import {
+  createAcademicAcquisitionClient as createAcademicAcquisitionClientDirect,
+  createDefaultAcademicAcquisitionDependencyFactoryInternal,
+  type AcademicAcquisitionClient,
+} from "./acquisition/coordinator.js";
+
+/** Creates a production scholarly-acquisition client with the package-owned secure dependency graph. */
+export function createAcademicAcquisitionClient(options?: AcademicAcquisitionOptions): AcademicAcquisitionClient {
+  return createAcademicAcquisitionClientDirect(options, createDefaultAcademicAcquisitionDependencyFactoryInternal());
+}
