@@ -49,6 +49,7 @@ const MAX_NODES = 4_096;
 const MAX_AST_DEPTH = 128;
 const MAX_PASSES = 64;
 const MAX_STRINGS = 32;
+const MAX_INTROSPECTOR_ARGUMENTS = 8;
 const ALL_CAPABILITIES = TOP_CAPABILITY_FLAGS;
 const TOP_LEAF: AbstractValue = Object.freeze({flags: TOP_CAPABILITY_FLAGS, strings: Object.freeze(new Set<string>()), unknownString: true, properties: Object.freeze(new Map<string, AbstractValue>()), unknownProperty: null});
 const TOP: AbstractValue = Object.freeze({flags: TOP_CAPABILITY_FLAGS, strings: Object.freeze(new Set<string>()), unknownString: true, properties: Object.freeze(new Map<string, AbstractValue>()), unknownProperty: TOP_LEAF});
@@ -293,8 +294,9 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
       return valueOf(flags, [], false, properties, unknownProperty);
     }
     if (ts.isArrayLiteralExpression(value)) {
-      const properties = new Map<string, AbstractValue>(); let flags = 0, unknownProperty: AbstractValue | null = null;
-      value.elements.forEach((item, index) => {if (ts.isSpreadElement(item)) {const spread = evaluate(item.expression, depth + 1); flags |= spread.flags; unknownProperty = join(unknownProperty ?? EMPTY, spread);} else {const entry = evaluate(item, depth + 1); flags |= entry.flags; properties.set(String(index), entry);}});
+      const properties = new Map<string, AbstractValue>(); let flags = 0, unknownProperty: AbstractValue | null = null,exactLength=true;
+      value.elements.forEach((item, index) => {if(ts.isSpreadElement(item)){const spread=evaluate(item.expression,depth+1);flags|=spread.flags;unknownProperty=join(unknownProperty??EMPTY,spread);exactLength=false;}else if(ts.isOmittedExpression(item)){exactLength=false;}else{const entry=evaluate(item,depth+1);flags|=entry.flags;properties.set(String(index),entry);}});
+      if(exactLength)properties.set("length",valueOf(0,[String(value.elements.length)]));
       return valueOf(flags, [], false, properties, unknownProperty);
     }
     const extract = (base: AbstractValue, keys: readonly string[], unknownKey: boolean): AbstractValue => {
@@ -331,14 +333,11 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
     }
     if (ts.isAwaitExpression(value)) return evaluate(value.expression, depth + 1);
     if (ts.isCallExpression(value)) {
-      if (ts.isPropertyAccessExpression(value.expression) && value.expression.name.text === "bind") {
-        const base = evaluate(value.expression.expression, depth + 1);
-        if ((base.flags & (Capability.introspector | Capability.codegen | Capability.network | Capability.child)) !== 0) return base;
-      }
-      const introspectorCall = (callee: AbstractValue, args: readonly ts.Expression[]): AbstractValue | null => {
+      const denseArguments=(array:AbstractValue):readonly AbstractValue[]|null=>{if(array.flags===TOP_CAPABILITY_FLAGS||(array.flags&Capability.analysisBound)!==0||array.unknownProperty!==null)return null;const lengthValue=array.properties.get("length");if(!lengthValue||lengthValue.unknownString||lengthValue.strings.size!==1)return null;const [rawLength]=lengthValue.strings,length=Number(rawLength);if(!Number.isSafeInteger(length)||length<0||length>MAX_INTROSPECTOR_ARGUMENTS||String(length)!==rawLength||array.properties.size!==length+1)return null;const output:AbstractValue[]=[];for(let index=0;index<length;index++){const item=array.properties.get(String(index));if(!item)return null;output.push(item);}return output;};
+      const boundArguments=(callee:AbstractValue):readonly AbstractValue[]|null=>{const lengthValue=callee.properties.get("[[boundLength]]");if(!lengthValue)return[];if(lengthValue.unknownString||lengthValue.strings.size!==1)return null;const [rawLength]=lengthValue.strings,length=Number(rawLength);if(!Number.isSafeInteger(length)||length<0||length>MAX_INTROSPECTOR_ARGUMENTS||String(length)!==rawLength)return null;const output:AbstractValue[]=[];for(let index=0;index<length;index++){const item=callee.properties.get(`[[bound:${index}]]`);if(!item)return null;output.push(item);}return output;};
+      const introspectorCall = (callee: AbstractValue, args: readonly AbstractValue[]): AbstractValue | null => {
         if (callee.flags===TOP_CAPABILITY_FLAGS||(callee.flags&Capability.introspector)===0)return null;
-        const source = args[0] ? evaluate(args[0], depth + 1) : OPAQUE_DANGER;
-        const key = args[1] ? evaluate(args[1], depth + 1) : valueOf(0, [], true);
+        const bound=boundArguments(callee);if(bound===null||bound.length+args.length>MAX_INTROSPECTOR_ARGUMENTS)return OPAQUE_DANGER;const logical=[...bound,...args],source=logical[0]??OPAQUE_DANGER,key=logical[1]??valueOf(0,[],true);
         const extracted = extract(source, [...key.strings], key.unknownString || key.strings.size === 0);
         if (callee.strings.has("introspector:get")) return extracted;
         if (callee.strings.has("introspector:prototype")) return derivedUnknown(source);
@@ -355,11 +354,14 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
         }
         return OPAQUE_DANGER;
       };
+      if(ts.isPropertyAccessExpression(value.expression)&&value.expression.name.text==="bind"){
+        const base=evaluate(value.expression.expression,depth+1);if((base.flags&(Capability.introspector|Capability.codegen|Capability.network|Capability.child))!==0){if(base.flags===TOP_CAPABILITY_FLAGS||value.arguments.some(ts.isSpreadElement)||value.arguments.length===0||value.arguments.length-1>MAX_INTROSPECTOR_ARGUMENTS)return OPAQUE_DANGER;const preArguments=value.arguments.slice(1).map(argument=>evaluate(argument,depth+1)),properties=new Map(base.properties);properties.set("[[boundLength]]",valueOf(0,[String(preArguments.length)]));preArguments.forEach((argument,index)=>properties.set(`[[bound:${index}]]`,argument));return valueOf(base.flags,base.strings,base.unknownString,properties,base.unknownProperty);}}
+      if(ts.isPropertyAccessExpression(value.expression)&&value.expression.name.text==="apply"){
+        const base=evaluate(value.expression.expression,depth+1);if((base.flags&(Capability.introspector|Capability.codegen))!==0){if(value.arguments.length!==2||value.arguments.some(ts.isSpreadElement))return OPAQUE_DANGER;const logical=denseArguments(evaluate(value.arguments[1]!,depth+1));if(logical===null)return OPAQUE_DANGER;const applied=introspectorCall(base,logical);return applied??OPAQUE_DANGER;}}
       if (ts.isPropertyAccessExpression(value.expression) && value.expression.name.text === "call") {
-        const called = introspectorCall(evaluate(value.expression.expression, depth + 1), value.arguments.slice(1));
-        if (called) return called;
+        const base=evaluate(value.expression.expression,depth+1);if((base.flags&Capability.introspector)!==0){if(value.arguments.some(ts.isSpreadElement))return OPAQUE_DANGER;const called=introspectorCall(base,value.arguments.slice(1).map(argument=>evaluate(argument,depth+1)));if(called)return called;}
       }
-      const inspected = introspectorCall(evaluate(value.expression, depth + 1), value.arguments);
+      const inspected = value.arguments.some(ts.isSpreadElement)?((evaluate(value.expression,depth+1).flags&Capability.introspector)!==0?OPAQUE_DANGER:null):introspectorCall(evaluate(value.expression, depth + 1), value.arguments.map(argument=>evaluate(argument,depth+1)));
       if (inspected) return inspected;
       if (ts.isPropertyAccessExpression(value.expression) && value.expression.name.text === "slice") {
         const base = evaluate(value.expression.expression, depth + 1);
