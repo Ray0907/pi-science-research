@@ -4,9 +4,11 @@ import {
   type ResearchStatusReader,
 } from "./commands/status.js";
 import { readFoundationStatus } from "./status-reader.js";
+import {createDefaultAcademicToolDependencies,registerAcademicTools,type AcademicToolDependencies} from "./tools/academic.js";
 
 export interface ResearchExtensionDependencies {
-  readStatus?: ResearchStatusReader;
+  readonly readStatus?: ResearchStatusReader;
+  readonly academicTools?: AcademicToolDependencies;
 }
 
 export default function registerResearchExtension(
@@ -17,4 +19,5 @@ export default function registerResearchExtension(
     description: "Verify and show a scientific research run status",
     handler: createResearchStatusHandler(dependencies.readStatus ?? readFoundationStatus),
   });
+  registerAcademicTools(pi,dependencies.academicTools??createDefaultAcademicToolDependencies());
 }

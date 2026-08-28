@@ -129,6 +129,7 @@ describe("Pi package manifest", () => {
 describe("research-status command", () => {
   async function loadCommand(readStatus: (request: { cwd: string; rootPath: string | null }) => Promise<unknown>) {
     const { default: registerResearchExtension } = await import("../extensions/research/index.js");
+    const {createAcademicToolDependencies}=await import("../extensions/research/tools/academic.js");
     const registrations: Array<{
       name: string;
       command: { handler: (args: string, context: unknown) => Promise<unknown> };
@@ -146,7 +147,7 @@ describe("research-status command", () => {
         },
       },
     );
-    registerResearchExtension(api as never, { readStatus } as never);
+    registerResearchExtension(api as never, { readStatus,academicTools:createAcademicToolDependencies({enabled:false}) } as never);
     expect(registrations.map(({ name }) => name)).toEqual(["research-status"]);
     return registrations[0]!.command.handler;
   }
