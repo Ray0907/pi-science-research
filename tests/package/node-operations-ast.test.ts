@@ -309,6 +309,7 @@ function auditAdapter(source:string):string[]{
   return errors;
 }
 
+function isFullyErasedTypeOnlyImport(node:ts.ImportDeclaration):boolean{const clause=node.importClause;if(!clause)return false;if(clause.isTypeOnly)return true;if(clause.name||!clause.namedBindings||!ts.isNamedImports(clause.namedBindings)||clause.namedBindings.elements.length===0)return false;return clause.namedBindings.elements.every((item)=>item.isTypeOnly);}
 function isNetworkCapableSpecifier(specifier:string):boolean{const normalized=specifier.startsWith("node:")?specifier.slice(5):specifier;return["http","https","http2","net","tls","dgram","dns","child_process","worker_threads","vm","undici"].some((base)=>normalized===base||normalized.startsWith(`${base}/`))||isForbiddenPackage(normalized);}
 function exactUtilImport(node:ts.ImportDeclaration):boolean{return ts.isStringLiteral(node.moduleSpecifier)&&node.moduleSpecifier.text==="node:util"&&JSON.stringify(importedNames(node.importClause).sort())===JSON.stringify(["utilTypes"]);}
 function auditNonAdapterSource(source:string,allowPromiseConstructorInspection=false):string[]{
@@ -317,7 +318,7 @@ function auditNonAdapterSource(source:string,allowPromiseConstructorInspection=f
   if(utilImports>1)errors.push("duplicate util import");
   const visit=(node:ts.Node):void=>{
     if(ts.isIdentifier(node)&&node.text==="utilTypes"&&!ts.isImportSpecifier(node.parent)){const outer=outerTransparent(node),member=ts.isPropertyAccessExpression(outer.parent)&&outer.parent.expression===outer?outer.parent:null,directCall=member!==null&&["isProxy","isNativeError"].includes(member.name.text)&&ts.isCallExpression(member.parent)&&member.parent.expression===member,capturedPromisePredicate=allowPromiseConstructorInspection&&member!==null&&((member.name.text==="isPromise"&&insideVariableInitializer(member,"NATIVE_IS_PROMISE"))||(member.name.text==="isProxy"&&insideVariableInitializer(member,"NATIVE_IS_PROXY")));if(!directCall&&!capturedPromisePredicate)errors.push("util binding context");}
-    if(ts.isImportDeclaration(node)&&ts.isStringLiteral(node.moduleSpecifier)&&!isRelativeSpecifier(node.moduleSpecifier.text)&&!exactUtilImport(node)&&!exactSchedulerImport(node))errors.push("production import denied");
+    if(ts.isImportDeclaration(node)&&ts.isStringLiteral(node.moduleSpecifier)&&!isFullyErasedTypeOnlyImport(node)&&!isRelativeSpecifier(node.moduleSpecifier.text)&&!exactUtilImport(node)&&!exactSchedulerImport(node))errors.push("production import denied");
     if(ts.isExportDeclaration(node)&&node.moduleSpecifier&&ts.isStringLiteral(node.moduleSpecifier)&&!isRelativeSpecifier(node.moduleSpecifier.text))errors.push("production export denied");
     if(ts.isImportEqualsDeclaration(node))errors.push("production import equals denied");
     if(ts.isBindingElement(node)){const key=node.propertyName??node.name;if(ts.isIdentifier(key)&&key.text==="constructor")errors.push("constructor access");}
@@ -338,7 +339,7 @@ function auditTestNetworkSource(source:string,allowPromiseConstructorInspection=
   const file=ts.createSourceFile("unit.ts",source,ts.ScriptTarget.Latest,true,ts.ScriptKind.TS);const errors:string[]=constructorTaintAuditErrors(file,allowPromiseConstructorInspection);
   const visit=(node:ts.Node):void=>{
     if(ts.isBindingElement(node)){const key=node.propertyName??node.name;if(ts.isIdentifier(key)&&key.text==="constructor")errors.push("constructor access");}
-    if((ts.isImportDeclaration(node)||ts.isExportDeclaration(node))&&node.moduleSpecifier&&ts.isStringLiteral(node.moduleSpecifier)&&isNetworkCapableSpecifier(node.moduleSpecifier.text))errors.push("test network import denied");
+    if(ts.isImportDeclaration(node)&&ts.isStringLiteral(node.moduleSpecifier)&&isNetworkCapableSpecifier(node.moduleSpecifier.text)&&!isFullyErasedTypeOnlyImport(node))errors.push("test network import denied");if(ts.isExportDeclaration(node)&&node.moduleSpecifier&&ts.isStringLiteral(node.moduleSpecifier)&&isNetworkCapableSpecifier(node.moduleSpecifier.text))errors.push("test network export denied");
     if(ts.isImportEqualsDeclaration(node))errors.push("test import equals denied");
     if(ts.isCallExpression(node)&&node.expression.kind===ts.SyntaxKind.ImportKeyword){const argument=node.arguments[0];if(!argument||!ts.isStringLiteral(argument)||isNetworkCapableSpecifier(argument.text))errors.push("test dynamic network import denied");}
     if(ts.isIdentifier(node)&&globalObjectIdentifiers.has(node.text)&&!isPropertyName(node)&&!isExactTestGlobalUrl(node))errors.push("test global object denied");
@@ -365,7 +366,7 @@ function auditAcquisitionUnitSource(source:string,name="fixture.ts"):string[]{
   const errors:string[]=auditTestNetworkSource(source,["tests/acquisition/crossref.test.ts","tests/acquisition/scheduler.test.ts"].some(suffix=>name.replaceAll("\\","/").endsWith(suffix))).map((error)=>`${name}: ${error}`);const factoryBindings=new Map<string,readonly number[]>();const factoryNamespaces=new Set<string>();
   for(const statement of file.statements){
     if(!ts.isImportDeclaration(statement)||!ts.isStringLiteral(statement.moduleSpecifier))continue;
-    if(["node:http","node:https","node:dns","node:dns/promises","node:tls"].includes(statement.moduleSpecifier.text))errors.push(`${name}: network builtin import`);
+    if(["node:http","node:https","node:dns","node:dns/promises","node:tls"].includes(statement.moduleSpecifier.text)&&!isFullyErasedTypeOnlyImport(statement))errors.push(`${name}: network builtin import`);
     const acquisitionModule=statement.moduleSpecifier.text.endsWith("/node-pinned-hop-internal.js")||statement.moduleSpecifier.text.endsWith("/request-deadline-internal.js");
     if(acquisitionModule&&statement.importClause?.name)errors.push(`${name}: default acquisition import`);
     const bindings=statement.importClause?.namedBindings;
@@ -593,4 +594,6 @@ describe("Node operations adapter audit",()=>{
     expect(auditAcquisitionUnitSource('import {describe} from "vitest";void describe;')).toEqual([]);
     expect(auditAcquisitionUnitSource(`import {createNodeRuntimeCapabilitiesInternal as make} from "${modulePath}";make(fakeOps);`)).toEqual([]);
   });
+
+  test("allows only fully erased type-only network imports in Node operation audits",()=>{for(const source of ['import type {RequestOptions} from "node:https";','import {type Socket} from "node:net";']){expect(auditNonAdapterSource(source),source).toEqual([]);expect(auditTestNetworkSource(source),source).toEqual([]);}for(const source of ['import {type Socket,connect} from "node:net";void connect;','import net,{type Socket} from "node:net";void net;','export {type Socket} from "node:net";','import network=require("node:net");void network;']){expect(auditNonAdapterSource(source),source).not.toEqual([]);expect(auditTestNetworkSource(source),source).not.toEqual([]);}});
 });

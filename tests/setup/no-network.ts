@@ -16,19 +16,21 @@ type Guard=Readonly<{installed:readonly string[];stubs:Readonly<Record<string,Fu
 type State=Readonly<{forbidden:(...arguments_:unknown[])=>never;guard:Guard;attemptsAreZero:()=>boolean}>;
 const stateKey=Symbol.for("pi-science-research.test-network-state");
 const globalRecord=globalThis as typeof globalThis&{[stateKey]?:State;__PI_SCIENCE_TEST_NETWORK_GUARD__?:Guard};
-const defineProperty=Object.defineProperty;const freeze=Object.freeze;const getOwnPropertyNames=Object.getOwnPropertyNames;
+const defineProperty=Object.defineProperty;const freeze=Object.freeze;const getOwnPropertyNames=Object.getOwnPropertyNames;const getOwnPropertyDescriptor=Object.getOwnPropertyDescriptor;
+export function createIsolatedNetworkStubInternal():Readonly<{stub:(...arguments_:unknown[])=>never;attempts:()=>number}>{let attempts=0;const stub=function(..._arguments:unknown[]):never{if(!Number.isSafeInteger(attempts)||attempts>=Number.MAX_SAFE_INTEGER)throw new Error("TEST_NETWORK_FORBIDDEN");attempts+=1;throw new Error("TEST_NETWORK_FORBIDDEN");};return freeze({stub,attempts:()=>attempts});}
+export function installReachableHttp2SessionStubsInternal(module:object,stub:Function):readonly string[]{const patched:string[]=[];for(const exportName of getOwnPropertyNames(module)){const exported=getOwnPropertyDescriptor(module,exportName)?.value;if((typeof exported!=="function"&&typeof exported!=="object")||exported===null)continue;const prototype=getOwnPropertyDescriptor(exported,"prototype")?.value;if(typeof prototype!=="object"||prototype===null)continue;for(const name of ["request","ping","settings"] as const){const descriptor=getOwnPropertyDescriptor(prototype,name);if(!descriptor||typeof descriptor.value!=="function")continue;defineProperty(prototype,name,{...descriptor,value:stub,writable:false,configurable:false});patched.push(`http2.session.${name}`);}}return freeze(patched);}
 let state=globalRecord[stateKey];
 if(state===undefined){
- let attempts=0;const forbidden=function(..._arguments:unknown[]):never{if(!Number.isSafeInteger(attempts)||attempts>=Number.MAX_SAFE_INTEGER)throw new Error("TEST_NETWORK_FORBIDDEN");attempts+=1;throw new Error("TEST_NETWORK_FORBIDDEN");};
+ const isolated=createIsolatedNetworkStubInternal(),forbidden=isolated.stub;
  const stubRecord:Record<string,Function>=Object.create(null) as Record<string,Function>;for(const name of installed)stubRecord[name]=forbidden;
- const guard=freeze({installed,stubs:freeze(stubRecord)}),next=freeze({forbidden,guard,attemptsAreZero:()=>attempts===0});
+ const guard=freeze({installed,stubs:freeze(stubRecord)}),next=freeze({forbidden,guard,attemptsAreZero:()=>isolated.attempts()===0});
  defineProperty(globalRecord,stateKey,{value:next,writable:false,enumerable:false,configurable:false});defineProperty(globalRecord,"__PI_SCIENCE_TEST_NETWORK_GUARD__",{value:guard,writable:false,enumerable:false,configurable:false});state=next;
  const install=(target:object,name:string):void=>{defineProperty(target,name,{value:forbidden,writable:false,enumerable:true,configurable:false});};
- install(globalThis,"fetch");install(globalThis,"WebSocket");install(http,"request");install(http,"get");install(https,"request");install(https,"get");install(http2,"connect");install(net,"connect");install(net,"createConnection");install(tls,"connect");install(dgram,"createSocket");
+ install(globalThis,"fetch");install(globalThis,"WebSocket");install(http,"request");install(http,"get");install(https,"request");install(https,"get");installReachableHttp2SessionStubsInternal(http2,forbidden);const http2ClientFactories=getOwnPropertyNames(http2).filter((name)=>name==="connect"||/^create.*client/iu.test(name));if(http2ClientFactories.length!==1||http2ClientFactories[0]!=="connect")throw new Error("TEST_NETWORK_SETUP_INVALID");install(http2,"connect");install(net,"connect");install(net,"createConnection");install(tls,"connect");install(dgram,"createSocket");
  for(const name of ["bind","connect","send"] as const)install(dgram.Socket.prototype,name);
  const dnsNames=["lookup","lookupService","resolve","resolve4","resolve6","resolveAny","resolveCaa","resolveCname","resolveMx","resolveNaptr","resolveNs","resolvePtr","resolveSoa","resolveSrv","resolveTxt","reverse"] as const;
  for(const name of dnsNames){install(dns,name);install(dnsPromises,name);}
  for(const prototype of [dns.Resolver.prototype,dnsPromises.Resolver.prototype])for(const name of getOwnPropertyNames(prototype))if(name==="reverse"||name.startsWith("resolve"))install(prototype,name);
  syncBuiltinESMExports();
 }
-afterAll(()=>{if(!state.attemptsAreZero())throw new Error("TEST_NETWORK_FORBIDDEN");process.stdout.write("network-attempts=0\n");});
+afterAll(()=>{if(!state!.attemptsAreZero())throw new Error("TEST_NETWORK_FORBIDDEN");process.stdout.write("network-attempts=0\n");});
