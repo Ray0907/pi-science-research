@@ -7,8 +7,12 @@ export const Capability = {
   child: 1 << 3,
   fixture: 1 << 4,
   processObject: 1 << 5,
+  introspector: 1 << 6,
+  codegen: 1 << 7,
+  analysisBound: 1 << 8,
 } as const;
-export const ALL_CAPABILITY_FLAGS = Capability.globalRoot | Capability.processRoot | Capability.network | Capability.child | Capability.fixture | Capability.processObject;
+export const ALL_CAPABILITY_FLAGS = Capability.globalRoot | Capability.processRoot | Capability.network | Capability.child | Capability.fixture | Capability.processObject | Capability.introspector | Capability.codegen | Capability.analysisBound;
+export const TOP_CAPABILITY_FLAGS = ALL_CAPABILITY_FLAGS & ~Capability.analysisBound;
 
 export interface AbstractValue {
   readonly flags: number;
@@ -42,11 +46,14 @@ const EMPTY: AbstractValue = Object.freeze({
 });
 const MAX_DEPTH = 8;
 const MAX_NODES = 4_096;
+const MAX_AST_DEPTH = 128;
 const MAX_PASSES = 64;
 const MAX_STRINGS = 32;
-const ALL_CAPABILITIES = ALL_CAPABILITY_FLAGS;
-const TOP_LEAF: AbstractValue = Object.freeze({flags: ALL_CAPABILITIES, strings: Object.freeze(new Set<string>()), unknownString: true, properties: Object.freeze(new Map<string, AbstractValue>()), unknownProperty: null});
-const TOP: AbstractValue = Object.freeze({flags: ALL_CAPABILITIES, strings: Object.freeze(new Set<string>()), unknownString: true, properties: Object.freeze(new Map<string, AbstractValue>()), unknownProperty: TOP_LEAF});
+const ALL_CAPABILITIES = TOP_CAPABILITY_FLAGS;
+const TOP_LEAF: AbstractValue = Object.freeze({flags: TOP_CAPABILITY_FLAGS, strings: Object.freeze(new Set<string>()), unknownString: true, properties: Object.freeze(new Map<string, AbstractValue>()), unknownProperty: null});
+const TOP: AbstractValue = Object.freeze({flags: TOP_CAPABILITY_FLAGS, strings: Object.freeze(new Set<string>()), unknownString: true, properties: Object.freeze(new Map<string, AbstractValue>()), unknownProperty: TOP_LEAF});
+const BOUND: AbstractValue = Object.freeze({flags: Capability.analysisBound, strings: Object.freeze(new Set<string>()), unknownString: true, properties: Object.freeze(new Map<string, AbstractValue>()), unknownProperty: null});
+const OPAQUE_DANGER: AbstractValue = Object.freeze({flags: Capability.globalRoot | Capability.processRoot | Capability.network | Capability.child | Capability.codegen, strings: Object.freeze(new Set<string>()), unknownString: true, properties: Object.freeze(new Map<string, AbstractValue>()), unknownProperty: null});
 
 export function isFullyErasedTypeOnlyImport(node: ts.ImportDeclaration): boolean {
   const clause = node.importClause;
@@ -142,8 +149,18 @@ function staticPropertyName(name: ts.PropertyName, evaluate: (expression: ts.Exp
 
 export function createCapabilityAnalysis(source: string, relative: string): CapabilityAnalysis {
   const kind = relative.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
-  const file = ts.createSourceFile(relative, source, ts.ScriptTarget.Latest, true, kind);
-  const bindings = new Map<string, AbstractValue>();
+  const virtualName = `/capability-audit/${relative.replaceAll("\\", "/")}`;
+  const options: ts.CompilerOptions = {target:ts.ScriptTarget.Latest,module:ts.ModuleKind.ESNext,noResolve:true};
+  const host=ts.createCompilerHost(options),originalGetSourceFile=host.getSourceFile.bind(host);
+  host.getSourceFile=(fileName,languageVersion,onError,shouldCreateNewSourceFile)=>fileName===virtualName?ts.createSourceFile(fileName,source,languageVersion,true,kind):originalGetSourceFile(fileName,languageVersion,onError,shouldCreateNewSourceFile);
+  host.fileExists=fileName=>fileName===virtualName||ts.sys.fileExists(fileName);
+  host.readFile=fileName=>fileName===virtualName?source:ts.sys.readFile(fileName);
+  const program=ts.createProgram([virtualName],options,host),file=program.getSourceFile(virtualName)!;
+  const checker=program.getTypeChecker(),bindings = new Map<string, AbstractValue>();
+  const localBindingKey=(identifier:ts.Identifier):string|null=>{const symbol=checker.getSymbolAtLocation(identifier),declaration=symbol?.declarations?.find(item=>item.getSourceFile()===file);return declaration?`${identifier.text}@${declaration.pos}:${declaration.end}`:null;};
+  const getBinding=(identifier:ts.Identifier):AbstractValue|undefined=>{const key=localBindingKey(identifier);return key===null?undefined:bindings.get(key);};
+  const hasBinding=(identifier:ts.Identifier):boolean=>{const key=localBindingKey(identifier);return key!==null&&bindings.has(key);};
+  const setBinding=(identifier:ts.Identifier,value:AbstractValue):void=>{const key=localBindingKey(identifier)??`ambient:${identifier.text}`;bindings.set(key,value);};
   const operations: AnalysisOperation[] = [];
   const functionDeclarations = new Map<string, ts.FunctionDeclaration>();
 
@@ -151,21 +168,21 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
     if (!ts.isStringLiteral(node.moduleSpecifier) || isFullyErasedTypeOnlyImport(node)) return;
     const module = moduleValue(node.moduleSpecifier.text);
     const clause = node.importClause;
-    if (clause?.name) bindings.set(clause.name.text, join(bindings.get(clause.name.text) ?? EMPTY, module));
+    if (clause?.name) setBinding(clause.name,join(getBinding(clause.name)??EMPTY,module));
     const named = clause?.namedBindings;
-    if (named && ts.isNamespaceImport(named)) bindings.set(named.name.text, join(bindings.get(named.name.text) ?? EMPTY, module));
+    if (named && ts.isNamespaceImport(named)) setBinding(named.name,join(getBinding(named.name)??EMPTY,module));
     if (named && ts.isNamedImports(named)) for (const item of named.elements) {
       if (item.isTypeOnly) continue;
       const imported = (item.propertyName ?? item.name).text;
       const extracted = module.properties.get(imported) ?? module.unknownProperty ?? module;
-      bindings.set(item.name.text, join(bindings.get(item.name.text) ?? EMPTY, extracted));
+      setBinding(item.name,join(getBinding(item.name)??EMPTY,extracted));
     }
   };
   for (const statement of file.statements) if (ts.isImportDeclaration(statement)) seedImport(statement);
 
-  const seedPatternNames = (pattern: ts.Node): void => {if (ts.isIdentifier(pattern)) {if (!bindings.has(pattern.text)) bindings.set(pattern.text, EMPTY); return;} ts.forEachChild(pattern, seedPatternNames);};
+  const seedPatternNames = (pattern: ts.Node): void => {if (ts.isIdentifier(pattern)) {if (!hasBinding(pattern))setBinding(pattern,EMPTY);return;}ts.forEachChild(pattern,seedPatternNames);};
   const collect = (node: ts.Node): void => {
-    if (ts.isFunctionDeclaration(node) && node.name && node.body) functionDeclarations.set(node.name.text, node);
+    if (ts.isFunctionDeclaration(node) && node.name && node.body) functionDeclarations.set(localBindingKey(node.name)??`ambient:${node.name.text}`,node);
     if (ts.isVariableDeclaration(node) || ts.isParameter(node)) seedPatternNames(node.name);
     if (ts.isVariableDeclaration(node) && node.initializer) operations.push({pattern: node.name, source: node.initializer, node});
     if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) operations.push({pattern: unwrapExpression(node.left as ts.Expression), source: node.right, node});
@@ -198,21 +215,34 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
 
   evaluate = (expression: ts.Expression, depth = 0): AbstractValue => {
     if (depth >= MAX_DEPTH) return TOP;
-    if (depth === 0) { let nodes = 0, exceeded = false; const stack: Array<readonly [ts.Node, number]> = [[expression, 0]]; while (stack.length > 0 && !exceeded) { const [node, nodeDepth] = stack.pop()!; if (!Number.isSafeInteger(nodes) || nodes >= MAX_NODES || nodeDepth >= MAX_DEPTH) { exceeded = true; break; } nodes += 1; ts.forEachChild(node, child => { stack.push([child, nodeDepth + 1]); }); } if (exceeded) return TOP; }
+    if (depth === 0) { let nodes = 0, exceeded = false; const stack: Array<readonly [ts.Node, number]> = [[expression, 0]]; while (stack.length > 0 && !exceeded) { const [node, nodeDepth] = stack.pop()!; if (!Number.isSafeInteger(nodes) || nodes >= MAX_NODES || nodeDepth >= MAX_AST_DEPTH) { exceeded = true; break; } nodes += 1; ts.forEachChild(node, child => { stack.push([child, nodeDepth + 1]); }); } if (exceeded) return BOUND; }
     const value = unwrapExpression(expression);
     if (ts.isStringLiteral(value) || ts.isNoSubstitutionTemplateLiteral(value)) return valueOf(0, [value.text]);
     if (ts.isNumericLiteral(value)) return valueOf(0, [value.text]);
     if (ts.isIdentifier(value)) {
+      const local=getBinding(value);if(local!==undefined)return local;
       if (value.text === "globalThis" || value.text === "global") return valueOf(Capability.globalRoot);
       if (value.text === "process") return valueOf(Capability.processRoot | Capability.processObject);
-      if (value.text === "module") return bindings.has(value.text) ? bindings.get(value.text)! : valueOf(Capability.child);
-      if (value.text === "fetch" || value.text === "WebSocket") return bindings.has(value.text) ? bindings.get(value.text)! : valueOf(Capability.network);
+      if (value.text === "module") return valueOf(Capability.child);
+      if (value.text === "fetch" || value.text === "WebSocket") return valueOf(Capability.network);
       if (value.text === "require" || value.text === "getBuiltinModule" || value.text === "createRequire") return valueOf(Capability.child);
-      if (value.text === "Worker") return bindings.has(value.text) ? bindings.get(value.text)! : valueOf(Capability.child);
+      if (value.text === "Worker") return valueOf(Capability.child);
+      if (value.text === "eval" || value.text === "Function") return valueOf(Capability.codegen);
+      if (value.text === "Object") return valueOf(0, [], false, new Map([
+        ["getOwnPropertyDescriptor", valueOf(Capability.introspector, ["introspector:descriptor"])],
+        ["getOwnPropertyDescriptors", valueOf(Capability.introspector, ["introspector:descriptors"])],
+        ["getPrototypeOf", valueOf(Capability.introspector, ["introspector:prototype"])],
+      ]));
+      if (value.text === "Reflect") return valueOf(0, [], false, new Map([
+        ["get", valueOf(Capability.introspector, ["introspector:get"])],
+        ["apply", valueOf(Capability.codegen)],
+        ["construct", valueOf(Capability.codegen)],
+        ["ownKeys", EMPTY],
+      ]), valueOf(Capability.codegen));
       if (["setTimeout", "setInterval"].includes(value.text)) return valueOf(Capability.processRoot);
-      const declaration = functionDeclarations.get(value.text);
-      if (declaration?.body) return derivedUnknown(evaluateFunctionResult(declaration, depth + 1));
-      return bindings.get(value.text) ?? EMPTY;
+      const declaration = functionDeclarations.get(localBindingKey(value)??`ambient:${value.text}`);
+      if (declaration?.body) {const result=evaluateFunctionResult(declaration,depth+1);return result.flags===TOP_CAPABILITY_FLAGS?EMPTY:derivedUnknown(result);}
+      return EMPTY;
     }
     if (ts.isConditionalExpression(value)) return join(evaluate(value.condition, depth + 1), join(evaluate(value.whenTrue, depth + 1), evaluate(value.whenFalse, depth + 1), depth + 1), depth + 1);
     if (ts.isBinaryExpression(value) && [ts.SyntaxKind.BarBarToken, ts.SyntaxKind.AmpersandAmpersandToken, ts.SyntaxKind.QuestionQuestionToken, ts.SyntaxKind.CommaToken].includes(value.operatorToken.kind)) return join(evaluate(value.left, depth + 1), evaluate(value.right, depth + 1), depth + 1);
@@ -268,6 +298,7 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
       return valueOf(flags, [], false, properties, unknownProperty);
     }
     const extract = (base: AbstractValue, keys: readonly string[], unknownKey: boolean): AbstractValue => {
+      if (base.flags === TOP_CAPABILITY_FLAGS) return TOP;
       let result = EMPTY;
       for (const key of keys) {
         result = join(result, base.properties.get(key) ?? base.unknownProperty ?? EMPTY);
@@ -278,13 +309,18 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
         }
         if ((base.flags & Capability.processRoot) !== 0 && key === "getBuiltinModule") result = join(result, valueOf(Capability.child));
         if ((base.flags & (Capability.network | Capability.child | Capability.fixture)) !== 0) result = join(result, valueOf(base.flags & (Capability.network | Capability.child | Capability.fixture)));
-        if (["call", "bind", "apply"].includes(key) && (base.flags & (Capability.network | Capability.child | Capability.fixture)) !== 0) result = join(result, valueOf(base.flags));
+        if (key === "constructor") result = join(result, valueOf(Capability.codegen));
+        if (["call", "bind", "apply"].includes(key) && (base.flags & (Capability.network | Capability.child | Capability.fixture | Capability.introspector | Capability.codegen)) !== 0) result = join(result, base);
       }
       if (unknownKey) {
         result = join(result, base.unknownProperty ?? EMPTY);
         if ((base.flags & Capability.globalRoot) !== 0) result = join(result, valueOf(Capability.network | Capability.processRoot | Capability.processObject));
         if ((base.flags & Capability.processRoot) !== 0) result = join(result, valueOf(Capability.child));
         if ((base.flags & (Capability.network | Capability.child | Capability.fixture)) !== 0) result = join(result, valueOf(base.flags));
+        if ((base.flags & Capability.globalRoot) !== 0) result = join(result, valueOf(Capability.globalRoot | Capability.processRoot | Capability.processObject | Capability.network | Capability.codegen));
+        if ((base.flags & Capability.processRoot) !== 0) result = join(result, valueOf(Capability.processRoot | Capability.child | Capability.codegen));
+        if ((base.flags & (Capability.network | Capability.child | Capability.introspector | Capability.codegen)) !== 0) result = join(result, valueOf(base.flags & (Capability.network | Capability.child | Capability.introspector | Capability.codegen)));
+        else result = join(result, EMPTY);
       }
       return result;
     };
@@ -295,6 +331,36 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
     }
     if (ts.isAwaitExpression(value)) return evaluate(value.expression, depth + 1);
     if (ts.isCallExpression(value)) {
+      if (ts.isPropertyAccessExpression(value.expression) && value.expression.name.text === "bind") {
+        const base = evaluate(value.expression.expression, depth + 1);
+        if ((base.flags & (Capability.introspector | Capability.codegen | Capability.network | Capability.child)) !== 0) return base;
+      }
+      const introspectorCall = (callee: AbstractValue, args: readonly ts.Expression[]): AbstractValue | null => {
+        if (callee.flags===TOP_CAPABILITY_FLAGS||(callee.flags&Capability.introspector)===0)return null;
+        const source = args[0] ? evaluate(args[0], depth + 1) : OPAQUE_DANGER;
+        const key = args[1] ? evaluate(args[1], depth + 1) : valueOf(0, [], true);
+        const extracted = extract(source, [...key.strings], key.unknownString || key.strings.size === 0);
+        if (callee.strings.has("introspector:get")) return extracted;
+        if (callee.strings.has("introspector:prototype")) return derivedUnknown(source);
+        const descriptor = (item: AbstractValue): AbstractValue => valueOf(0, [], false, new Map([["value", item]]), item.flags === 0 ? EMPTY : valueOf(item.flags));
+        if (callee.strings.has("introspector:descriptor")) return descriptor(extracted);
+        if (callee.strings.has("introspector:descriptors")) {
+          const properties = new Map<string, AbstractValue>();
+          for (const name of ["fetch", "WebSocket", "process", "module", "getBuiltinModule"]) {
+            const item = extract(source, [name], false);
+            if (item.flags !== 0) properties.set(name, descriptor(item));
+          }
+          const dangerousSource = source.flags !== TOP_CAPABILITY_FLAGS && (source.flags & (Capability.globalRoot | Capability.processRoot | Capability.network | Capability.child)) !== 0;
+          return valueOf(0, [], false, properties, dangerousSource ? descriptor(OPAQUE_DANGER) : EMPTY);
+        }
+        return OPAQUE_DANGER;
+      };
+      if (ts.isPropertyAccessExpression(value.expression) && value.expression.name.text === "call") {
+        const called = introspectorCall(evaluate(value.expression.expression, depth + 1), value.arguments.slice(1));
+        if (called) return called;
+      }
+      const inspected = introspectorCall(evaluate(value.expression, depth + 1), value.arguments);
+      if (inspected) return inspected;
       if (ts.isPropertyAccessExpression(value.expression) && value.expression.name.text === "slice") {
         const base = evaluate(value.expression.expression, depth + 1);
         const indexes: number[] = [];
@@ -334,6 +400,7 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
   };
 
   const patternProperty = (sourceValue: AbstractValue, keys: readonly string[], unknown: boolean): AbstractValue => {
+    if (sourceValue.flags === TOP_CAPABILITY_FLAGS) return TOP;
     let item = EMPTY;
     for (const key of keys) {
       item = join(item, sourceValue.properties.get(key) ?? sourceValue.unknownProperty ?? EMPTY);
@@ -342,21 +409,26 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
       if ((sourceValue.flags & Capability.globalRoot) !== 0 && key === "module") item = join(item, valueOf(Capability.child));
       if ((sourceValue.flags & Capability.processRoot) !== 0 && key === "getBuiltinModule") item = join(item, valueOf(Capability.child));
       if ((sourceValue.flags & (Capability.network | Capability.child | Capability.fixture)) !== 0) item = join(item, valueOf(sourceValue.flags));
+      if (key === "constructor") item = join(item, valueOf(Capability.codegen));
     }
     if (unknown) {
       item = join(item, sourceValue.unknownProperty ?? EMPTY);
       if ((sourceValue.flags & Capability.globalRoot) !== 0) item = join(item, valueOf(Capability.network | Capability.processRoot | Capability.processObject));
       if ((sourceValue.flags & Capability.processRoot) !== 0) item = join(item, valueOf(Capability.child));
+      if ((sourceValue.flags & Capability.globalRoot) !== 0) item = join(item, valueOf(Capability.globalRoot | Capability.processRoot | Capability.processObject | Capability.network | Capability.codegen));
+      if ((sourceValue.flags & Capability.processRoot) !== 0) item = join(item, valueOf(Capability.processRoot | Capability.child | Capability.codegen));
+      if ((sourceValue.flags & (Capability.network | Capability.child | Capability.introspector | Capability.codegen)) !== 0) item = join(item, valueOf(sourceValue.flags & (Capability.network | Capability.child | Capability.introspector | Capability.codegen)));
+      else item = join(item, EMPTY);
     }
     return item;
   };
-  const taintPattern = (pattern: ts.Node): boolean => {let changed = false; const visit = (node: ts.Node): void => {if (ts.isIdentifier(node)) {const previous = bindings.get(node.text) ?? EMPTY, next = join(previous, TOP); if (!sameValue(previous, next)) {bindings.set(node.text, next); changed = true;} return;} ts.forEachChild(node, visit);}; visit(pattern); return changed;};
+  const taintPattern = (pattern: ts.Node,taint:AbstractValue=TOP): boolean => {let changed = false; const visit = (node: ts.Node): void => {if (ts.isIdentifier(node)) {const previous=getBinding(node)??EMPTY,next=join(previous,taint);if(!sameValue(previous,next)){setBinding(node,next); changed = true;} return;} ts.forEachChild(node, visit);}; visit(pattern); return changed;};
   const extractPattern = (pattern: ts.Node, sourceValue: AbstractValue, depth = 0): boolean => {
-    if (depth >= MAX_DEPTH) return taintPattern(pattern);
+    if(depth>=MAX_DEPTH)return taintPattern(pattern,BOUND);
     if (ts.isIdentifier(pattern)) {
-      const previous = bindings.get(pattern.text) ?? EMPTY, next = join(previous, sourceValue);
+      const previous=getBinding(pattern)??EMPTY,next=join(previous,sourceValue);
       if (sameValue(previous, next)) return false;
-      bindings.set(pattern.text, next); return true;
+      setBinding(pattern,next);return true;
     }
     if (ts.isObjectBindingPattern(pattern)) {
       let changed = false;
@@ -398,7 +470,7 @@ export function createCapabilityAnalysis(source: string, relative: string): Capa
     for (const operation of operations) changed = extractPattern(operation.pattern, evaluate(operation.source), 0) || changed;
     if (!changed) {stabilized = true; break;}
   }
-  if (!stabilized) for (const operation of operations) taintPattern(operation.pattern);
+  if(!stabilized)for(const operation of operations)taintPattern(operation.pattern,BOUND);
 
   const contains = (value: AbstractValue, flag: number): boolean => (value.flags & flag) !== 0;
   const location = (node: ts.Node, category: string): string => {const point = file.getLineAndCharacterOfPosition(node.getStart(file));return `${relative}:${point.line + 1}:${point.character + 1}: ${category}`;};
