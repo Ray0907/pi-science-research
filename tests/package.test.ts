@@ -2,11 +2,7 @@ import { execFile } from "node:child_process";
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
-
-const execFileAsync = promisify(execFile);
 
 const projectRoot = new URL("../", import.meta.url);
 
@@ -53,36 +49,35 @@ describe("Pi package manifest", () => {
   });
 
   it("resolves only the package root through Node self-reference semantics", async () => {
-    const script = `
-      const root = import.meta.resolve("pi-science-research");
-      if (!root.endsWith("/src/index.ts")) throw new Error("unexpected root: " + root);
-      for (const specifier of [
-        "pi-science-research/src/index.ts",
-        "pi-science-research/src/scholarly/identifiers.js",
-        "pi-science-research/src/acquisition/providers/provider-adapter-friend-internal.ts",
-        "pi-science-research/src/acquisition/providers/provider-adapter-friend-internal.js",
-        "pi-science-research/src/acquisition/coordinator.ts",
-        "pi-science-research/src/acquisition/coordinator.js",
-        "pi-science-research/src/acquisition/planner-scheduler-friend-internal.ts",
-        "pi-science-research/src/acquisition/planner-scheduler-friend-internal.js",
-        "pi-science-research/src/acquisition/transport-settlement-friend-internal.ts",
-        "pi-science-research/src/acquisition/transport-settlement-friend-internal.js"
-      ]) {
-        for (const action of [() => import.meta.resolve(specifier), () => import(specifier)]) {
-          try { await action(); throw new Error("unexpected subpath access: " + specifier); }
-          catch (error) { if (error?.code !== "ERR_PACKAGE_PATH_NOT_EXPORTED") throw error; }
-        }
-      }
-      process.stdout.write("root-only");
-    `;
-    const scriptPath = join(fileURLToPath(projectRoot), `.package-self-reference-${process.pid}.mjs`);
-    await writeFile(scriptPath, script);
-    try {
-      const { stdout } = await execFileAsync(process.execPath, [scriptPath], { cwd: projectRoot });
-      expect(stdout).toBe("root-only");
-    } finally {
-      await rm(scriptPath, { force: true });
+    expect(import.meta.resolve("pi-science-research")).toMatch(/\/src\/index\.ts$/u);
+    for (const specifier of [
+      "pi-science-research/src/index.ts",
+      "pi-science-research/src/scholarly/identifiers.js",
+      "pi-science-research/src/acquisition/providers/provider-adapter-friend-internal.ts",
+      "pi-science-research/src/acquisition/providers/provider-adapter-friend-internal.js",
+      "pi-science-research/src/acquisition/coordinator.ts",
+      "pi-science-research/src/acquisition/coordinator.js",
+      "pi-science-research/src/acquisition/planner-scheduler-friend-internal.ts",
+      "pi-science-research/src/acquisition/planner-scheduler-friend-internal.js",
+      "pi-science-research/src/acquisition/transport-settlement-friend-internal.ts",
+      "pi-science-research/src/acquisition/transport-settlement-friend-internal.js",
+    ]) {
+      try { import.meta.resolve(specifier); throw new Error(`unexpected subpath access: ${specifier}`); }
+      catch (error) { expect(error).toMatchObject({code:"ERR_PACKAGE_PATH_NOT_EXPORTED"}); }
     }
+    for(const action of [
+      ()=>vi.importActual("pi-science-research/src/index.ts"),
+      ()=>vi.importActual("pi-science-research/src/scholarly/identifiers.js"),
+      ()=>vi.importActual("pi-science-research/src/acquisition/providers/provider-adapter-friend-internal.ts"),
+      ()=>vi.importActual("pi-science-research/src/acquisition/providers/provider-adapter-friend-internal.js"),
+      ()=>vi.importActual("pi-science-research/src/acquisition/coordinator.ts"),
+      ()=>vi.importActual("pi-science-research/src/acquisition/coordinator.js"),
+      ()=>vi.importActual("pi-science-research/src/acquisition/planner-scheduler-friend-internal.ts"),
+      ()=>vi.importActual("pi-science-research/src/acquisition/planner-scheduler-friend-internal.js"),
+      ()=>vi.importActual("pi-science-research/src/acquisition/transport-settlement-friend-internal.ts"),
+      ()=>vi.importActual("pi-science-research/src/acquisition/transport-settlement-friend-internal.js"),
+    ]) try { await action(); throw new Error("unexpected subpath import"); }
+    catch(error){expect(String(error)).toMatch(/not exported/u);}
   });
 
   it("publishes only runtime sources and license files", async () => {
@@ -91,11 +86,11 @@ describe("Pi package manifest", () => {
     };
     expect(manifest.files).toEqual(["extensions", "src", "LICENSE"]);
 
-    const { stdout } = await execFileAsync(
-      "npm",
-      ["pack", "--dry-run", "--json", "--ignore-scripts"],
-      { cwd: projectRoot },
-    );
+    const packageTemp=await mkdtemp(join(tmpdir(),"pi-science-research-pack-"));
+    const npmExecutable=process.platform==="win32"?"npm.cmd":"npm";
+    let stdout:string;
+    try { stdout=await new Promise<string>((resolvePromise,reject)=>{execFile(npmExecutable,["pack","--dry-run","--json","--ignore-scripts"],{cwd:projectRoot,shell:false,env:{PATH:process.env.PATH,SystemRoot:process.env.SystemRoot,ComSpec:process.env.ComSpec,PATHEXT:process.env.PATHEXT,HOME:packageTemp,TMPDIR:packageTemp,TMP:packageTemp,TEMP:packageTemp}},(error,output)=>{if(error)reject(error);else resolvePromise(output);});}); }
+    finally { await rm(packageTemp,{recursive:true,force:true}); }
     const packed = JSON.parse(stdout) as [{ files: Array<{ path: string }> }];
     const paths = packed[0]!.files.map(({ path }) => path);
     expect(paths).not.toEqual(expect.arrayContaining([

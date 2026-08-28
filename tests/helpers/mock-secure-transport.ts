@@ -17,7 +17,7 @@ export interface MockSecureTransportControl {
   onRequest?:(callbacks:NodeRequestCallbacksInternal)=>void;
 }
 
-/** Fake-only capability source; contains no network or process operations. */
+/** Task 11 AST-audited fake-only source; captures no ambient network or process capability. */
 export function createMockSecureTransportCapabilities():MockSecureTransportControl {
   let timerId=0;const timers=new Map<number,()=>void>();const timerMilliseconds=new Map<number,number>();const requests:MockSecureTransportControl["requests"]=[];const agents:MockSecureTransportControl["agents"]=[];const resolvers:MockSecureTransportControl["resolvers"]=[];
   const control={} as MockSecureTransportControl;control.now=100;control.timerMilliseconds=timerMilliseconds;control.timestampNow=()=>new Date(1_700_000_000_000+control.now).toISOString();control.timers=timers;control.requests=requests;control.agents=agents;control.resolvers=resolvers;control.resolve4=async()=>["8.8.8.8"];control.resolve6=async()=>["2606:4700:4700::1111"];

@@ -59,12 +59,12 @@ function expectCode(code: string) {
   return expect.objectContaining({ code });
 }
 
-function spawnVitestChild(root: string, environment: Record<string, string>): Promise<void> {
-  return new Promise((resolvePromise, reject) => {
-    const child = spawn(process.execPath, [resolve("node_modules/vitest/vitest.mjs"), "run", "--root", root, "child.test.ts"], {
-      cwd: process.cwd(),
-      env: { ...process.env, ...environment },
-      stdio: ["ignore", "pipe", "pipe"],
+function spawnVitestChild(root:string,environment:Readonly<{BARRIER:string;PROJECT:string;RUN_ID:string;TOKEN:string;RESULT:string}>):Promise<void>{
+  return new Promise((resolvePromise,reject)=>{
+    const child=spawn(process.execPath,[resolve(import.meta.dirname,"../../node_modules/vitest/vitest.mjs"),"run","--root",root,"child.test.ts"],{
+      cwd:root,shell:false,
+      env:{PATH:process.env.PATH,SystemRoot:process.env.SystemRoot,ComSpec:process.env.ComSpec,PATHEXT:process.env.PATHEXT,HOME:root,TMPDIR:root,TMP:root,TEMP:root,BARRIER:environment.BARRIER,PROJECT:environment.PROJECT,RUN_ID:environment.RUN_ID,TOKEN:environment.TOKEN,RESULT:environment.RESULT},
+      stdio:["ignore","pipe","pipe"],
     });
     let output = "";
     child.stdout.on("data", (chunk) => { output += String(chunk); });
