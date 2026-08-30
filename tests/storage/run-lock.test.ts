@@ -15,7 +15,9 @@ import { createOwnedRunRoot, type OwnedRunRoot } from "../../src/storage/run-roo
 import {
   ResearchRunLockError,
   acquireResearchRunLockInternal,
+  createResearchRunLockRetentionObserverInternal,
   createResearchRunLockTestHooksInternal,
+  getResearchRunLockRetentionCountsInternal,
   type ResearchRunLockPhaseInternal,
 } from "../../src/storage/run-lock-internal.js";
 
@@ -499,24 +501,6 @@ describe.skipIf(process.platform === "win32")("acquireResearchRunLockInternal", 
       );
       await expect(lstat(join(root.path, ".state"))).rejects.toMatchObject({ code: "ENOENT" });
     }
-    await root.close();
-  });
-
-  test("consumes a synthetic acquisition fault exactly once", async () => {
-    const root = await fixture();
-    const oneShot = createResearchRunLockTestHooksInternal({
-      now: () => NOW,
-      randomBytes: () => OWNER_TOKEN,
-      onCheck: null,
-      failAt: "before-lock-open",
-    });
-
-    await expect(acquireResearchRunLockInternal(root, { executionEpoch: 10 }, oneShot)).rejects.toEqual(
-      expectCode("lock.io-failed"),
-    );
-    await expect(lstat(join(root.path, ".state", "controller.lock"))).rejects.toMatchObject({ code: "ENOENT" });
-    const lock = await acquireResearchRunLockInternal(root, { executionEpoch: 10 }, oneShot);
-    await lock.release();
     await root.close();
   });
 
@@ -1117,6 +1101,285 @@ describe.skipIf(process.platform === "win32")("acquireResearchRunLockInternal", 
     }))).rejects.toEqual(expectCode("lock.replaced"));
     expect(replaced).toBe(true);
     await expect(lstat(join(statePath, "controller.lock"))).rejects.toMatchObject({ code: "ENOENT" });
+    await root.close();
+  });
+
+  test("rejects non-file lock pathnames without changing them", async () => {
+    const root = await fixture();
+    const statePath = join(root.path, ".state");
+    const lockPath = join(statePath, "controller.lock");
+    await mkdir(lockPath, { recursive: true, mode: 0o700 });
+
+    await expect(acquireResearchRunLockInternal(root, { executionEpoch: 0 }, hooks())).rejects.toEqual(
+      expectCode("lock.conflict"),
+    );
+    expect((await lstat(lockPath)).isDirectory()).toBe(true);
+    await root.close();
+  });
+
+  test.each([
+    new Date(Number.NaN),
+    Object.create(Date.prototype) as Date,
+  ])("rejects an invalid acquired-at source as invalid input", async (invalidNow) => {
+    const root = await fixture();
+    const invalidHooks = createResearchRunLockTestHooksInternal({
+      now: () => invalidNow,
+      randomBytes: () => OWNER_TOKEN,
+      onCheck: null,
+      failAt: null,
+    });
+
+    await expect(acquireResearchRunLockInternal(root, { executionEpoch: 0 }, invalidHooks)).rejects.toEqual(
+      expectCode("lock.invalid-input"),
+    );
+    await expect(lstat(join(root.path, ".state", "controller.lock"))).rejects.toMatchObject({ code: "ENOENT" });
+    await root.close();
+  });
+
+  test.each([Number.NaN, 1.5, "1", null])(
+    "rejects invalid execution epoch %j before state I/O",
+    async (executionEpoch) => {
+      const root = await fixture();
+      await expect(acquireResearchRunLockInternal(
+        root,
+        { executionEpoch } as { executionEpoch: number },
+        hooks(),
+      )).rejects.toEqual(expectCode("lock.invalid-input"));
+      await expect(lstat(join(root.path, ".state"))).rejects.toMatchObject({ code: "ENOENT" });
+      await root.close();
+    },
+  );
+
+  test("rejects replay by pathname replacement even when the record bytes are authentic", async () => {
+    const root = await fixture();
+    const lock = await acquireResearchRunLockInternal(root, { executionEpoch: 20 }, hooks());
+    const lockPath = join(root.path, ".state", "controller.lock");
+    const replay = await readFile(lockPath);
+    await rename(lockPath, `${lockPath}.owned`);
+    await writeFile(lockPath, replay, { mode: 0o600 });
+
+    await expect(lock.release()).rejects.toEqual(expectCode("lock.replaced"));
+    expect(await readFile(lockPath)).toEqual(replay);
+    await lock.closePreservingLock();
+    await root.close();
+  });
+
+  test.each(["root", "state", "lock"] as const)(
+    "release fails closed after %s pathname replacement",
+    async (target) => {
+      const root = await fixture();
+      const lock = await acquireResearchRunLockInternal(root, { executionEpoch: 21 }, hooks());
+      const statePath = join(root.path, ".state");
+      const lockPath = join(statePath, "controller.lock");
+      if (target === "root") {
+        await rename(root.path, `${root.path}.owned`);
+        await mkdir(root.path, { mode: 0o700 });
+      } else if (target === "state") {
+        await rename(statePath, `${statePath}.owned`);
+        await mkdir(statePath, { mode: 0o700 });
+      } else {
+        const bytes = await readFile(lockPath);
+        await rename(lockPath, `${lockPath}.owned`);
+        await writeFile(lockPath, bytes, { mode: 0o600 });
+      }
+
+      await expect(lock.release()).rejects.toEqual(expectCode("lock.replaced"));
+      await lock.closePreservingLock();
+      await root.close();
+    },
+  );
+
+  test("serializes concurrent release and keeps repeated release idempotent", async () => {
+    const root = await fixture();
+    const phases: ResearchRunLockPhaseInternal[] = [];
+    const lock = await acquireResearchRunLockInternal(root, { executionEpoch: 22 }, hooks((phase) => {
+      phases.push(phase);
+    }));
+
+    await Promise.all([lock.release(), lock.release(), lock.release()]);
+    await lock.release();
+    expect(phases.filter((phase) => phase === "before-lock-unlink")).toHaveLength(1);
+    expect(phases.filter((phase) => phase === "before-descriptor-close")).toHaveLength(1);
+    await root.close();
+  });
+
+  test.each([
+    "before-state-create",
+    "after-state-open",
+    "after-root-directory-sync",
+    "before-lock-open",
+    "after-lock-open",
+    "after-lock-write",
+    "after-lock-sync",
+    "after-state-publication-sync",
+  ] as const)("consumes acquisition phase fault once at %s", async (failAt) => {
+    const root = await fixture();
+    const oneShot = createResearchRunLockTestHooksInternal({
+      now: () => NOW,
+      randomBytes: () => OWNER_TOKEN,
+      onCheck: null,
+      failAt,
+    });
+    const lockPath = join(root.path, ".state", "controller.lock");
+
+    await expect(acquireResearchRunLockInternal(root, { executionEpoch: 23 }, oneShot)).rejects.toEqual(
+      expectCode("lock.io-failed"),
+    );
+    await rm(lockPath, { force: true });
+    const recovered = await acquireResearchRunLockInternal(root, { executionEpoch: 23 }, oneShot);
+    await recovered.release();
+    await root.close();
+  });
+
+  test.each([
+    "before-release-verify",
+    "before-lock-unlink",
+    "after-lock-unlink",
+    "after-state-release-sync",
+    "before-descriptor-close",
+  ] as const)("consumes release phase fault once at %s and finishes on retry", async (failAt) => {
+    const root = await fixture();
+    const oneShot = createResearchRunLockTestHooksInternal({
+      now: () => NOW,
+      randomBytes: () => OWNER_TOKEN,
+      onCheck: null,
+      failAt,
+    });
+    const lock = await acquireResearchRunLockInternal(root, { executionEpoch: 24 }, oneShot);
+    const lockPath = join(root.path, ".state", "controller.lock");
+
+    await expect(lock.release()).rejects.toEqual(expectCode("lock.io-failed"));
+    await lock.release();
+    await expect(lstat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+    await root.close();
+  });
+
+  test("authentically observes exact lock descriptor retention without a loader seam", async () => {
+    const root = await fixture();
+    const observer = createResearchRunLockRetentionObserverInternal();
+    const forged = Object.freeze({ capabilityKind: "research-run-lock-retention-observer" as const });
+    expect(Object.isFrozen(observer)).toBe(true);
+    expect(() => getResearchRunLockRetentionCountsInternal(forged as never)).toThrow(expectCode("lock.invalid-input"));
+    await expect(acquireResearchRunLockInternal(root, { executionEpoch: 25 }, undefined, forged as never)).rejects.toEqual(
+      expectCode("lock.invalid-input"),
+    );
+    await expect(lstat(join(root.path, ".state"))).rejects.toMatchObject({ code: "ENOENT" });
+
+    const closeFault = createResearchRunLockTestHooksInternal({
+      now: () => NOW,
+      randomBytes: () => OWNER_TOKEN,
+      onCheck: null,
+      failAt: "before-descriptor-close",
+    });
+    const released = await acquireResearchRunLockInternal(root, { executionEpoch: 25 }, closeFault, observer);
+    expect(getResearchRunLockRetentionCountsInternal(observer)).toEqual({ descriptors: 3 });
+    expect(Object.isFrozen(getResearchRunLockRetentionCountsInternal(observer))).toBe(true);
+    await expect(released.release()).rejects.toEqual(expectCode("lock.io-failed"));
+    expect(getResearchRunLockRetentionCountsInternal(observer)).toEqual({ descriptors: 3 });
+    await released.release();
+    expect(getResearchRunLockRetentionCountsInternal(observer)).toEqual({ descriptors: 0 });
+
+    for (const [failAt, expectedRetained] of [
+      ["after-state-open", 2],
+      ["after-lock-open", 3],
+      ["after-lock-write", 3],
+      ["after-lock-sync", 3],
+    ] as const) {
+      let observed = -1;
+      const acquisitionFault = createResearchRunLockTestHooksInternal({
+        now: () => NOW,
+        randomBytes: () => OWNER_TOKEN,
+        onCheck: (phase) => {
+          if (phase === failAt) observed = getResearchRunLockRetentionCountsInternal(observer).descriptors;
+        },
+        failAt,
+      });
+      await expect(acquireResearchRunLockInternal(root, { executionEpoch: 26 }, acquisitionFault, observer)).rejects.toEqual(
+        expectCode("lock.io-failed"),
+      );
+      expect(observed).toBe(expectedRetained);
+      expect(getResearchRunLockRetentionCountsInternal(observer)).toEqual({ descriptors: 0 });
+      await rm(join(root.path, ".state", "controller.lock"), { force: true });
+    }
+
+    const lockPath = join(root.path, ".state", "controller.lock");
+    const replacedLockPath = `${lockPath}.verification-owned`;
+    let verificationRetained = -1;
+    const verificationFault = createResearchRunLockTestHooksInternal({
+      now: () => NOW,
+      randomBytes: () => OWNER_TOKEN,
+      onCheck: async (phase) => {
+        if (phase !== "after-state-publication-sync") return;
+        verificationRetained = getResearchRunLockRetentionCountsInternal(observer).descriptors;
+        const bytes = await readFile(lockPath);
+        await rename(lockPath, replacedLockPath);
+        await writeFile(lockPath, bytes, { mode: 0o600 });
+      },
+      failAt: null,
+    });
+    await expect(acquireResearchRunLockInternal(root, { executionEpoch: 26 }, verificationFault, observer)).rejects.toEqual(
+      expectCode("lock.replaced"),
+    );
+    expect(verificationRetained).toBe(3);
+    expect(getResearchRunLockRetentionCountsInternal(observer)).toEqual({ descriptors: 0 });
+    await rm(lockPath);
+    await rm(replacedLockPath);
+
+    for (let cycle = 0; cycle < 100; cycle += 1) {
+      const lock = await acquireResearchRunLockInternal(root, { executionEpoch: 26 + cycle }, undefined, observer);
+      expect(getResearchRunLockRetentionCountsInternal(observer)).toEqual({ descriptors: 3 });
+      await lock.closePreservingLock();
+      expect(getResearchRunLockRetentionCountsInternal(observer)).toEqual({ descriptors: 0 });
+      await rm(join(root.path, ".state", "controller.lock"));
+    }
+    const stale = await acquireResearchRunLockInternal(root, { executionEpoch: 126 }, undefined, observer);
+    await stale.closePreservingLock();
+    expect(getResearchRunLockRetentionCountsInternal(observer)).toEqual({ descriptors: 0 });
+    await expect(acquireResearchRunLockInternal(root, { executionEpoch: 127 }, undefined, observer)).rejects.toEqual(
+      expectCode("lock.conflict"),
+    );
+    expect(getResearchRunLockRetentionCountsInternal(observer)).toEqual({ descriptors: 0 });
+    await root.close();
+  });
+
+  test.each(["now", "randomBytes", "onCheck"] as const)(
+    "redacts a malicious exported lock error thrown by the %s callback",
+    async (seam) => {
+      const root = await fixture();
+      const secret = `SECRET:${seam}:${root.path}:${ROOT_TOKEN}`;
+      const malicious = () => { throw new ResearchRunLockError(secret as never); };
+      const maliciousHooks = createResearchRunLockTestHooksInternal({
+        now: seam === "now" ? malicious : () => NOW,
+        randomBytes: seam === "randomBytes" ? malicious : () => OWNER_TOKEN,
+        onCheck: seam === "onCheck" ? malicious : null,
+        failAt: null,
+      });
+
+      let caught: unknown;
+      try { await acquireResearchRunLockInternal(root, { executionEpoch: 128 }, maliciousHooks); } catch (error) { caught = error; }
+      await root.close();
+      expect(caught).toBeInstanceOf(ResearchRunLockError);
+      expect((caught as ResearchRunLockError).code).toBe("lock.io-failed");
+      expect((caught as Error).message).toBe("Research run lock failed (lock.io-failed)");
+      expect(JSON.stringify(caught)).not.toContain(secret);
+      for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(caught as object))) {
+        if ("value" in descriptor && typeof descriptor.value === "string") expect(descriptor.value).not.toContain(secret);
+      }
+    },
+  );
+
+  test("redacts callback, path, token, and injected I/O details", async () => {
+    const root = await fixture();
+    const secret = `SECRET:${root.path}:${ROOT_TOKEN}`;
+    const secretHooks = hooks(() => { throw Object.assign(new Error(secret), { path: secret }); });
+
+    let caught: unknown;
+    try { await acquireResearchRunLockInternal(root, { executionEpoch: 128 }, secretHooks); } catch (error) { caught = error; }
+    expect(caught).toBeInstanceOf(ResearchRunLockError);
+    expect(String((caught as Error).message)).toBe("Research run lock failed (lock.io-failed)");
+    expect(JSON.stringify(caught)).not.toContain(secret);
+    expect(Reflect.ownKeys(caught as object)).toEqual(expect.arrayContaining(["stack", "message", "name", "code"]));
+    expect(Reflect.ownKeys(caught as object)).not.toContain("path");
     await root.close();
   });
 });

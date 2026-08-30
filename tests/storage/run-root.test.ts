@@ -28,6 +28,7 @@ import {
   revalidateOwnedRunRoot,
 } from "../../src/storage/run-root.js";
 import { sha256Hex } from "../../src/crypto/hash.js";
+import { acquireResearchRunLockInternal } from "../../src/storage/run-lock-internal.js";
 
 const RUN_ID = "run-0123456789abcdef" as const;
 const TOKEN = "a".repeat(64);
@@ -220,11 +221,13 @@ describe("createOwnedRunRoot", () => {
     await mkdir(harnessRoot);
     const barrier = join(harnessRoot, "start");
     const source = resolve("src/storage/run-root.ts");
+    const lockSource = resolve("src/storage/run-lock-internal.ts");
     const childTest = join(harnessRoot, "child.test.ts");
     await writeFile(childTest, `
 import { test, expect } from "vitest";
 import { readFile, stat, writeFile } from "node:fs/promises";
 import { createOwnedRunRoot } from ${JSON.stringify(source)};
+import { acquireResearchRunLockInternal } from ${JSON.stringify(lockSource)};
 
 test("cross-process create", async () => {
   while (true) {
@@ -236,8 +239,10 @@ test("cross-process create", async () => {
     now: () => new Date("2026-08-25T12:34:56.000Z"),
   });
   const marker = JSON.parse(await readFile(root.path + "/.pi-science-research-owner.json", "utf8"));
+  const lock = await acquireResearchRunLockInternal(root, { executionEpoch: 1 });
   await writeFile(process.env.RESULT!, JSON.stringify({ path: root.path, marker }));
   await root.close();
+  expect(lock.executionEpoch).toBe(1);
   expect(marker.runId).toBe(process.env.RUN_ID);
 });
 `);
@@ -273,6 +278,14 @@ test("cross-process create", async () => {
     for (const { child, value } of records) {
       expect(value.marker.runId).toBe(child.runId);
       expect(value.marker.ownershipTokenSha256).toBe(sha256Hex(child.token));
+      const stalePath = join(value.path, ".state", "controller.lock");
+      expect((await lstat(stalePath)).isFile()).toBe(true);
+      const opened = await openOwnedRunRoot(value.path, child.runId as `run-${string}`, child.token);
+      await expect(acquireResearchRunLockInternal(opened, { executionEpoch: 2 })).rejects.toEqual(
+        expectCode("lock.conflict"),
+      );
+      expect((await lstat(stalePath)).isFile()).toBe(true);
+      await opened.close();
     }
   }, 30_000);
 

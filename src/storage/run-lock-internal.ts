@@ -31,6 +31,7 @@ const MAX_LOCK_RECORD_BYTES = 4096;
 const NO_FOLLOW = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
 const DIRECTORY = typeof constants.O_DIRECTORY === "number" ? constants.O_DIRECTORY : 0;
 const hooksState = new WeakMap<object, TestHookState>();
+const retentionObserverState = new WeakMap<object, RetentionObserverState>();
 const lockState = new WeakMap<object, InternalLockState>();
 
 export type ResearchRunLockErrorCodeInternal =
@@ -44,13 +45,16 @@ export type ResearchRunLockErrorCodeInternal =
   | "lock.closed"
   | "lock.io-failed";
 
+const authenticLockErrors = new WeakSet<object>();
+
 export class ResearchRunLockError extends Error {
   readonly code: ResearchRunLockErrorCodeInternal;
 
   constructor(code: ResearchRunLockErrorCodeInternal) {
-    super(`Research run lock failed (${code})`);
+    const safeCode = isLockErrorCode(code) ? code : "lock.io-failed";
+    super(`Research run lock failed (${safeCode})`);
     this.name = "ResearchRunLockError";
-    this.code = code;
+    this.code = safeCode;
   }
 }
 
@@ -79,6 +83,18 @@ export interface ResearchRunLockTestHooksDescriptorInternal {
 export interface ResearchRunLockTestHooksInternal {
   readonly capabilityKind: "research-run-lock-test-hooks";
 }
+
+export interface ResearchRunLockRetentionObserverInternal {
+  readonly capabilityKind: "research-run-lock-retention-observer";
+}
+
+interface RetentionObserverState {
+  root: number;
+  state: number;
+  lock: number;
+}
+
+type RetainedDescriptor = keyof RetentionObserverState;
 
 interface TestHookState {
   readonly now: () => Date;
@@ -132,6 +148,7 @@ interface InternalLockState {
   readonly recordBytes: Buffer;
   readonly ownerToken: Buffer;
   readonly hooks: TestHookState | null;
+  readonly retentionObserver: RetentionObserverState | null;
   readonly childStrategy: LockChildStrategy;
   lifecycle: LockLifecycle;
   closePromise: Promise<void> | null;
@@ -141,6 +158,20 @@ interface InternalLockState {
   rootClosed: boolean;
   stateClosed: boolean;
   lockClosed: boolean;
+}
+
+export function createResearchRunLockRetentionObserverInternal(): ResearchRunLockRetentionObserverInternal {
+  const observer = Object.freeze({ capabilityKind: "research-run-lock-retention-observer" as const });
+  retentionObserverState.set(observer, { root: 0, state: 0, lock: 0 });
+  return observer;
+}
+
+export function getResearchRunLockRetentionCountsInternal(
+  observer: ResearchRunLockRetentionObserverInternal,
+): Readonly<{ descriptors: number }> {
+  const state = authenticateRetentionObserver(observer);
+  if (state === null) fail("lock.invalid-input");
+  return Object.freeze({ descriptors: state.root + state.state + state.lock });
 }
 
 export function createResearchRunLockTestHooksInternal(
@@ -167,15 +198,18 @@ export async function acquireResearchRunLockInternal(
   root: OwnedRunRoot,
   options: { readonly executionEpoch: number },
   testHooks?: ResearchRunLockTestHooksInternal,
+  retentionObserver?: ResearchRunLockRetentionObserverInternal,
 ): Promise<ResearchRunLockInternal> {
   let rootFd: number | undefined;
   let stateFd: number | undefined;
   let lockFd: number | undefined;
+  let retention: RetentionObserverState | null = null;
   try {
     const optionValues = exactDataDescriptors(options, ["executionEpoch"]);
     const executionEpoch = optionValues.executionEpoch;
     if (!Number.isSafeInteger(executionEpoch) || (executionEpoch as number) < 0) fail("lock.invalid-input");
     const hooks = authenticateHooks(testHooks);
+    retention = authenticateRetentionObserver(retentionObserver);
     await verifyAuthenticRoot(root);
 
     // Node exposes no openat/unlinkat API. Linux uses verified procfs child
@@ -185,6 +219,7 @@ export async function acquireResearchRunLockInternal(
       fail("lock.io-failed");
     }
     rootFd = openDirectory(root.path);
+    retainDescriptor(retention, "root");
     const rootInitial = nativeFstatSync(rootFd);
     assertRootPair(root, rootInitial);
     const childStrategy = selectLockChildStrategy(rootFd);
@@ -209,6 +244,7 @@ export async function acquireResearchRunLockInternal(
     }
 
     stateFd = openDirectory(stateEffectPath);
+    retainDescriptor(retention, "state");
     const stateInitial = nativeFstatSync(stateFd);
     assertSafeState(rootInitial, stateInitial, safeLstat(statePath));
     await invokePhase(hooks, "after-state-open");
@@ -255,6 +291,7 @@ export async function acquireResearchRunLockInternal(
       }
       throw error;
     }
+    retainDescriptor(retention, "lock");
     const lockInitial = nativeFstatSync(lockFd);
     assertSafeLock(rootInitial, lockInitial, safeLstat(lockPath));
     verifyRootAndState(root, rootFd, rootInitial, stateFd, stateInitial, statePath);
@@ -294,6 +331,7 @@ export async function acquireResearchRunLockInternal(
       recordBytes,
       ownerToken: token,
       hooks,
+      retentionObserver: retention,
       childStrategy,
       lifecycle: "active",
       closePromise: null,
@@ -337,7 +375,7 @@ export async function acquireResearchRunLockInternal(
     lockState.set(lock, state);
     return lock;
   } catch (error) {
-    closeFailedAcquisitionDescriptors(lockFd, stateFd, rootFd);
+    closeFailedAcquisitionDescriptors(retention, { lock: lockFd, state: stateFd, root: rootFd });
     throw wrap(error);
   }
 }
@@ -447,6 +485,7 @@ function closeOne(state: InternalLockState, which: "lock" | "state" | "root"): v
   // POSIX leaves the numeric descriptor unusable by the caller after close,
   // including when close reports an error; retry could close a reused fd.
   state[closedKey] = true;
+  releaseRetainedDescriptor(state.retentionObserver, which);
   nativeCloseSync(fd);
 }
 
@@ -593,6 +632,7 @@ function assertNoUnsafeExistingLock(path: string): void {
   const existing = lstatIfExists(path);
   if (existing === null) return;
   if (existing.isSymbolicLink()) fail("lock.symlink");
+  if (!existing.isFile()) fail("lock.conflict");
   if (existing.nlink !== 1) fail("lock.unsafe-link");
   fail("lock.conflict");
 }
@@ -672,7 +712,7 @@ function parseLockRecord(bytes: Buffer): LockRecord {
     if (`${canonicalJson(record)}\n` !== text) fail("lock.owner-mismatch");
     return record;
   } catch (error) {
-    if (error instanceof ResearchRunLockError) throw error;
+    if (isAuthenticLockError(error)) throw error;
     fail("lock.owner-mismatch");
   }
 }
@@ -688,11 +728,14 @@ function currentTimestamp(hooks: TestHookState | null): string {
   try {
     const value = (hooks?.now ?? (() => new Date()))();
     if (utilTypes.isProxy(value) || Object.getPrototypeOf(value) !== Date.prototype) fail("lock.invalid-input");
+    let time: number;
+    try { time = Date.prototype.getTime.call(value); } catch { fail("lock.invalid-input"); }
+    if (!Number.isFinite(time)) fail("lock.invalid-input");
     const timestamp = Date.prototype.toISOString.call(value);
     if (!isTimestamp(timestamp)) fail("lock.invalid-input");
     return timestamp;
   } catch (error) {
-    if (error instanceof ResearchRunLockError) throw error;
+    if (isAuthenticLockError(error)) throw error;
     fail("lock.io-failed");
   }
 }
@@ -703,7 +746,7 @@ function generateOwnerToken(hooks: TestHookState | null): Buffer {
     if (utilTypes.isProxy(value) || !(value instanceof Uint8Array) || value.byteLength !== 32) fail("lock.invalid-input");
     return Buffer.from(value);
   } catch (error) {
-    if (error instanceof ResearchRunLockError) throw error;
+    if (isAuthenticLockError(error)) throw error;
     fail("lock.io-failed");
   }
 }
@@ -717,7 +760,7 @@ async function invokePhase(hooks: TestHookState | null, phase: ResearchRunLockPh
       fail("lock.io-failed");
     }
   } catch (error) {
-    if (error instanceof ResearchRunLockError) throw error;
+    if (isAuthenticLockError(error)) throw error;
     fail("lock.io-failed");
   }
 }
@@ -730,6 +773,26 @@ function authenticateHooks(value: ResearchRunLockTestHooksInternal | undefined):
   const state = hooksState.get(value);
   if (!state) fail("lock.invalid-input");
   return state;
+}
+
+function authenticateRetentionObserver(
+  value: ResearchRunLockRetentionObserverInternal | undefined,
+): RetentionObserverState | null {
+  if (value === undefined) return null;
+  if (value === null || typeof value !== "object" || utilTypes.isProxy(value) || !Object.isFrozen(value)) {
+    fail("lock.invalid-input");
+  }
+  const state = retentionObserverState.get(value);
+  if (!state) fail("lock.invalid-input");
+  return state;
+}
+
+function retainDescriptor(state: RetentionObserverState | null, descriptor: RetainedDescriptor): void {
+  if (state !== null) state[descriptor] += 1;
+}
+
+function releaseRetainedDescriptor(state: RetentionObserverState | null, descriptor: RetainedDescriptor): void {
+  if (state !== null && state[descriptor] > 0) state[descriptor] -= 1;
 }
 
 async function verifyAuthenticRoot(root: OwnedRunRoot): Promise<void> {
@@ -830,21 +893,46 @@ function closeCleanupDescriptor(fd: number): void {
   nativeCloseSync(fd);
 }
 
-function closeFailedAcquisitionDescriptors(...fds: Array<number | undefined>): void {
-  for (const fd of fds) {
+function closeFailedAcquisitionDescriptors(
+  retention: RetentionObserverState | null,
+  descriptors: Readonly<Record<RetainedDescriptor, number | undefined>>,
+): void {
+  for (const descriptor of ["lock", "state", "root"] as const) {
+    const fd = descriptors[descriptor];
     if (fd === undefined) continue;
+    releaseRetainedDescriptor(retention, descriptor);
     try { closeCleanupDescriptor(fd); } catch { /* numeric descriptor already consumed */ }
   }
 }
 
 function wrap(error: unknown): ResearchRunLockError {
-  if (error instanceof ResearchRunLockError) return error;
-  if (isNodeError(error, "ELOOP")) return new ResearchRunLockError("lock.symlink");
-  return new ResearchRunLockError("lock.io-failed");
+  if (isAuthenticLockError(error)) return error;
+  if (isNodeError(error, "ELOOP")) return createLockError("lock.symlink");
+  return createLockError("lock.io-failed");
+}
+
+function createLockError(code: ResearchRunLockErrorCodeInternal): ResearchRunLockError {
+  const error = new ResearchRunLockError(code);
+  Object.freeze(error);
+  authenticLockErrors.add(error);
+  return error;
+}
+
+function isAuthenticLockError(error: unknown): error is ResearchRunLockError {
+  return error instanceof ResearchRunLockError && authenticLockErrors.has(error) && Object.isFrozen(error) &&
+    isLockErrorCode(error.code) && error.name === "ResearchRunLockError" &&
+    error.message === `Research run lock failed (${error.code})`;
+}
+
+function isLockErrorCode(value: unknown): value is ResearchRunLockErrorCodeInternal {
+  return typeof value === "string" && [
+    "lock.invalid-input", "lock.state-invalid", "lock.conflict", "lock.symlink", "lock.unsafe-link",
+    "lock.replaced", "lock.owner-mismatch", "lock.closed", "lock.io-failed",
+  ].includes(value);
 }
 
 function fail(code: ResearchRunLockErrorCodeInternal): never {
-  throw new ResearchRunLockError(code);
+  throw createLockError(code);
 }
 
 function isNodeError(error: unknown, code: string): boolean {
