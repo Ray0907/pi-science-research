@@ -12,6 +12,7 @@ const root=path.resolve(import.meta.dirname,"../..");
 const adapterPath=path.join(root,"src/acquisition/node-pinned-hop-internal.ts");
 const decoderAdapterPath=path.join(root,"src/acquisition/content-decoding-internal.ts");
 const secureJsonTransportPath=path.join(root,"src/acquisition/secure-json-transport-internal.ts");
+const runLockPath=path.join(root,"src/storage/run-lock-internal.ts");
 const networkNodeImports=new Set(["node:dns/promises","node:http","node:https","node:tls","node:timers","node:perf_hooks"]);
 const allowedNodeImports=new Set([...networkNodeImports,"node:util"]);
 const requestOptionKeys=new Set(["agent","headers","setHost","servername","ca","rejectUnauthorized","maxHeaderSize","insecureHTTPParser","joinDuplicateHeaders","lookup","checkServerIdentity"]);
@@ -413,11 +414,80 @@ function acquisitionUnitIsolationErrors():string[]{
   return errors;
 }
 
+type RunLockNodeBinding={readonly module:string;readonly imported:string;readonly typeOnly:boolean};
+function auditRunLockNodeOperations(source:string):string[]{
+  const file=ts.createSourceFile("run-lock-internal.ts",source,ts.ScriptTarget.Latest,true,ts.ScriptKind.TS),errors:string[]=[];
+  const expected=new Map<string,readonly string[]>([
+    ["node:crypto",["randomBytes:nodeRandomBytes:runtime","timingSafeEqual:timingSafeEqual:runtime"]],
+    ["node:fs",["closeSync:nativeCloseSync:runtime","constants:constants:runtime","fstatSync:nativeFstatSync:runtime","fsyncSync:nativeFsyncSync:runtime","lstatSync:nativeLstatSync:runtime","mkdirSync:nativeMkdirSync:runtime","openSync:nativeOpenSync:runtime","readSync:nativeReadSync:runtime","Stats:Stats:type","unlinkSync:nativeUnlinkSync:runtime","writeSync:nativeWriteSync:runtime"]],
+    ["node:path",["join:join:runtime"]],
+    ["node:util",["types:utilTypes:runtime"]],
+  ]),bindings=new Map<string,RunLockNodeBinding>(),seen=new Set<string>();
+  for(const statement of file.statements){
+    if(ts.isImportDeclaration(statement)&&ts.isStringLiteral(statement.moduleSpecifier)){
+      const specifier=statement.moduleSpecifier.text;if(isRelativeSpecifier(specifier))continue;
+      const clause=statement.importClause,named=clause?.namedBindings;
+      if(!expected.has(specifier)||!clause||clause.name||clause.isTypeOnly||!named||!ts.isNamedImports(named)){errors.push(`run-lock import denied ${specifier}`);continue;}
+      if(seen.has(specifier))errors.push(`run-lock duplicate import ${specifier}`);seen.add(specifier);
+      const actual=named.elements.map(item=>`${item.propertyName?.text??item.name.text}:${item.name.text}:${item.isTypeOnly?"type":"runtime"}`).sort();
+      if(JSON.stringify(actual)!==JSON.stringify([...expected.get(specifier)!].sort()))errors.push(`run-lock import bindings ${specifier}`);
+      for(const item of named.elements)bindings.set(item.name.text,{module:specifier,imported:item.propertyName?.text??item.name.text,typeOnly:item.isTypeOnly});
+    }
+    if(ts.isExportDeclaration(statement)&&statement.moduleSpecifier&&!isRelativeSpecifier((statement.moduleSpecifier as ts.StringLiteral).text))errors.push("run-lock export denied");
+    if(ts.isImportEqualsDeclaration(statement))errors.push("run-lock import-equals denied");
+  }
+  for(const specifier of expected.keys())if(!seen.has(specifier))errors.push(`run-lock missing import ${specifier}`);
+  const contexts=new Map<string,Set<string>>();
+  const context=(node:ts.Node):string=>{for(let current:ts.Node|undefined=node.parent;current;current=current.parent){if(ts.isFunctionDeclaration(current)&&current.name)return current.name.text;if(ts.isMethodDeclaration(current))return current.name.getText(file);if(ts.isFunctionExpression(current)&&current.name)return current.name.text;}return"<top>";};
+  const inType=(node:ts.Node):boolean=>{for(let current:ts.Node|undefined=node.parent;current&&!ts.isStatement(current);current=current.parent)if(ts.isTypeNode(current))return true;return false;};
+  const addContext=(name:string,node:ts.Node):void=>{const values=contexts.get(name)??new Set<string>();values.add(context(node));contexts.set(name,values);};
+  const directFunctions=new Set(["timingSafeEqual","nativeCloseSync","nativeFstatSync","nativeFsyncSync","nativeLstatSync","nativeMkdirSync","nativeOpenSync","nativeReadSync","nativeUnlinkSync","nativeWriteSync","join"]);
+  const visit=(node:ts.Node):void=>{
+    if(ts.isCallExpression(node)&&node.expression.kind===ts.SyntaxKind.ImportKeyword)errors.push("run-lock dynamic import denied");
+    if(ts.isIdentifier(node)&&["require","createRequire","getBuiltinModule","exec","execFile","spawn","fork","Worker","WebSocket","fetch","eval","Function"].includes(node.text)&&!isPropertyName(node))errors.push(`run-lock execution denied ${node.text}`);
+    if(ts.isPropertyAccessExpression(node)&&ts.isIdentifier(node.expression)&&node.expression.text==="process"&&node.name.text!=="platform"&&!(node.name.text==="getuid"&&context(node)==="ownedByEffectiveUser"))errors.push("run-lock process member denied");
+    if(ts.isPropertyAccessExpression(node)&&["constructor","createRequire","getBuiltinModule","require","exec","execFile","spawn","fork"].includes(node.name.text))errors.push(`run-lock member denied ${node.name.text}`);
+    if(ts.isElementAccessExpression(node)){const key=node.argumentExpression;if(ts.isIdentifier(node.expression)&&["process","globalThis","global"].includes(node.expression.text))errors.push("run-lock computed global denied");if(key&&ts.isStringLiteral(key)&&["constructor","createRequire","getBuiltinModule","require","exec","execFile","spawn","fork"].includes(key.text))errors.push(`run-lock computed member denied ${key.text}`);}
+    if(ts.isIdentifier(node)){const binding=bindings.get(node.text);if(binding&&!ts.isImportSpecifier(node.parent)){addContext(node.text,node);const outer=outerTransparent(node),parent=outer.parent;
+      if(binding.typeOnly){if(!inType(node))errors.push(`run-lock type binding context ${node.text}`);}
+      else if(node.text==="constants"){if(!ts.isPropertyAccessExpression(parent)||parent.expression!==outer||parent.questionDotToken||!parent.name.text.startsWith("O_"))errors.push("run-lock constants context");}
+      else if(node.text==="utilTypes"){const member=ts.isPropertyAccessExpression(parent)&&parent.expression===outer?parent:null;if(!member||member.questionDotToken||member.name.text!=="isProxy"||!ts.isCallExpression(member.parent)||member.parent.expression!==member)errors.push("run-lock util context");}
+      else if(node.text==="nodeRandomBytes"){const binary=ts.isBinaryExpression(parent)&&parent.right===outer&&parent.operatorToken.kind===ts.SyntaxKind.QuestionQuestionToken;const call=binary&&outerTransparent(parent).parent;if(!binary||!call||!ts.isCallExpression(call)||call.expression!==outerTransparent(parent)||context(node)!=="generateOwnerToken")errors.push("run-lock random context");}
+      else if(directFunctions.has(node.text)){if(!ts.isCallExpression(parent)||parent.expression!==outer)errors.push(`run-lock function context ${node.text}`);}
+      else errors.push(`run-lock binding context ${node.text}`);
+    }}
+    ts.forEachChild(node,visit);
+  };visit(file);
+  const expectedContexts=new Map<string,readonly string[]>([
+    ["constants",["<top>","acquireResearchRunLockInternal","openDirectory","selectLockChildStrategy","verifyLockPair"]],
+    ["Stats",["<top>","assertRootPair","assertSafeLock","assertSafeState","lstatIfExists","ownedByEffectiveUser","safeLstat","sameDirectory","sameFileIdentityAndPolicy","sameInode","sameStableFile","verifyLockPair","verifyPinnedStatePath","verifyPublicationPair","verifyRootAndState","verifyRootDescriptor"]],
+    ["utilTypes",["authenticateHooks","authenticateRetentionObserver","currentTimestamp","exactDataDescriptors","generateOwnerToken","isResearchRunLockTestHooksInternal","requireLockState"]],
+    ["nativeFstatSync",["acquireResearchRunLockInternal","readExact","selectLockChildStrategy","verifyLockPair","verifyPinnedStatePath","verifyPublicationPair","verifyRootDescriptor","verifyUnlinkedOwnership"]],
+    ["nativeFsyncSync",["acquireResearchRunLockInternal","releaseLock","syncStateDirectory"]],
+    ["nativeOpenSync",["acquireResearchRunLockInternal","openDirectory","selectLockChildStrategy","verifyLockPair"]],
+    ["nativeCloseSync",["closeCleanupDescriptor","closeOne"]],
+    ["nativeLstatSync",["lstatIfExists","safeLstat"]],
+    ["nativeMkdirSync",["acquireResearchRunLockInternal"]],
+    ["nativeReadSync",["readExact"]],
+    ["nativeUnlinkSync",["releaseLock"]],
+    ["nativeWriteSync",["writeFully"]],
+    ["nodeRandomBytes",["generateOwnerToken"]],
+    ["timingSafeEqual",["safeHashEqual"]],
+    ["join",["acquireResearchRunLockInternal"]],
+  ]);
+  for(const [name,wanted] of expectedContexts){const actual=[...(contexts.get(name)??new Set())].sort();if(JSON.stringify(actual)!==JSON.stringify([...wanted].sort()))errors.push(`run-lock named contexts ${name}`);}
+  return [...new Set(errors)].sort();
+}
+
 describe("Node operations adapter audit",()=>{
   test("audits sole real Node adapter imports methods production features and approved request options by TypeScript AST",()=>{
     expect(auditProductionTree(path.join(root,"src/acquisition"),adapterPath,decoderAdapterPath)).toEqual([]);
     expect(acquisitionUnitIsolationErrors()).toEqual([]);
   });
+
+  test("separately audits exact run-lock crypto fs path and util bindings in named contexts",()=>{const source=fs.readFileSync(runLockPath,"utf8");expect(auditRunLockNodeOperations(source)).toEqual([]);});
+
+  test("rejects run-lock extra fs subprocess network computed and aliased Node capabilities",()=>{const source=fs.readFileSync(runLockPath,"utf8"),malicious=[`${source}\nimport {readFileSync} from "node:fs";void readFileSync;`,`${source}\nimport {readFile} from "node:fs/promises";void readFile;`,`${source}\nimport {spawn} from "node:child_process";void spawn;`,`${source}\nimport {request} from "node:https";void request;`,source.replace("constants.O_RDONLY","constants[\"O_RDONLY\"]"),`${source}\nconst hiddenOpen=nativeOpenSync;void hiddenOpen;`];for(const fixture of malicious){expect(fixture).not.toBe(source);expect(auditRunLockNodeOperations(fixture).length,fixture.slice(-160)).toBeGreaterThan(0);}});
 
   test("locks the direct pinned-hop module API without exposing the raw adapter",()=>{const source=fs.readFileSync(adapterPath,"utf8");expect(directModuleExportNames(source)).toEqual(["NodeClockInternal","NodeHopProtocolFailureInternal","NodeOperationsInternal","NodePinnedHopCallbacksInternal","NodePinnedHopFailureCodeInternal","NodePinnedHopHandleInternal","NodePinnedHopSettlementInternal","NodeRequestCallbacksInternal","NodeRequestHandleInternal","NodeRequestOptionsInternal","NodeRequestOwnedAgentInternal","NodeResolverInternal","NodeRuntimeCapabilitiesInternal","PinnedHopOpenRequestInternal","PinnedHopRuntimeErrorCodeInternal","PinnedHopRuntimeErrorInternal","PinnedHopRuntimeInternal","PinnedProviderTargetInternal","SecureTransportError","SecureTransportErrorCode","assertPinnedHopRuntimeInternal","createNodeDnsResolver","createNodeRuntimeCapabilitiesInternal","createPinnedHopRuntimeInternal","discardPinnedProviderTargetInternal","getNodeRuntimeClockInternal","getPinnedHopRuntimeRetentionCountsInternal","realNodeOperations"].sort());expect(source).not.toContain("adaptNodeRequestInternal");const decoderSource=fs.readFileSync(decoderAdapterPath,"utf8");expect(auditContentDecoderAdapter(`${decoderSource}\nimport {gunzipSync} from "node:zlib";void gunzipSync(new Uint8Array());`).length).toBeGreaterThan(0);expect(directModuleExportNames(decoderSource)).toEqual(["ContentDecodeCapabilitiesInternal","ContentDecodeOperationsDescriptorInternal","createContentDecodeCapabilitiesInternal","createNodeContentDecodeCapabilitiesInternal"].sort());expect(Object.keys(contentDecodingModule).sort()).toEqual(["createContentDecodeCapabilitiesInternal","createNodeContentDecodeCapabilitiesInternal"]);const scannerSource=fs.readFileSync(path.join(root,"src/acquisition/json-wire-scanner-internal.ts"),"utf8");expect(scannerSource).not.toContain("registerInternal");expect(scannerSource).not.toContain("Object.defineProperty(getProviderJsonSettlementInternal");expect(directModuleExportNames(scannerSource)).toEqual(["ProviderJsonRootSnapshotInternal","ProviderJsonScanError","ProviderJsonScanErrorCode","ProviderJsonScanOptions","ProviderJsonSettlementLookupInternal","ProviderJsonValueInternal","getProviderJsonSettlementInternal","scanAndParseProviderJsonInternal","snapshotProviderJsonInternal"].sort());expect(Object.keys(jsonScannerModule).sort()).toEqual(["ProviderJsonScanError","getProviderJsonSettlementInternal","scanAndParseProviderJsonInternal","snapshotProviderJsonInternal"]);const secureSource=fs.readFileSync(secureJsonTransportPath,"utf8");expect(secureSource).not.toMatch(/registerInternal|Object\.defineProperty\([^)]*(register|finalize)/u);expect(directModuleExportNames(secureSource)).toEqual(["ContentDecodeCapabilitiesInternal","ContentDecodeOperationsDescriptorInternal","PhysicalRequestAbortReasonInternal","SecureJsonTransport","SecureTransportCapabilitiesInternal","SecureTransportRequestHandleInternal","assertSecureJsonTransportInternal","createContentDecodeCapabilitiesInternal","createNodeSecureTransportCapabilitiesInternal","createSecureJsonTransport","createSecureTransportCapabilitiesInternal","getProviderJsonSettlementInternal","openSecureTransportRequestInternal"].sort());expect(Object.keys(secureJsonTransportModule).sort()).toEqual(["assertSecureJsonTransportInternal","createContentDecodeCapabilitiesInternal","createNodeSecureTransportCapabilitiesInternal","createSecureJsonTransport","createSecureTransportCapabilitiesInternal","getProviderJsonSettlementInternal","openSecureTransportRequestInternal"]);const transportSource=fs.readFileSync(path.join(root,"src/acquisition/transport.ts"),"utf8");expect(transportSource).not.toMatch(/finalizeDecoded|getDecodedSettlementCandidate|registerInternal/u);expect(directModuleExportNames(transportSource)).toEqual(["EncodedBytesInternal","EncodedTransportInternal","EncodedTransportOutcomeInternal","EncodedTransportRequestHandleInternal","EncodedTransportSuccessInternal","SecureTransportError","SecureTransportOptions","SecureTransportRequest","createEncodedTransportInternal","createEncodedTransportOutcomeInternal"].sort());for(const file of [decoderAdapterPath,secureJsonTransportPath,path.join(root,"src/acquisition/transport.ts")])expect(fs.readFileSync(file,"utf8"),file).not.toContain("JSON.parse");});
 
