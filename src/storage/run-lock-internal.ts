@@ -46,6 +46,7 @@ export type ResearchRunLockErrorCodeInternal =
   | "lock.io-failed";
 
 const authenticLockErrors = new WeakSet<object>();
+const uncertainAcquisitionCleanupErrors = new WeakSet<object>();
 
 export class ResearchRunLockError extends Error {
   readonly code: ResearchRunLockErrorCodeInternal;
@@ -172,6 +173,17 @@ export function getResearchRunLockRetentionCountsInternal(
   const state = authenticateRetentionObserver(observer);
   if (state === null) fail("lock.invalid-input");
   return Object.freeze({ descriptors: state.root + state.state + state.lock });
+}
+
+export function isResearchRunLockTestHooksInternal(value: unknown): value is ResearchRunLockTestHooksInternal {
+  return value !== null && typeof value === "object" && !utilTypes.isProxy(value) && Object.isFrozen(value)
+    && hooksState.has(value);
+}
+
+export function isResearchRunLockAcquisitionCleanupUncertainInternal(
+  value: unknown,
+): value is ResearchRunLockError {
+  return isAuthenticLockError(value) && uncertainAcquisitionCleanupErrors.has(value);
 }
 
 export function createResearchRunLockTestHooksInternal(
@@ -375,8 +387,11 @@ export async function acquireResearchRunLockInternal(
     lockState.set(lock, state);
     return lock;
   } catch (error) {
+    const lockWasPublished = lockFd !== undefined;
     closeFailedAcquisitionDescriptors(retention, { lock: lockFd, state: stateFd, root: rootFd });
-    throw wrap(error);
+    const normalized = wrap(error);
+    if (lockWasPublished) uncertainAcquisitionCleanupErrors.add(normalized);
+    throw normalized;
   }
 }
 
