@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }}, Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            node: '22.19.0'
+          - os: ubuntu-latest
+            node: '24.x'
+          - os: windows-latest
+            node: '24.x'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+      - name: Run checks
+        run: npm run check
+
+  package:
+    name: Package audit
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24.x'
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+      - name: Audit package contents
+        shell: bash
+        run: |
+          npm pack --dry-run --json --ignore-scripts > "$RUNNER_TEMP/npm-pack.json"
+          node --input-type=module <<'NODE'
+          import { readFileSync } from "node:fs";
+          import { join } from "node:path";
+
+          const fail = () => { throw new Error("package audit rejected"); };
+          const runnerTemp = process.env.RUNNER_TEMP;
+          if (typeof runnerTemp !== "string" || runnerTemp.length === 0) fail();
+
+          let root;
+          try { root = JSON.parse(readFileSync(join(runnerTemp, "npm-pack.json"), "utf8")); }
+          catch { fail(); }
+          if (!Array.isArray(root) || root.length !== 1) fail();
+          const entry = root[0];
+          if (entry === null || typeof entry !== "object" || !Array.isArray(entry.files)) fail();
+
+          const paths = entry.files.map((file) => {
+            if (file === null || typeof file !== "object" || typeof file.path !== "string") fail();
+            return file.path;
+          });
+          if (paths.length !== 50 || new Set(paths).size !== 50) fail();
+
+          const required = [
+            "README.md",
+            "LICENSE",
+            "package.json",
+            "extensions/research/index.ts",
+            "src/index.ts",
+          ];
+          if (required.some((path) => !paths.includes(path))) fail();
+
+          const allowedRoots = new Set(["README.md", "LICENSE", "package.json"]);
+          if (paths.some((path) => !allowedRoots.has(path) && !path.startsWith("extensions/") && !path.startsWith("src/"))) fail();
+          if (paths.some((path) =>
+            path.startsWith("docs/") ||
+            path.startsWith("tests/") ||
+            path.includes("/fixtures/") ||
+            path === "tsconfig.json" ||
+            path === "vitest.config.ts" ||
+            path.endsWith(".tmp") ||
+            path.includes(".original.")
+          )) fail();
+
+          console.log(`package-files=${paths.length}`);
+          NODE
