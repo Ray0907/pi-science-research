@@ -25,10 +25,13 @@ jobs:
         include:
           - os: ubuntu-latest
             node: '22.19.0'
+            suite: full
           - os: ubuntu-latest
             node: '24.x'
+            suite: full
           - os: windows-latest
             node: '24.x'
+            suite: acquisition
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -42,8 +45,15 @@ jobs:
           cache-dependency-path: package-lock.json
       - name: Install dependencies
         run: npm ci --ignore-scripts
-      - name: Run checks
+      - name: Run full checks
+        if: matrix.suite == 'full'
         run: npm run check -- --testTimeout=30000
+      - name: Type-check Windows acquisition
+        if: matrix.suite == 'acquisition'
+        run: npm run typecheck
+      - name: Run Windows acquisition checks
+        if: matrix.suite == 'acquisition'
+        run: npm test -- --run --testTimeout=30000 tests/acquisition tests/extensions/academic-tools.test.ts
 
   package:
     name: Package audit
