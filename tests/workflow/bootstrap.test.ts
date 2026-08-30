@@ -17,6 +17,7 @@ import {
   createResearchBootstrapContextInternal,
   createResearchBootstrapTestHooksInternal,
   createResolvedResearchRoleSnapshotInternal,
+  getResearchBootstrapFailureInternal,
   projectResearchTopicInternal,
   type ResearchBootstrapOperationFaultInternal,
   type ResearchBootstrapPhaseInternal,
@@ -80,6 +81,7 @@ function hooks(phases: ResearchBootstrapPhaseInternal[] = [], overrides: Partial
   monotonicNow: () => number;
   faultAt: ResearchBootstrapOperationFaultInternal | null;
   lockFailAt: ResearchRunLockPhaseInternal | null;
+  onCheck: (phase: ResearchBootstrapPhaseInternal) => void | Promise<void>;
 }> = {}) {
   let randomOrdinal = 0;
   const lockHooks = createResearchRunLockTestHooksInternal({
@@ -92,7 +94,10 @@ function hooks(phases: ResearchBootstrapPhaseInternal[] = [], overrides: Partial
     now: overrides.now ?? (() => new Date(NOW)),
     monotonicNow: overrides.monotonicNow ?? (() => 100),
     randomBytes: (size) => new Uint8Array(size).fill(++randomOrdinal),
-    onCheck: (phase) => { phases.push(phase); },
+    onCheck: (phase) => {
+      phases.push(phase);
+      return overrides.onCheck?.(phase);
+    },
     faultAt: overrides.faultAt ?? null,
     lockHooks,
   });
@@ -379,6 +384,16 @@ describe.skipIf(process.platform === "win32")("durable research bootstrap", () =
     } else {
       await expect(lstat(join(outcome.rootPath, ".state", "controller.lock"))).rejects.toMatchObject({ code: "ENOENT" });
     }
+    if (faultAt === "normal-active-checkpoint-write-partial" || faultAt === "normal-active-checkpoint-durability") {
+      const failure = getResearchBootstrapFailureInternal(outcome.error);
+      expect(failure).toEqual({
+        runId: "run-01010101010101010101010101010101",
+        rootPath: outcome.rootPath,
+        lastDurableSeq: 2,
+        state: "planning",
+      });
+      expect(Object.isFrozen(failure)).toBe(true);
+    }
   });
 
   test.each([
@@ -408,6 +423,14 @@ describe.skipIf(process.platform === "win32")("durable research bootstrap", () =
   ] as const)("classifies %s as a redacted integrity failure", async (faultAt) => {
     const outcome = await faultOutcome(faultAt, "bootstrap.integrity-failed");
     await expect(lstat(join(outcome.rootPath, ".state", "controller.lock"))).rejects.toMatchObject({ code: "ENOENT" });
+    const failure = getResearchBootstrapFailureInternal(outcome.error);
+    expect(failure).toEqual({
+      runId: "run-01010101010101010101010101010101",
+      rootPath: outcome.rootPath,
+      lastDurableSeq: 3,
+      state: "unknown",
+    });
+    expect(Object.isFrozen(failure)).toBe(true);
   });
 
   test.each([
@@ -430,24 +453,177 @@ describe.skipIf(process.platform === "win32")("durable research bootstrap", () =
     expect((await lstat(join(withPrimaryFailure.rootPath, ".state", "controller.lock"))).isFile()).toBe(true);
   });
 
-  test("rejects unreachable cancellation fault values from the exact three-event Task 6 hook contract", () => {
-    for (const faultAt of [
-      "cancellation-active-checkpoint-write-partial",
-      "cancellation-active-checkpoint-durability",
-      "cancel-requested-write-partial",
-      "cancel-requested-durability",
-      "cancelled-transition-write-partial",
-      "cancelled-transition-durability",
-    ] as const) {
-      expect(() => createResearchBootstrapTestHooksInternal({
-        now: () => NOW,
-        monotonicNow: () => 0,
-        randomBytes: (size) => new Uint8Array(size),
-        onCheck: null,
-        faultAt: faultAt as never,
-        lockHooks: null,
-      })).toThrow(expectCode("bootstrap.invalid-input"));
+  test("authenticates native signals without enumerating or freezing the live signal", async () => {
+    const project = await projectFixture();
+    const value = invocation("Native cancellation authentication");
+    let proxyTouched = false;
+    const proxied = new Proxy(new AbortController().signal, {
+      ownKeys() { proxyTouched = true; throw new Error("must not enumerate"); },
+    });
+    expect(() => context(project, value, { signal: proxied })).toThrow(expectCode("bootstrap.invalid-input"));
+    expect(proxyTouched).toBe(false);
+
+    const fake = Object.create(AbortSignal.prototype) as AbortSignal;
+    expect(() => context(project, value, { signal: fake })).toThrow(expectCode("bootstrap.invalid-input"));
+
+    let accessorTouched = false;
+    const accessorSignal = new AbortController().signal;
+    Object.defineProperty(accessorSignal, "aborted", {
+      configurable: true,
+      get() { accessorTouched = true; throw new Error("must not invoke"); },
+    });
+    expect(() => context(project, value, { signal: accessorSignal })).toThrow(expectCode("bootstrap.invalid-input"));
+    expect(accessorTouched).toBe(false);
+
+    const controller = new AbortController();
+    const liveContext = context(project, value, { signal: controller.signal });
+    expect(Object.isFrozen(controller.signal)).toBe(false);
+    controller.abort("redacted reason");
+    await expect(bootstrapResearchRunInternal(value, liveContext, hooks()))
+      .rejects.toEqual(expectCode("bootstrap.cancelled"));
+    expect(Object.isFrozen(controller.signal)).toBe(false);
+  });
+
+  test.each([
+    "before-root-create",
+    "after-root-create",
+    "after-lock-acquire",
+    "after-ledger-open",
+    "after-ledger-directory-sync",
+  ] as const)("cancels at the %s pre-run boundary without publishing a run", async (boundary) => {
+    const project = await projectFixture();
+    const value = invocation(`--output boundary-${boundary} Boundary cancellation`);
+    const controller = new AbortController();
+    const error = await bootstrapResearchRunInternal(value, context(project, value, { signal: controller.signal }), hooks([], {
+      onCheck: (phase) => { if (phase === boundary) controller.abort("private reason"); },
+    })).then(() => null, (caught: unknown) => caught);
+
+    expect(error).toEqual(expectCode("bootstrap.cancelled"));
+    const rootPath = join(await realpath(project), `boundary-${boundary}`);
+    if (boundary === "before-root-create") {
+      await expect(lstat(rootPath)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(getResearchBootstrapFailureInternal(error)).toBeNull();
+    } else {
+      expect(getResearchBootstrapFailureInternal(error)).toEqual({
+        runId: "run-01010101010101010101010101010101",
+        rootPath,
+        lastDurableSeq: 0,
+        state: "orphan",
+      });
+      await expect(lstat(join(rootPath, ".state", "controller.lock"))).rejects.toMatchObject({ code: "ENOENT" });
     }
+  });
+
+  test.each([
+    ["after-run-created", ["run_created", "active_time_checkpoint", "cancel_requested", "state_changed"]],
+    ["after-planning-transition", ["run_created", "state_changed", "active_time_checkpoint", "cancel_requested", "state_changed"]],
+    ["after-active-checkpoint", ["run_created", "state_changed", "active_time_checkpoint", "cancel_requested", "state_changed"]],
+  ] as const)("durably cancels at %s without duplicating the active checkpoint", async (boundary, eventTypes) => {
+    const project = await projectFixture();
+    const value = invocation(`Cancel durably at ${boundary}`);
+    const controller = new AbortController();
+    const error = await bootstrapResearchRunInternal(value, context(project, value, { signal: controller.signal }), hooks([], {
+      onCheck: (phase) => { if (phase === boundary) controller.abort("private reason"); },
+    })).then(() => null, (caught: unknown) => caught);
+
+    expect(error).toEqual(expectCode("bootstrap.cancelled"));
+    const failure = getResearchBootstrapFailureInternal(error);
+    expect(failure).toEqual({
+      runId: "run-01010101010101010101010101010101",
+      rootPath: expect.any(String),
+      lastDurableSeq: eventTypes.length,
+      state: "cancelled",
+    });
+    expect(Object.isFrozen(failure)).toBe(true);
+    const events = await readVerifiedLedgerSnapshot(join(failure!.rootPath, ".state", "events.jsonl"), { trustedRoot: failure!.rootPath });
+    expect(events.map((event) => event.type)).toEqual(eventTypes);
+    const cancellation = events.find((event) => event.type === "cancel_requested");
+    expect(cancellation?.payload).toEqual({ executionEpoch: 0, reason: "abort-signal" });
+    const transition = events.at(-1);
+    expect(transition?.type).toBe("state_changed");
+    if (transition?.type === "state_changed") expect(transition.payload.to).toBe("cancelled");
+  });
+
+  test("ignores an abort after the final cancellation boundary", async () => {
+    const project = await projectFixture();
+    const value = invocation("Late abort");
+    const controller = new AbortController();
+    const result = await bootstrapResearchRunInternal(value, context(project, value, { signal: controller.signal }), hooks([], {
+      onCheck: (phase) => { if (phase === "before-final-verify") controller.abort("too late"); },
+    }));
+    expect(result.state).toBe("planning");
+    const events = await readVerifiedLedgerSnapshot(join(result.rootPath, ".state", "events.jsonl"), { trustedRoot: result.rootPath });
+    expect(events.map((event) => event.type)).toEqual(["run_created", "state_changed", "active_time_checkpoint"]);
+  });
+
+  test.each([
+    ["cancellation-active-checkpoint-write-partial", 1],
+    ["cancellation-active-checkpoint-durability", 1],
+    ["cancel-requested-write-partial", 2],
+    ["cancel-requested-durability", 2],
+    ["cancelled-transition-write-partial", 3],
+    ["cancelled-transition-durability", 3],
+  ] as const)("reports the last confirmed durable event for %s", async (faultAt, lastDurableSeq) => {
+    const project = await projectFixture();
+    const value = invocation(`Cancellation fault ${faultAt}`);
+    const controller = new AbortController();
+    const error = await bootstrapResearchRunInternal(value, context(project, value, { signal: controller.signal }), hooks([], {
+      faultAt,
+      onCheck: (phase) => { if (phase === "after-run-created") controller.abort("private reason"); },
+    })).then(() => null, (caught: unknown) => caught);
+
+    expect(error).toEqual(expectCode("bootstrap.persistence-failed"));
+    expect(getResearchBootstrapFailureInternal(error)).toEqual({
+      runId: "run-01010101010101010101010101010101",
+      rootPath: expect.any(String),
+      lastDurableSeq,
+      state: "created",
+    });
+  });
+
+  test("gives final root integrity failure precedence over durable cancellation", async () => {
+    const project = await projectFixture();
+    const value = invocation("Cancellation integrity precedence");
+    const controller = new AbortController();
+    const error = await bootstrapResearchRunInternal(value, context(project, value, { signal: controller.signal }), hooks([], {
+      faultAt: "root-revalidate-before",
+      onCheck: (phase) => { if (phase === "after-run-created") controller.abort("private reason"); },
+    })).then(() => null, (caught: unknown) => caught);
+
+    expect(error).toEqual(expectCode("bootstrap.integrity-failed"));
+    expect(error).toBeInstanceOf(ResearchBootstrapError);
+    const failure = getResearchBootstrapFailureInternal(error);
+    expect(failure).toEqual({
+      runId: "run-01010101010101010101010101010101",
+      rootPath: expect.any(String),
+      lastDurableSeq: 4,
+      state: "unknown",
+    });
+    expect(Object.isFrozen(failure)).toBe(true);
+  });
+
+  test("exposes frozen sidecars only for authentic errors and gives cleanup precedence", async () => {
+    expect(getResearchBootstrapFailureInternal(new ResearchBootstrapError("bootstrap.cancelled"))).toBeNull();
+    expect(getResearchBootstrapFailureInternal({ code: "bootstrap.cancelled" })).toBeNull();
+    let touched = false;
+    const proxy = new Proxy({}, { ownKeys() { touched = true; throw new Error("must not enumerate"); } });
+    expect(getResearchBootstrapFailureInternal(proxy)).toBeNull();
+    expect(touched).toBe(false);
+
+    const project = await projectFixture();
+    const value = invocation("Cancellation cleanup precedence");
+    const controller = new AbortController();
+    const error = await bootstrapResearchRunInternal(value, context(project, value, { signal: controller.signal }), hooks([], {
+      lockFailAt: "before-release-verify",
+      onCheck: (phase) => { if (phase === "after-run-created") controller.abort("private reason"); },
+    })).then(() => null, (caught: unknown) => caught);
+    expect(error).toEqual(expectCode("bootstrap.cleanup-uncertain"));
+    expect(getResearchBootstrapFailureInternal(error)).toEqual(expect.objectContaining({
+      lastDurableSeq: 4,
+      state: "cancelled",
+    }));
+    expect(Object.keys(error as object).sort()).toEqual(["code", "name"]);
+    expect(JSON.stringify(error)).not.toContain("rootPath");
   });
 
   test("rejects calculation-enabled runs before IDs, clocks, approval, hooks, or filesystem creation", async () => {

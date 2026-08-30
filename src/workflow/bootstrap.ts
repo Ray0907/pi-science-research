@@ -67,8 +67,11 @@ const NATIVE_PROMISE_SPECIES_DESCRIPTOR = Object.getOwnPropertyDescriptor(NATIVE
 const NATIVE_PROMISE_SPECIES_GETTER = NATIVE_PROMISE_SPECIES_DESCRIPTOR.get;
 const DATE_GET_TIME = Date.prototype.getTime;
 const DATE_TO_ISO_STRING = Date.prototype.toISOString;
-const ABORTED_GETTER = Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")?.get;
+const NATIVE_ABORT_SIGNAL_PROTOTYPE = AbortSignal.prototype;
+const NATIVE_ABORTED_GETTER = Object.getOwnPropertyDescriptor(NATIVE_ABORT_SIGNAL_PROTOTYPE, "aborted")?.get;
+const NATIVE_THROW_IF_ABORTED = Object.getOwnPropertyDescriptor(NATIVE_ABORT_SIGNAL_PROTOTYPE, "throwIfAborted")?.value;
 const authenticErrors = new WeakSet<object>();
+const failureSidecars = new WeakMap<object, ResearchBootstrapFailureInternal>();
 const roleSnapshots = new WeakMap<object, { readonly invocation: NormalizedResearchInvocationInternal }>();
 const contexts = new WeakSet<object>();
 const hookStates = new WeakMap<object, MutableTestHookState>();
@@ -135,6 +138,12 @@ export type ResearchBootstrapOperationFaultInternal =
   | "planning-transition-durability"
   | "normal-active-checkpoint-write-partial"
   | "normal-active-checkpoint-durability"
+  | "cancellation-active-checkpoint-write-partial"
+  | "cancellation-active-checkpoint-durability"
+  | "cancel-requested-write-partial"
+  | "cancel-requested-durability"
+  | "cancelled-transition-write-partial"
+  | "cancelled-transition-durability"
   | "ledger-read-before"
   | "ledger-verify-before"
   | "ledger-close-after"
@@ -163,6 +172,19 @@ export interface ResearchBootstrapResultInternal {
   readonly rootPath: string;
   readonly state: "planning";
   readonly budget: RunSnapshot["budget"];
+}
+
+export interface ResearchBootstrapFailureInternal {
+  readonly runId: RunId;
+  readonly rootPath: string;
+  readonly lastDurableSeq: number;
+  readonly state: "orphan" | "created" | "planning" | "cancelled" | "unknown";
+}
+
+/** Returns durable recovery metadata only for errors created by this module instance. */
+export function getResearchBootstrapFailureInternal(error: unknown): ResearchBootstrapFailureInternal | null {
+  if (error === null || typeof error !== "object" || !authenticErrors.has(error)) return null;
+  return failureSidecars.get(error) ?? null;
 }
 
 /** Resolves the invocation's explicit role models without changing unspecified active-session roles. */
@@ -266,6 +288,8 @@ export async function bootstrapResearchRunInternal(
   let approvalInvalid = false;
   let approvalFailed = false;
   let integrityStage = false;
+  let stateClassificationUnknown = false;
+  const durable: DurableBootstrapState = { lastSeq: 0, state: "orphan", activeCheckpoint: false };
   const hooks = authenticateHooks(testHooks);
 
   try {
@@ -280,6 +304,7 @@ export async function bootstrapResearchRunInternal(
     const topic = projectResearchTopicInternal(invocation.question);
 
     await phase(hooks, "before-root-create");
+    throwIfCancelled(context.signal);
     operationFault(hooks, "root-create-before");
     // The root and lock primitives provide the POSIX foundation used here.
     // Their Darwin pathname fallbacks retain the documented same-user race limitation.
@@ -331,27 +356,23 @@ export async function bootstrapResearchRunInternal(
     await phase(hooks, "after-ledger-directory-sync");
     throwIfCancelled(context.signal);
 
-    await ledger.append("run_created", { run: snapshot });
+    ledgerFaults.nextAppend = "run-created";
+    const created = await ledger.append("run_created", { run: snapshot });
+    durable.lastSeq = created.seq;
+    durable.state = "created";
     await phase(hooks, "after-run-created");
-    throwIfCancelled(context.signal);
+    await cancelAtBoundary(context.signal, ledger, lock, hooks, ledgerFaults, durable, startedAt, monotonicStarted);
 
-    await ledger.append("state_changed", { from: "created", to: "planning", blocker: null });
+    ledgerFaults.nextAppend = "planning-transition";
+    const planning = await ledger.append("state_changed", { from: "created", to: "planning", blocker: null });
+    durable.lastSeq = planning.seq;
+    durable.state = "planning";
     await phase(hooks, "after-planning-transition");
-    throwIfCancelled(context.signal);
+    await cancelAtBoundary(context.signal, ledger, lock, hooks, ledgerFaults, durable, startedAt, monotonicStarted);
 
-    const endedAt = wallClock(hooks);
-    const monotonicEnded = monotonicClock(hooks);
-    const addedMs = elapsedMilliseconds(startedAt.time, endedAt.time, monotonicStarted, monotonicEnded);
-    ledgerFaults.timestamp = endedAt.time;
-    await ledger.append("active_time_checkpoint", {
-      ownerTokenSha256: lock.ownerTokenSha256,
-      intervalStartedAt: startedAt.timestamp,
-      intervalEndedAt: endedAt.timestamp,
-      addedMs,
-      totalMs: addedMs,
-    });
+    await appendActiveCheckpoint(ledger, lock, hooks, ledgerFaults, durable, startedAt, monotonicStarted, "normal-active-checkpoint");
     await phase(hooks, "after-active-checkpoint");
-    throwIfCancelled(context.signal);
+    await cancelAtBoundary(context.signal, ledger, lock, hooks, ledgerFaults, durable, startedAt, monotonicStarted);
 
     integrityStage = true;
     await phase(hooks, "before-final-verify");
@@ -365,6 +386,7 @@ export async function bootstrapResearchRunInternal(
       || reduced.runState !== "planning" || reduced.currentEpoch !== 0) fail("bootstrap.integrity-failed");
   } catch (error) {
     primary = classifyFailure(error, approvalInvalid, approvalFailed, integrityStage);
+    if (integrityStage && primary.code === "bootstrap.integrity-failed") stateClassificationUnknown = true;
   }
 
   if (ledger) {
@@ -394,7 +416,8 @@ export async function bootstrapResearchRunInternal(
       operationFault(hooks, "root-revalidate-before");
       await revalidateOwnedRunRoot(root);
     } catch (error) {
-      primary ??= classifyIntegrityFailure(error);
+      if (!primary || primary.code === "bootstrap.cancelled") primary = classifyIntegrityFailure(error);
+      stateClassificationUnknown = true;
     }
     try { await phase(hooks, "before-root-close"); }
     catch (error) { primary ??= classifyFailure(error, false, false, false); }
@@ -404,10 +427,103 @@ export async function bootstrapResearchRunInternal(
     } catch { cleanupUncertain = true; }
   }
 
-  if (cleanupUncertain) throw createError("bootstrap.cleanup-uncertain");
-  if (primary) throw primary;
+  const finalError = cleanupUncertain ? createError("bootstrap.cleanup-uncertain") : primary;
+  if (finalError) {
+    if (root) attachFailureSidecar(finalError, root, durable, stateClassificationUnknown);
+    throw finalError;
+  }
   const resultBudget = initialBudget(invocation);
   return Object.freeze({ runId: root!.runId, rootPath: root!.path, state: "planning" as const, budget: resultBudget });
+}
+
+interface DurableBootstrapState {
+  lastSeq: number;
+  state: "orphan" | "created" | "planning" | "cancelled";
+  activeCheckpoint: boolean;
+}
+
+type BootstrapAppendPurpose =
+  | "run-created"
+  | "planning-transition"
+  | "normal-active-checkpoint"
+  | "cancellation-active-checkpoint"
+  | "cancel-requested"
+  | "cancelled-transition";
+
+interface BootstrapLedgerFaultOptions {
+  timestamp: number;
+  io: { append: typeof appendFully } | undefined;
+  durability: typeof defaultDurability | undefined;
+  nextAppend: BootstrapAppendPurpose | null;
+}
+
+async function cancelAtBoundary(
+  signal: AbortSignal | undefined,
+  ledger: EventLedger,
+  lock: ResearchRunLockInternal,
+  hooks: MutableTestHookState | null,
+  ledgerFaults: BootstrapLedgerFaultOptions,
+  durable: DurableBootstrapState,
+  startedAt: { readonly time: number; readonly timestamp: string },
+  monotonicStarted: number,
+): Promise<void> {
+  if (!isCancellationRequested(signal)) return;
+  if (!durable.activeCheckpoint) {
+    await appendActiveCheckpoint(
+      ledger, lock, hooks, ledgerFaults, durable, startedAt, monotonicStarted, "cancellation-active-checkpoint",
+    );
+  }
+  ledgerFaults.nextAppend = "cancel-requested";
+  const requested = await ledger.append("cancel_requested", { executionEpoch: 0, reason: "abort-signal" });
+  durable.lastSeq = requested.seq;
+  const from = durable.state;
+  if (from !== "created" && from !== "planning") fail("bootstrap.integrity-failed");
+  ledgerFaults.nextAppend = "cancelled-transition";
+  const cancelled = await ledger.append("state_changed", { from, to: "cancelled", blocker: null });
+  durable.lastSeq = cancelled.seq;
+  durable.state = "cancelled";
+  fail("bootstrap.cancelled");
+}
+
+async function appendActiveCheckpoint(
+  ledger: EventLedger,
+  lock: ResearchRunLockInternal,
+  hooks: MutableTestHookState | null,
+  ledgerFaults: BootstrapLedgerFaultOptions,
+  durable: DurableBootstrapState,
+  startedAt: { readonly time: number; readonly timestamp: string },
+  monotonicStarted: number,
+  purpose: "normal-active-checkpoint" | "cancellation-active-checkpoint",
+): Promise<void> {
+  const endedAt = wallClock(hooks);
+  const monotonicEnded = monotonicClock(hooks);
+  const addedMs = elapsedMilliseconds(startedAt.time, endedAt.time, monotonicStarted, monotonicEnded);
+  ledgerFaults.timestamp = endedAt.time;
+  ledgerFaults.nextAppend = purpose;
+  const checkpoint = await ledger.append("active_time_checkpoint", {
+    ownerTokenSha256: lock.ownerTokenSha256,
+    intervalStartedAt: startedAt.timestamp,
+    intervalEndedAt: endedAt.timestamp,
+    addedMs,
+    totalMs: addedMs,
+  });
+  durable.lastSeq = checkpoint.seq;
+  durable.activeCheckpoint = true;
+}
+
+function attachFailureSidecar(
+  error: ResearchBootstrapError,
+  root: OwnedRunRoot,
+  durable: DurableBootstrapState,
+  unknown: boolean,
+): void {
+  const sidecar = Object.freeze({
+    runId: root.runId,
+    rootPath: root.path,
+    lastDurableSeq: Number.isSafeInteger(durable.lastSeq) && durable.lastSeq >= 0 ? durable.lastSeq : 0,
+    state: unknown ? "unknown" as const : durable.state,
+  });
+  failureSidecars.set(error, sidecar);
 }
 
 function createInitialSnapshot(
@@ -461,25 +577,20 @@ function initialBudget(invocation: NormalizedResearchInvocationInternal): RunSna
   });
 }
 
-function ledgerFaultOptions(hooks: MutableTestHookState | null, initialTimestamp: number): {
-  timestamp: number;
-  io: { append: typeof appendFully } | undefined;
-  durability: typeof defaultDurability | undefined;
-} {
-  const output: {
-    timestamp: number;
-    io: { append: typeof appendFully } | undefined;
-    durability: typeof defaultDurability | undefined;
-  } = { timestamp: initialTimestamp, io: undefined, durability: undefined };
+function ledgerFaultOptions(hooks: MutableTestHookState | null, initialTimestamp: number): BootstrapLedgerFaultOptions {
+  const output: BootstrapLedgerFaultOptions = {
+    timestamp: initialTimestamp,
+    io: undefined,
+    durability: undefined,
+    nextAppend: null,
+  };
   if (!hooks) return output;
-  let appendOrdinal = 0;
-  const partialFaults = ["run-created-write-partial", "planning-transition-write-partial", "normal-active-checkpoint-write-partial"] as const;
-  const durabilityFaults = ["run-created-durability", "planning-transition-durability", "normal-active-checkpoint-durability"] as const;
   output.io = {
     async append(handle, bytes) {
-      appendOrdinal += 1;
-      if (hooks.faultAt === partialFaults[appendOrdinal - 1]) {
+      const appendFault = output.nextAppend === null ? null : `${output.nextAppend}-write-partial`;
+      if (appendFault !== null && hooks.faultAt === appendFault) {
         hooks.faultAt = null;
+        output.nextAppend = null;
         const partial = Math.max(1, Math.floor(bytes.byteLength / 2));
         await handle.write(bytes, 0, partial, null);
         throw new Error("injected bootstrap append fault");
@@ -488,11 +599,14 @@ function ledgerFaultOptions(hooks: MutableTestHookState | null, initialTimestamp
     },
   };
   output.durability = async (handle, reason) => {
-    if (reason === "append" && hooks.faultAt === durabilityFaults[appendOrdinal - 1]) {
+    const appendFault = output.nextAppend === null ? null : `${output.nextAppend}-durability`;
+    if (reason === "append" && appendFault !== null && hooks.faultAt === appendFault) {
       hooks.faultAt = null;
+      output.nextAppend = null;
       throw new Error("injected bootstrap durability fault");
     }
     await defaultDurability(handle, reason);
+    if (reason === "append") output.nextAppend = null;
   };
   return output;
 }
@@ -523,19 +637,35 @@ function authenticateHooks(value: ResearchBootstrapTestHooksInternal | undefined
 
 function checkedSignal(value: unknown): AbortSignal | undefined {
   if (value === undefined) return undefined;
-  if (value === null || typeof value !== "object" || utilTypes.isProxy(value)
-    || Object.getPrototypeOf(value) !== AbortSignal.prototype || typeof ABORTED_GETTER !== "function") fail("bootstrap.invalid-input");
-  try { Reflect.apply(ABORTED_GETTER, value, []); }
-  catch { fail("bootstrap.invalid-input"); }
+  if (value === null || typeof value !== "object" || NATIVE_IS_PROXY(value)
+    || NATIVE_GET_PROTOTYPE_OF(value) !== NATIVE_ABORT_SIGNAL_PROTOTYPE
+    || typeof NATIVE_ABORTED_GETTER !== "function" || typeof NATIVE_THROW_IF_ABORTED !== "function") fail("bootstrap.invalid-input");
+  try {
+    if (NATIVE_GET_OWN_PROPERTY_DESCRIPTOR(value, "aborted") !== undefined
+      || NATIVE_GET_OWN_PROPERTY_DESCRIPTOR(value, "throwIfAborted") !== undefined) fail("bootstrap.invalid-input");
+    const aborted = NATIVE_REFLECT_APPLY(NATIVE_ABORTED_GETTER, value, []);
+    if (typeof aborted !== "boolean") fail("bootstrap.invalid-input");
+  } catch (error) {
+    if (isAuthenticError(error)) throw error;
+    fail("bootstrap.invalid-input");
+  }
   return value as AbortSignal;
 }
 
-function throwIfCancelled(signal: AbortSignal | undefined): void {
-  if (!signal) return;
+function isCancellationRequested(signal: AbortSignal | undefined): boolean {
+  if (!signal) return false;
   let aborted: unknown;
-  try { aborted = Reflect.apply(ABORTED_GETTER!, signal, []); }
+  try { aborted = NATIVE_REFLECT_APPLY(NATIVE_ABORTED_GETTER!, signal, []); }
   catch { fail("bootstrap.invalid-input"); }
-  if (aborted === true) fail("bootstrap.cancelled");
+  if (typeof aborted !== "boolean") fail("bootstrap.invalid-input");
+  if (!aborted) return false;
+  try { NATIVE_REFLECT_APPLY(NATIVE_THROW_IF_ABORTED, signal, []); }
+  catch { return true; }
+  return true;
+}
+
+function throwIfCancelled(signal: AbortSignal | undefined): void {
+  if (isCancellationRequested(signal)) fail("bootstrap.cancelled");
 }
 
 function wallClock(hooks: MutableTestHookState | null): { readonly time: number; readonly timestamp: string } {
@@ -733,7 +863,10 @@ function isOperationFault(value: unknown): value is ResearchBootstrapOperationFa
     "root-create-before", "ledger-open-before", "ledger-directory-sync-before",
     "run-created-write-partial", "run-created-durability", "planning-transition-write-partial",
     "planning-transition-durability", "normal-active-checkpoint-write-partial",
-    "normal-active-checkpoint-durability", "ledger-read-before", "ledger-verify-before",
+    "normal-active-checkpoint-durability", "cancellation-active-checkpoint-write-partial",
+    "cancellation-active-checkpoint-durability", "cancel-requested-write-partial",
+    "cancel-requested-durability", "cancelled-transition-write-partial",
+    "cancelled-transition-durability", "ledger-read-before", "ledger-verify-before",
     "ledger-close-after", "root-revalidate-before", "root-close-after",
   ].includes(value);
 }
