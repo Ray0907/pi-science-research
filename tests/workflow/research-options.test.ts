@@ -26,7 +26,7 @@ function errorCode(rawArgs: string, mode: ResearchInvocationMode = "tui"): Resea
 
 describe("closed research invocation grammar", () => {
   test("returns the exact deeply frozen standard defaults in every invocation mode", () => {
-    for (const mode of ["tui", "rpc", "json", "print"] as const) {
+    for (const mode of ["tui", "rpc", "json"] as const) {
       const invocation = parseResearchInvocationInternal("  What is known?  ", { mode });
       expect(invocation).toEqual({
         question: "What is known?",
@@ -81,7 +81,7 @@ describe("closed research invocation grammar", () => {
 
   test("transports deterministic quoted option values without interpreting question text", () => {
     const invocation = parseResearchInvocationInternal(
-      String.raw`--output 'private report.md' --language "en-US" --model-role "coordinator=provider/model\"quoted" --calculation-policy "pol\\icy.json" "question remains \q and 'unterminated"`,
+      String.raw`--output 'private report.md' --language "en-US" --model-role "coordinator=provider/model\"quoted" --allow-calculations --calculation-policy "pol\\icy.json" "question remains \q and 'unterminated"`,
       { mode: "json" },
     );
     expect(invocation.requestedOutput).toBe("private report.md");
@@ -102,7 +102,7 @@ describe("closed research invocation grammar", () => {
   });
 
   test("ends options only on exact double dash and preserves the trimmed question remainder", () => {
-    expect(parseResearchInvocationInternal("-- --depth deep literal question  ", { mode: "print" }).question)
+    expect(parseResearchInvocationInternal("-- --depth deep literal question  ", { mode: "tui" }).question)
       .toBe("--depth deep literal question");
     expect(parseResearchInvocationInternal("--depth quick   first  --output later.md  ", { mode: "tui" }))
       .toMatchObject({ depth: "quick", requestedOutput: null, question: "first  --output later.md" });
@@ -131,15 +131,102 @@ describe("closed research invocation grammar", () => {
     expect(errorCode("--model-role coordinator question")).toBe("research-options.invalid-option-value");
   });
 
-  test("rejects budget overrides outside depth minima and hard maxima", () => {
+  test("requires each model role identifier to contain one nonempty provider/model pair", () => {
+    for (const assignment of [
+      "coordinator=/model",
+      "coordinator=provider/",
+      "coordinator=provider/model/extra",
+      "coordinator=providermodel",
+      "coordinator=provider//model",
+    ]) expect(errorCode(`--model-role ${assignment} question`)).toBe("research-options.invalid-option-value");
+  });
+
+  test("enforces exact UTF-8 byte limits for output policy paths and model identifiers without exposing values", () => {
+    const exactOutput = "😀".repeat(1_024);
+    const exactModel = `p/${"😀".repeat(127)}xx`;
+    const exactPolicy = "😀".repeat(1_024);
+    const immediateOverOutput = `${exactOutput}a`;
+    const immediateOverModel = `${exactModel}a`;
+    const immediateOverPolicy = `${exactPolicy}a`;
+    const invocation = parseResearchInvocationInternal(
+      `--output ${exactOutput} --model-role coordinator=${exactModel} --allow-calculations --calculation-policy ${exactPolicy} question`,
+      { mode: "json" },
+    );
+    expect(Buffer.byteLength(invocation.requestedOutput!, "utf8")).toBe(4_096);
+    expect(Buffer.byteLength(invocation.modelOverrides.coordinator!, "utf8")).toBe(512);
+    expect(Buffer.byteLength(invocation.calculationPolicyPath!, "utf8")).toBe(4_096);
+    expect(Buffer.byteLength(immediateOverOutput, "utf8")).toBe(4_097);
+    expect(Buffer.byteLength(immediateOverModel, "utf8")).toBe(513);
+    expect(Buffer.byteLength(immediateOverPolicy, "utf8")).toBe(4_097);
+
     for (const rawArgs of [
-      "--depth quick --max-time 0ms question",
-      "--depth quick --max-time 1s question",
-      "--max-time 25h question",
-      "--max-sources 0 question",
-      "--max-sources -1 question",
-      "--max-sources 501 question",
+      `--output ${immediateOverOutput} question`,
+      `--model-role coordinator=${immediateOverModel} question`,
+      `--allow-calculations --calculation-policy ${immediateOverPolicy} question`,
+      `--output ${"😀".repeat(1_025)}SECRET question`,
+      `--model-role coordinator=p/${"😀".repeat(128)}SECRET question`,
+      `--allow-calculations --calculation-policy ${"😀".repeat(1_025)}SECRET question`,
+    ]) expect(errorCode(rawArgs, "json")).toBe("research-options.invalid-option-value");
+  });
+
+  test("accepts only positive integer minute or hour durations within depth minima and the 24h maximum", () => {
+    for (const [rawArgs, activeTimeLimitMs] of [
+      ["--depth quick --max-time 5m question", 5 * 60_000],
+      ["--depth standard --max-time 10m question", 10 * 60_000],
+      ["--depth deep --max-time 20m question", 20 * 60_000],
+      ["--depth deep --max-time 24h question", 24 * 60 * 60_000],
+    ] as const) expect(parseResearchInvocationInternal(rawArgs, { mode: "tui" }).activeTimeLimitMs).toBe(activeTimeLimitMs);
+
+    for (const rawArgs of [
+      "--depth quick --max-time 0m question",
+      "--depth quick --max-time +5m question",
+      "--depth quick --max-time -5m question",
+      "--depth quick --max-time 5.5m question",
+      "--depth standard --max-time 600s question",
+      "--depth standard --max-time 600000ms question",
+      "--depth standard --max-time 1h30m question",
+      "--depth standard --max-time 1e2m question",
+      `--depth quick --max-time ${"9".repeat(512)}m question`,
+      "--depth deep --max-time 19m question",
+      "--depth quick --max-time 25h question",
     ]) expect(errorCode(rawArgs)).toBe("research-options.invalid-option-value");
+  });
+
+  test("enforces invocation-mode calculation and policy combinations", () => {
+    expect(parseResearchInvocationInternal("--allow-calculations question", { mode: "tui" }))
+      .toMatchObject({ allowCalculations: true, calculationPolicyPath: null });
+    for (const mode of ["rpc", "json"] as const) {
+      expect(parseResearchInvocationInternal("question", { mode }))
+        .toMatchObject({ allowCalculations: false, calculationPolicyPath: null });
+      expect(parseResearchInvocationInternal("--allow-calculations --calculation-policy policy.json question", { mode }))
+        .toMatchObject({ allowCalculations: true, calculationPolicyPath: "policy.json" });
+      expect(errorCode("--allow-calculations question", mode)).toBe("research-options.invalid-option-value");
+      expect(errorCode("--calculation-policy policy.json question", mode)).toBe("research-options.invalid-option-value");
+    }
+    expect(errorCode("--calculation-policy policy.json question", "tui")).toBe("research-options.invalid-option-value");
+    expect(errorCode("--allow-calculations --calculation-policy policy.json question", "tui"))
+      .toBe("research-options.invalid-option-value");
+    expect(errorCode("question", "print")).toBe("research-options.invalid-mode");
+    expect(errorCode("--allow-calculations --calculation-policy policy.json question", "print"))
+      .toBe("research-options.invalid-mode");
+  });
+
+  test("canonicalizes exactly one structurally valid BCP-47 language tag", () => {
+    for (const [value, language] of [["EN-us", "en-US"], ["zh-hant-tw", "zh-Hant-TW"], ["fr-CA", "fr-CA"]] as const) {
+      expect(parseResearchInvocationInternal(`--language ${value} question`, { mode: "tui" }).language).toBe(language);
+    }
+    for (const value of ["en_US", "en,fr", "not_a_language", "x", "123"]) {
+      expect(errorCode(`--language ${value} question`)).toBe("research-options.invalid-option-value");
+    }
+  });
+
+  test("accepts only decimal integer source counts from 1 through 500", () => {
+    for (const [value, maxSources] of [["1", 1], ["050", 50], ["500", 500]] as const) {
+      expect(parseResearchInvocationInternal(`--max-sources ${value} question`, { mode: "tui" }).maxSources).toBe(maxSources);
+    }
+    for (const value of ["0", "501", "+1", "-1", "1.0", "1e2", "0x10", "Infinity", "NaN"]) {
+      expect(errorCode(`--max-sources ${value} question`)).toBe("research-options.invalid-option-value");
+    }
   });
 
   test("rejects empty malformed control-bearing ill-formed Unicode and over-limit invocations with closed codes", () => {
@@ -152,7 +239,7 @@ describe("closed research invocation grammar", () => {
     expect(parseResearchInvocationInternal("paired-😀", { mode: "tui" }).question).toBe("paired-😀");
     expect(errorCode("😀".repeat(16_385))).toBe("research-options.command-too-large");
     expect(errorCode(`${"a".repeat(65_536)}\ud800`)).toBe("research-options.command-too-large");
-    expect(errorCode(`--output ${"a".repeat(49_100)} ${"q".repeat(16_385)}`))
+    expect(errorCode(`--output ${"a".repeat(4_096)} ${"q".repeat(16_385)}`))
       .toBe("research-options.question-too-large");
   });
 
@@ -164,6 +251,29 @@ describe("closed research invocation grammar", () => {
       ["question", { mode: "batch" }, "research-options.invalid-mode"],
       ["question", null, "research-options.invalid-mode"],
     ] as const) expect(closedError(() => parse(raw, context)).code).toBe(code);
+  });
+
+  test("accepts only a closed plain mode context and validates non-string raw input before inspecting context", () => {
+    const parse = parseResearchInvocationInternal as (raw: unknown, context: unknown) => unknown;
+    const nullPrototypeContext = Object.assign(Object.create(null) as Record<string, unknown>, { mode: "tui" });
+    expect(parse("question", nullPrototypeContext)).toMatchObject({ question: "question" });
+
+    const symbol = Symbol("SECRET");
+    for (const context of [
+      { mode: "tui", extra: "SECRET" },
+      { mode: "tui", [symbol]: "SECRET" },
+      Object.assign(Object.create({ inherited: "SECRET" }) as Record<string, unknown>, { mode: "tui" }),
+      new (class { mode = "tui"; })(),
+    ]) expect(closedError(() => parse("question", context)).code).toBe("research-options.invalid-mode");
+
+    let getterCalls = 0;
+    const accessorContext = Object.create(null) as Record<string, unknown>;
+    Object.defineProperty(accessorContext, "mode", {
+      enumerable: true,
+      get() { getterCalls += 1; throw new Error("SECRET getter"); },
+    });
+    expect(closedError(() => parse(123, accessorContext)).code).toBe("research-options.invalid-input");
+    expect(getterCalls).toBe(0);
   });
 
   test("rejects live and revoked proxy contexts trap-free and never invokes a mode getter", () => {

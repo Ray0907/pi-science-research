@@ -59,6 +59,9 @@ interface Token {
 
 const MAXIMUM_COMMAND_BYTES = 64 * 1024;
 const MAXIMUM_QUESTION_BYTES = 16 * 1024;
+const MAXIMUM_MODEL_IDENTIFIER_BYTES = 512;
+const MAXIMUM_OUTPUT_PATH_BYTES = 4_096;
+const MAXIMUM_POLICY_PATH_BYTES = 4_096;
 const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f]/u;
 const VALUE_OPTIONS = new Set([
   "--depth",
@@ -121,38 +124,56 @@ function readOptionValue(input: string, start: number): Token {
   return fail("research-options.malformed-quote");
 }
 
-function invocationMode(context: unknown): ResearchInvocationMode {
+function invocationMode(context: unknown): Exclude<ResearchInvocationMode, "print"> {
   if (context === null || typeof context !== "object" || utilTypes.isProxy(context)) {
     fail("research-options.invalid-mode");
   }
+  let prototype: object | null;
+  let keys: PropertyKey[];
   let descriptor: PropertyDescriptor | undefined;
   try {
+    prototype = Object.getPrototypeOf(context);
+    keys = Reflect.ownKeys(context);
     descriptor = Object.getOwnPropertyDescriptor(context, "mode");
   } catch {
     return fail("research-options.invalid-mode");
   }
-  if (!descriptor || !("value" in descriptor)) fail("research-options.invalid-mode");
+  if (prototype !== Object.prototype && prototype !== null) fail("research-options.invalid-mode");
+  if (keys.length !== 1 || keys[0] !== "mode") fail("research-options.invalid-mode");
+  if (!descriptor?.enumerable || !("value" in descriptor)) fail("research-options.invalid-mode");
   const mode = descriptor.value as unknown;
-  if (mode !== "tui" && mode !== "rpc" && mode !== "json" && mode !== "print") fail("research-options.invalid-mode");
+  if (mode !== "tui" && mode !== "rpc" && mode !== "json") fail("research-options.invalid-mode");
   return mode;
 }
 
 function durationMilliseconds(value: string): number {
-  const unit = value.endsWith("ms") ? "ms" : value.endsWith("s") ? "s" : value.endsWith("m") ? "m" : value.endsWith("h") ? "h" : null;
-  if (unit === null) fail("research-options.invalid-option-value");
-  const numeric = value.slice(0, -unit.length);
-  if (numeric.length === 0) fail("research-options.invalid-option-value");
-  const amount = Number(numeric);
-  const multiplier = unit === "h" ? 3_600_000 : unit === "m" ? 60_000 : unit === "s" ? 1_000 : 1;
+  const match = /^([0-9]+)([mh])$/u.exec(value);
+  if (!match) fail("research-options.invalid-option-value");
+  const amount = Number(match[1]);
+  if (!Number.isSafeInteger(amount) || amount <= 0) fail("research-options.invalid-option-value");
+  const multiplier = match[2] === "h" ? 3_600_000 : 60_000;
   const milliseconds = amount * multiplier;
   if (!Number.isSafeInteger(milliseconds)) fail("research-options.invalid-option-value");
   return milliseconds;
 }
 
 function sourceCount(value: string): number {
+  if (!/^[0-9]+$/u.test(value)) fail("research-options.invalid-option-value");
   const count = Number(value);
-  if (!Number.isSafeInteger(count)) fail("research-options.invalid-option-value");
+  if (!Number.isSafeInteger(count) || count < 1 || count > 500) fail("research-options.invalid-option-value");
   return count;
+}
+
+function canonicalLanguage(value: string): string {
+  let canonical: string[];
+  try { canonical = Intl.getCanonicalLocales(value); }
+  catch { return fail("research-options.invalid-option-value"); }
+  if (canonical.length !== 1) fail("research-options.invalid-option-value");
+  return canonical[0]!;
+}
+
+function withinUtf8Limit(value: string, maximumBytes: number): boolean {
+  return Buffer.byteLength(value, "utf8") <= maximumBytes;
 }
 
 function hasUnpairedSurrogate(value: string): boolean {
@@ -178,7 +199,13 @@ function modelAssignment(value: string): readonly [ResearchModelRole, string] {
   if (role !== "coordinator" && role !== "researcher" && role !== "verifier") {
     fail("research-options.invalid-option-value");
   }
-  return [role, value.slice(separator + 1)];
+  const model = value.slice(separator + 1);
+  const slash = model.indexOf("/");
+  if (slash <= 0 || slash === model.length - 1 || model.indexOf("/", slash + 1) !== -1
+    || !withinUtf8Limit(model, MAXIMUM_MODEL_IDENTIFIER_BYTES)) {
+    fail("research-options.invalid-option-value");
+  }
+  return [role, model];
 }
 
 /** Parses arguments following /research without performing shell expansion. */
@@ -186,8 +213,8 @@ export function parseResearchInvocationInternal(
   rawArgs: string,
   context: { readonly mode: ResearchInvocationMode },
 ): NormalizedResearchInvocationInternal {
-  invocationMode(context);
   if (typeof rawArgs !== "string") fail("research-options.invalid-input");
+  const mode = invocationMode(context);
   if (rawArgs.length > MAXIMUM_COMMAND_BYTES) fail("research-options.command-too-large");
   if (hasUnpairedSurrogate(rawArgs)) fail("research-options.invalid-unicode");
   if (Buffer.byteLength(rawArgs, "utf8") > MAXIMUM_COMMAND_BYTES) fail("research-options.command-too-large");
@@ -245,8 +272,11 @@ export function parseResearchInvocationInternal(
         if (token.value !== "quick" && token.value !== "standard" && token.value !== "deep") fail("research-options.invalid-option-value");
         depth = token.value;
         break;
-      case "--output": requestedOutput = token.value; break;
-      case "--language": language = token.value; break;
+      case "--output":
+        if (!withinUtf8Limit(token.value, MAXIMUM_OUTPUT_PATH_BYTES)) fail("research-options.invalid-option-value");
+        requestedOutput = token.value;
+        break;
+      case "--language": language = canonicalLanguage(token.value); break;
       case "--model-role": {
         const [role, model] = modelAssignment(token.value);
         if (mutableModels[role] !== null) fail("research-options.duplicate-model-role");
@@ -255,7 +285,10 @@ export function parseResearchInvocationInternal(
       }
       case "--max-time": activeTimeLimitMs = durationMilliseconds(token.value); break;
       case "--max-sources": maxSourcesOverride = sourceCount(token.value); break;
-      case "--calculation-policy": calculationPolicyPath = token.value; break;
+      case "--calculation-policy":
+        if (!withinUtf8Limit(token.value, MAXIMUM_POLICY_PATH_BYTES)) fail("research-options.invalid-option-value");
+        calculationPolicyPath = token.value;
+        break;
     }
   }
 
@@ -263,6 +296,13 @@ export function parseResearchInvocationInternal(
   if (question.length === 0) fail("research-options.empty-question");
   if (/^\/research(?:$|\s)/u.test(question)) fail("research-options.command-token");
   if (Buffer.byteLength(question, "utf8") > MAXIMUM_QUESTION_BYTES) fail("research-options.question-too-large");
+
+  if (calculationPolicyPath !== null && (!allowCalculations || mode === "tui")) {
+    fail("research-options.invalid-option-value");
+  }
+  if (allowCalculations && mode !== "tui" && calculationPolicyPath === null) {
+    fail("research-options.invalid-option-value");
+  }
 
   let budget: ReturnType<typeof normalizeDepthBudgetInternal>;
   try {
