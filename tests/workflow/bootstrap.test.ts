@@ -6,7 +6,8 @@ import { afterEach, describe, expect, test } from "vitest";
 
 import { parse } from "../../src/domain/schema.js";
 import { RunSnapshotSchema } from "../../src/domain/records.js";
-import { readVerifiedLedgerSnapshot } from "../../src/storage/event-ledger.js";
+import { openEventLedger, readVerifiedLedgerSnapshot } from "../../src/storage/event-ledger.js";
+import { openOwnedRunRoot } from "../../src/storage/run-root.js";
 import {
   createResearchRunLockTestHooksInternal,
   type ResearchRunLockPhaseInternal,
@@ -26,6 +27,8 @@ import { parseResearchInvocationInternal } from "../../src/workflow/research-opt
 import { readFoundationStatus } from "../../extensions/research/status-reader.js";
 
 const NOW = new Date("2026-08-25T12:34:56.000Z");
+const TEST_RUN_ID = "run-01010101010101010101010101010101" as const;
+const TEST_ROOT_OWNERSHIP_TOKEN = "02".repeat(32);
 const roots: string[] = [];
 
 afterEach(async () => {
@@ -81,13 +84,14 @@ function hooks(phases: ResearchBootstrapPhaseInternal[] = [], overrides: Partial
   monotonicNow: () => number;
   faultAt: ResearchBootstrapOperationFaultInternal | null;
   lockFailAt: ResearchRunLockPhaseInternal | null;
+  lockOnCheck: (phase: ResearchRunLockPhaseInternal) => void | Promise<void>;
   onCheck: (phase: ResearchBootstrapPhaseInternal) => void | Promise<void>;
 }> = {}) {
   let randomOrdinal = 0;
   const lockHooks = createResearchRunLockTestHooksInternal({
     now: () => NOW,
     randomBytes: () => new Uint8Array(32).fill(0x5c),
-    onCheck: null,
+    onCheck: overrides.lockOnCheck ?? null,
     failAt: overrides.lockFailAt ?? null,
   });
   return createResearchBootstrapTestHooksInternal({
@@ -106,6 +110,41 @@ function hooks(phases: ResearchBootstrapPhaseInternal[] = [], overrides: Partial
 function expectCode(code: string) {
   return expect.objectContaining({ name: "ResearchBootstrapError", code, message: `Research bootstrap failed (${code})` });
 }
+
+type OperationFaultExpectation = Readonly<{
+  code: "bootstrap.persistence-failed" | "bootstrap.integrity-failed" | "bootstrap.cleanup-uncertain";
+  lastDurableSeq: number | null;
+  state: "orphan" | "created" | "planning" | "unknown" | null;
+  cancelAfterRunCreated?: true;
+  completeLines?: number;
+}>;
+
+const OPERATION_FAULT_EXPECTATIONS = {
+  "root-create-before": { code: "bootstrap.persistence-failed", lastDurableSeq: null, state: null },
+  "ledger-open-before": { code: "bootstrap.persistence-failed", lastDurableSeq: 0, state: "orphan" },
+  "ledger-directory-sync-before": { code: "bootstrap.persistence-failed", lastDurableSeq: 0, state: "orphan", completeLines: 0 },
+  "run-created-write-partial": { code: "bootstrap.persistence-failed", lastDurableSeq: 0, state: "orphan", completeLines: 0 },
+  "run-created-durability": { code: "bootstrap.persistence-failed", lastDurableSeq: 0, state: "orphan", completeLines: 1 },
+  "planning-transition-write-partial": { code: "bootstrap.persistence-failed", lastDurableSeq: 1, state: "created", completeLines: 1 },
+  "planning-transition-durability": { code: "bootstrap.persistence-failed", lastDurableSeq: 1, state: "created", completeLines: 2 },
+  "normal-active-checkpoint-write-partial": { code: "bootstrap.persistence-failed", lastDurableSeq: 2, state: "planning", completeLines: 2 },
+  "normal-active-checkpoint-durability": { code: "bootstrap.persistence-failed", lastDurableSeq: 2, state: "planning", completeLines: 3 },
+  "cancellation-active-checkpoint-write-partial": { code: "bootstrap.persistence-failed", lastDurableSeq: 1, state: "created", cancelAfterRunCreated: true, completeLines: 1 },
+  "cancellation-active-checkpoint-durability": { code: "bootstrap.persistence-failed", lastDurableSeq: 1, state: "created", cancelAfterRunCreated: true, completeLines: 2 },
+  "cancel-requested-write-partial": { code: "bootstrap.persistence-failed", lastDurableSeq: 2, state: "created", cancelAfterRunCreated: true, completeLines: 2 },
+  "cancel-requested-durability": { code: "bootstrap.persistence-failed", lastDurableSeq: 2, state: "created", cancelAfterRunCreated: true, completeLines: 3 },
+  "cancelled-transition-write-partial": { code: "bootstrap.persistence-failed", lastDurableSeq: 3, state: "created", cancelAfterRunCreated: true, completeLines: 3 },
+  "cancelled-transition-durability": { code: "bootstrap.persistence-failed", lastDurableSeq: 3, state: "created", cancelAfterRunCreated: true, completeLines: 4 },
+  "ledger-read-before": { code: "bootstrap.integrity-failed", lastDurableSeq: 3, state: "unknown", completeLines: 3 },
+  "ledger-verify-before": { code: "bootstrap.integrity-failed", lastDurableSeq: 3, state: "unknown", completeLines: 3 },
+  "ledger-close-after": { code: "bootstrap.cleanup-uncertain", lastDurableSeq: 3, state: "planning", completeLines: 3 },
+  "root-revalidate-before": { code: "bootstrap.integrity-failed", lastDurableSeq: 3, state: "unknown", completeLines: 3 },
+  "root-close-after": { code: "bootstrap.cleanup-uncertain", lastDurableSeq: 3, state: "planning", completeLines: 3 },
+} as const satisfies Readonly<Record<ResearchBootstrapOperationFaultInternal, OperationFaultExpectation>>;
+
+const OPERATION_FAULT_CASES = Object.entries(OPERATION_FAULT_EXPECTATIONS) as readonly (
+  readonly [ResearchBootstrapOperationFaultInternal, OperationFaultExpectation]
+)[];
 
 async function faultOutcome(
   faultAt: ResearchBootstrapOperationFaultInternal | null,
@@ -231,6 +270,21 @@ describe.skipIf(process.platform === "win32")("durable research bootstrap", () =
     expect(custom.rootPath).toBe(join(await realpath(project), "custom", "run"));
   });
 
+  test("closes each root, ledger, and lock across 100 bounded sequential bootstraps", async () => {
+    const project = await projectFixture();
+    await mkdir(join(project, "runs"));
+    for (let index = 0; index < 100; index += 1) {
+      const value = invocation(`--output runs/run-${index} Bounded bootstrap ${index}`);
+      const result = await bootstrapResearchRunInternal(value, context(project, value), hooks());
+      const ledgerPath = join(result.rootPath, ".state", "events.jsonl");
+      await expect(lstat(join(result.rootPath, ".state", "controller.lock"))).rejects.toMatchObject({ code: "ENOENT" });
+      const reopenedLedger = await openEventLedger(ledgerPath);
+      await reopenedLedger.close();
+      const reopenedRoot = await openOwnedRunRoot(result.rootPath, result.runId, TEST_ROOT_OWNERSHIP_TOKEN);
+      await reopenedRoot.close();
+    }
+  });
+
   test("requires and preserves explicit outside approval, including an authentic base promise", async () => {
     const project = await projectFixture();
     const outside = join(project, "..", "outside");
@@ -328,7 +382,7 @@ describe.skipIf(process.platform === "win32")("durable research bootstrap", () =
     if (created?.type === "run_created") expect(created.payload.run.question).toBe(question);
   });
 
-  test("records monotonic active elapsed time and rejects backward monotonic clocks", async () => {
+  test("records monotonic active elapsed time and rejects invalid or regressing clocks", async () => {
     const project = await projectFixture();
     const value = invocation("Clocked topic");
     let wallCall = 0;
@@ -349,6 +403,31 @@ describe.skipIf(process.platform === "win32")("durable research bootstrap", () =
     await expect(bootstrapResearchRunInternal(backwardValue, context(project, backwardValue), hooks([], {
       monotonicNow: () => backwardCall++ === 0 ? 100 : 99,
     }))).rejects.toEqual(expectCode("bootstrap.clock-invalid"));
+
+    let wallBackwardCall = 0;
+    const wallBackwardValue = invocation("Backward wall clock topic");
+    await expect(bootstrapResearchRunInternal(wallBackwardValue, context(project, wallBackwardValue), hooks([], {
+      now: () => new Date(NOW.getTime() - (wallBackwardCall++ === 0 ? 0 : 1)),
+    }))).rejects.toEqual(expectCode("bootstrap.clock-invalid"));
+
+    for (const invalid of [-1, Number.MAX_SAFE_INTEGER + 1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const invalidValue = invocation(`Invalid monotonic clock ${String(invalid)}`);
+      await expect(bootstrapResearchRunInternal(invalidValue, context(project, invalidValue), hooks([], {
+        monotonicNow: () => invalid,
+      }))).rejects.toEqual(expectCode("bootstrap.clock-invalid"));
+    }
+
+    let fractionalCall = 0;
+    const fractionalValue = invocation("Fractional monotonic clock");
+    const fractional = await bootstrapResearchRunInternal(
+      fractionalValue,
+      context(project, fractionalValue),
+      hooks([], { monotonicNow: () => fractionalCall++ === 0 ? 100.25 : 100.75 }),
+    );
+    const fractionalEvents = await readVerifiedLedgerSnapshot(join(fractional.rootPath, ".state", "events.jsonl"));
+    const fractionalCheckpoint = fractionalEvents.at(-1);
+    expect(fractionalCheckpoint?.type).toBe("active_time_checkpoint");
+    if (fractionalCheckpoint?.type === "active_time_checkpoint") expect(fractionalCheckpoint.payload.addedMs).toBe(0.5);
   });
 
   test("classifies denied outside locations without publishing a run", async () => {
@@ -367,32 +446,55 @@ describe.skipIf(process.platform === "win32")("durable research bootstrap", () =
     await expect(lstat(target)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  test.each([
-    "root-create-before",
-    "ledger-open-before",
-    "ledger-directory-sync-before",
-    "run-created-write-partial",
-    "run-created-durability",
-    "planning-transition-write-partial",
-    "planning-transition-durability",
-    "normal-active-checkpoint-write-partial",
-    "normal-active-checkpoint-durability",
-  ] as const)("classifies %s as a redacted persistence failure and releases any lock", async (faultAt) => {
-    const outcome = await faultOutcome(faultAt, "bootstrap.persistence-failed");
-    if (faultAt === "root-create-before") {
-      await expect(lstat(outcome.rootPath)).rejects.toMatchObject({ code: "ENOENT" });
-    } else {
-      await expect(lstat(join(outcome.rootPath, ".state", "controller.lock"))).rejects.toMatchObject({ code: "ENOENT" });
+  test.each(OPERATION_FAULT_CASES)("fails closed at exact operation fault %s", async (faultAt, expected) => {
+    const project = await projectFixture();
+    await mkdir(join(project, "runs"));
+    const value = invocation(`--output runs/fault-run Fault matrix ${faultAt}`);
+    const controller = new AbortController();
+    const error = await bootstrapResearchRunInternal(
+      value,
+      context(project, value, { signal: expected.cancelAfterRunCreated ? controller.signal : undefined }),
+      hooks([], {
+        faultAt,
+        onCheck: (phase) => {
+          if (expected.cancelAfterRunCreated && phase === "after-run-created") controller.abort("private reason");
+        },
+      }),
+    ).then(() => null, (caught: unknown) => caught);
+    const rootPath = join(await realpath(project), "runs", "fault-run");
+
+    expect(error).toEqual(expectCode(expected.code));
+    expect(error).toBeInstanceOf(ResearchBootstrapError);
+    expect((error as Error).message).not.toContain(project);
+    expect((error as Error).message).not.toContain(`Fault matrix ${faultAt}`);
+    if (expected.lastDurableSeq === null) {
+      expect(getResearchBootstrapFailureInternal(error)).toBeNull();
+      await expect(lstat(rootPath)).rejects.toMatchObject({ code: "ENOENT" });
+      return;
     }
-    if (faultAt === "normal-active-checkpoint-write-partial" || faultAt === "normal-active-checkpoint-durability") {
-      const failure = getResearchBootstrapFailureInternal(outcome.error);
-      expect(failure).toEqual({
-        runId: "run-01010101010101010101010101010101",
-        rootPath: outcome.rootPath,
-        lastDurableSeq: 2,
-        state: "planning",
-      });
-      expect(Object.isFrozen(failure)).toBe(true);
+
+    expect((await lstat(rootPath)).isDirectory()).toBe(true);
+    const failure = getResearchBootstrapFailureInternal(error);
+    expect(failure).toEqual({
+      runId: TEST_RUN_ID,
+      rootPath,
+      lastDurableSeq: expected.lastDurableSeq,
+      state: expected.state,
+    });
+    expect(Object.isFrozen(failure)).toBe(true);
+    await expect(lstat(join(rootPath, ".state", "controller.lock"))).rejects.toMatchObject({ code: "ENOENT" });
+    const ledgerPath = join(rootPath, ".state", "events.jsonl");
+    if (expected.completeLines !== undefined) {
+      const ledgerBytes = await readFile(ledgerPath);
+      expect(ledgerBytes.reduce((count, byte) => count + (byte === 0x0a ? 1 : 0), 0)).toBe(expected.completeLines);
+    }
+    if (faultAt === "ledger-close-after") {
+      const reopenedLedger = await openEventLedger(ledgerPath);
+      await reopenedLedger.close();
+    }
+    if (faultAt === "root-close-after") {
+      const reopenedRoot = await openOwnedRunRoot(rootPath, TEST_RUN_ID, TEST_ROOT_OWNERSHIP_TOKEN);
+      await reopenedRoot.close();
     }
   });
 
@@ -417,28 +519,37 @@ describe.skipIf(process.platform === "win32")("durable research bootstrap", () =
   });
 
   test.each([
-    "ledger-read-before",
-    "ledger-verify-before",
-    "root-revalidate-before",
-  ] as const)("classifies %s as a redacted integrity failure", async (faultAt) => {
-    const outcome = await faultOutcome(faultAt, "bootstrap.integrity-failed");
-    await expect(lstat(join(outcome.rootPath, ".state", "controller.lock"))).rejects.toMatchObject({ code: "ENOENT" });
-    const failure = getResearchBootstrapFailureInternal(outcome.error);
-    expect(failure).toEqual({
-      runId: "run-01010101010101010101010101010101",
-      rootPath: outcome.rootPath,
-      lastDurableSeq: 3,
-      state: "unknown",
-    });
-    expect(Object.isFrozen(failure)).toBe(true);
+    ["before-release-verify", true],
+    ["before-lock-unlink", true],
+    ["after-lock-unlink", false],
+    ["after-state-release-sync", false],
+    ["before-descriptor-close", false],
+  ] as const)("closes descriptors after release fault %s and reports cleanup uncertainty", async (lockFailAt, lockRemains) => {
+    const outcome = await faultOutcome(null, "bootstrap.cleanup-uncertain", lockFailAt);
+    const lockPath = join(outcome.rootPath, ".state", "controller.lock");
+    if (lockRemains) expect((await lstat(lockPath)).isFile()).toBe(true);
+    else await expect(lstat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  test.each([
-    "ledger-close-after",
-    "root-close-after",
-  ] as const)("classifies %s as cleanup uncertainty after releasing the lock", async (faultAt) => {
-    const outcome = await faultOutcome(faultAt, "bootstrap.cleanup-uncertain");
-    await expect(lstat(join(outcome.rootPath, ".state", "controller.lock"))).rejects.toMatchObject({ code: "ENOENT" });
+  test("runs cleanup in ledger-close, lock-release, preserving-close, root-revalidate, root-close order", async () => {
+    const project = await projectFixture();
+    const value = invocation("--output ordered-cleanup Ordered cleanup");
+    const timeline: string[] = [];
+    const error = await bootstrapResearchRunInternal(value, context(project, value), hooks([], {
+      faultAt: "run-created-durability",
+      lockFailAt: "before-release-verify",
+      onCheck: (phase) => { timeline.push(`bootstrap:${phase}`); },
+      lockOnCheck: (phase) => { timeline.push(`lock:${phase}`); },
+    })).then(() => null, (caught: unknown) => caught);
+
+    expect(error).toEqual(expectCode("bootstrap.cleanup-uncertain"));
+    expect(timeline.slice(timeline.indexOf("bootstrap:after-ledger-close"))).toEqual([
+      "bootstrap:after-ledger-close",
+      "lock:before-release-verify",
+      "lock:before-descriptor-close",
+      "bootstrap:before-root-close",
+    ]);
+    expect((await lstat(join(await realpath(project), "ordered-cleanup", ".state", "controller.lock"))).isFile()).toBe(true);
   });
 
   test("preserves a residual lock and gives cleanup uncertainty precedence when release is uncertain", async () => {
@@ -556,29 +667,20 @@ describe.skipIf(process.platform === "win32")("durable research bootstrap", () =
     expect(events.map((event) => event.type)).toEqual(["run_created", "state_changed", "active_time_checkpoint"]);
   });
 
-  test.each([
-    ["cancellation-active-checkpoint-write-partial", 1],
-    ["cancellation-active-checkpoint-durability", 1],
-    ["cancel-requested-write-partial", 2],
-    ["cancel-requested-durability", 2],
-    ["cancelled-transition-write-partial", 3],
-    ["cancelled-transition-durability", 3],
-  ] as const)("reports the last confirmed durable event for %s", async (faultAt, lastDurableSeq) => {
+  test("gives cleanup uncertainty precedence over cancellation append persistence failure", async () => {
     const project = await projectFixture();
-    const value = invocation(`Cancellation fault ${faultAt}`);
+    const value = invocation("Cancellation persistence cleanup precedence");
     const controller = new AbortController();
     const error = await bootstrapResearchRunInternal(value, context(project, value, { signal: controller.signal }), hooks([], {
-      faultAt,
+      faultAt: "cancelled-transition-durability",
+      lockFailAt: "before-release-verify",
       onCheck: (phase) => { if (phase === "after-run-created") controller.abort("private reason"); },
     })).then(() => null, (caught: unknown) => caught);
 
-    expect(error).toEqual(expectCode("bootstrap.persistence-failed"));
-    expect(getResearchBootstrapFailureInternal(error)).toEqual({
-      runId: "run-01010101010101010101010101010101",
-      rootPath: expect.any(String),
-      lastDurableSeq,
-      state: "created",
-    });
+    expect(error).toEqual(expectCode("bootstrap.cleanup-uncertain"));
+    const failure = getResearchBootstrapFailureInternal(error);
+    expect(failure).toEqual(expect.objectContaining({ lastDurableSeq: 3, state: "created" }));
+    expect((await lstat(join(failure!.rootPath, ".state", "controller.lock"))).isFile()).toBe(true);
   });
 
   test("gives final root integrity failure precedence over durable cancellation", async () => {

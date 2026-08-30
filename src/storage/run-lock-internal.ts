@@ -449,7 +449,9 @@ async function releaseLock(lock: ResearchRunLockInternal): Promise<void> {
 async function closePreserving(lock: ResearchRunLockInternal): Promise<void> {
   const state = requireLockState(lock);
   if (state.lifecycle === "released" || state.lifecycle === "closed-preserving") return;
-  if (state.lifecycle === "release-closing" || state.releaseInProgress) fail("lock.closed");
+  // A failed release may already be in release-closing; finish consuming its
+  // descriptors without retrying any namespace effect.
+  if (state.releaseInProgress) fail("lock.closed");
   if (state.closePromise) return state.closePromise;
   if (state.closeInProgress) fail("lock.closed");
   state.closeInProgress = true;

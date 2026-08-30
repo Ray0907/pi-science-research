@@ -689,7 +689,9 @@ function monotonicClock(hooks: MutableTestHookState | null): number {
   let value: unknown;
   try { value = (hooks?.monotonicNow ?? (() => performance.now()))(); }
   catch { fail("bootstrap.clock-invalid"); }
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) fail("bootstrap.clock-invalid");
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > Number.MAX_SAFE_INTEGER) {
+    fail("bootstrap.clock-invalid");
+  }
   return value;
 }
 

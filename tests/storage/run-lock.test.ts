@@ -1279,6 +1279,24 @@ describe.skipIf(process.platform === "win32")("acquireResearchRunLockInternal", 
     await released.release();
     expect(getResearchRunLockRetentionCountsInternal(observer)).toEqual({ descriptors: 0 });
 
+    for (const failAt of [
+      "before-release-verify", "before-lock-unlink", "after-lock-unlink",
+      "after-state-release-sync", "before-descriptor-close",
+    ] as const) {
+      const preservingCloseFault = createResearchRunLockTestHooksInternal({
+        now: () => NOW,
+        randomBytes: () => OWNER_TOKEN,
+        onCheck: null,
+        failAt,
+      });
+      const preserving = await acquireResearchRunLockInternal(root, { executionEpoch: 26 }, preservingCloseFault, observer);
+      await expect(preserving.release()).rejects.toEqual(expectCode("lock.io-failed"));
+      expect(getResearchRunLockRetentionCountsInternal(observer)).toEqual({ descriptors: 3 });
+      await preserving.closePreservingLock();
+      expect(getResearchRunLockRetentionCountsInternal(observer)).toEqual({ descriptors: 0 });
+      await rm(join(root.path, ".state", "controller.lock"), { force: true });
+    }
+
     for (const [failAt, expectedRetained] of [
       ["after-state-open", 2],
       ["after-lock-open", 3],
