@@ -148,8 +148,8 @@ describe("Pi package manifest", () => {
     finally { await rm(packageTemp,{recursive:true,force:true}); }
     const packed = JSON.parse(stdout) as [{ files: Array<{ path: string }> }];
     const paths = packed[0]!.files.map(({ path }) => path);
-    expect(paths).toHaveLength(54);
-    expect(new Set(paths).size).toBe(54);
+    expect(paths).toHaveLength(55);
+    expect(new Set(paths).size).toBe(55);
     expect(paths.every(path=>["README.md","LICENSE","package.json"].includes(path)||path.startsWith("extensions/")||path.startsWith("src/"))).toBe(true);
     packedRuntimePaths=Object.freeze([...paths]);
     expect(paths).not.toEqual(expect.arrayContaining([
@@ -193,6 +193,7 @@ describe("Pi package manifest", () => {
       "src/workflow/depth-profile.ts",
       "src/workflow/research-options.ts",
       "src/workflow/bootstrap.ts",
+      "src/workflow/planning-contract-internal.ts",
     ]));
   });
 
@@ -205,7 +206,7 @@ describe("Pi package manifest", () => {
 
   it("keeps local plans tests fixtures and configs out of the tarball",()=>{expect(packedRuntimePaths).not.toBeNull();const forbidden=packedRuntimePaths!.filter(item=>item.startsWith("docs/")||item.startsWith("tests/")||item.includes("fixtures/")||item==="tsconfig.json"||item==="vitest.config.ts"||item.endsWith(".tmp"));expect(forbidden).toEqual([]);});
 
-  it("keeps the package CI cardinality synchronized to the observed unique tarball",async()=>{const workflow=await readFile(new URL("../.github/workflows/ci.yml",import.meta.url),"utf8");expect([...workflow.matchAll(/paths\.length !== 54 \|\| new Set\(paths\)\.size !== 54/gu)]).toHaveLength(1);expect(workflow).not.toMatch(/paths\.length !== 50|size !== 50/gu);});
+  it("keeps the package CI cardinality synchronized to the observed unique tarball",async()=>{const workflow=await readFile(new URL("../.github/workflows/ci.yml",import.meta.url),"utf8");expect([...workflow.matchAll(/paths\.length !== 55 \|\| new Set\(paths\)\.size !== 55/gu)]).toHaveLength(1);expect(workflow).not.toMatch(/paths\.length !== 54|size !== 54/gu);});
 });
 
 describe("research-status command", () => {
