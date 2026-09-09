@@ -148,8 +148,8 @@ describe("Pi package manifest", () => {
     finally { await rm(packageTemp,{recursive:true,force:true}); }
     const packed = JSON.parse(stdout) as [{ files: Array<{ path: string }> }];
     const paths = packed[0]!.files.map(({ path }) => path);
-    expect(paths).toHaveLength(56);
-    expect(new Set(paths).size).toBe(56);
+    expect(paths).toHaveLength(57);
+    expect(new Set(paths).size).toBe(57);
     expect(paths.every(path=>["README.md","LICENSE","package.json"].includes(path)||path.startsWith("extensions/")||path.startsWith("src/"))).toBe(true);
     packedRuntimePaths=Object.freeze([...paths]);
     expect(paths).not.toEqual(expect.arrayContaining([
@@ -195,6 +195,7 @@ describe("Pi package manifest", () => {
       "src/workflow/bootstrap.ts",
       "src/workflow/planning-contract-internal.ts",
       "src/workflow/planning-board-internal.ts",
+      "src/storage/planning-artifact-internal.ts",
     ]));
   });
 
@@ -207,7 +208,7 @@ describe("Pi package manifest", () => {
 
   it("keeps local plans tests fixtures and configs out of the tarball",()=>{expect(packedRuntimePaths).not.toBeNull();const forbidden=packedRuntimePaths!.filter(item=>item.startsWith("docs/")||item.startsWith("tests/")||item.includes("fixtures/")||item==="tsconfig.json"||item==="vitest.config.ts"||item.endsWith(".tmp"));expect(forbidden).toEqual([]);});
 
-  it("keeps the package CI cardinality synchronized to the observed unique tarball",async()=>{const workflow=await readFile(new URL("../.github/workflows/ci.yml",import.meta.url),"utf8");expect([...workflow.matchAll(/paths\.length !== 56 \|\| new Set\(paths\)\.size !== 56/gu)]).toHaveLength(1);expect(workflow).not.toMatch(/paths\.length !== 55|size !== 55/gu);});
+  it("keeps the package CI cardinality synchronized to the observed unique tarball",async()=>{const workflow=await readFile(new URL("../.github/workflows/ci.yml",import.meta.url),"utf8");expect([...workflow.matchAll(/paths\.length !== 57 \|\| new Set\(paths\)\.size !== 57/gu)]).toHaveLength(1);expect(workflow).not.toMatch(/paths\.length !== 56|size !== 56/gu);});
 });
 
 describe("research-status command", () => {
