@@ -96,7 +96,7 @@ jobs:
             if (file === null || typeof file !== "object" || typeof file.path !== "string") fail();
             return file.path;
           });
-          if (paths.length !== 58 || new Set(paths).size !== 58) fail();
+          if (paths.length !== 59 || new Set(paths).size !== 59) fail();
 
           const required = [
             "README.md",
